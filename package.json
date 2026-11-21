@@ -1,0 +1,48 @@
+{
+  "name": "robo-erp-standalone",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "dev": "cross-env TZ=UTC next dev",
+    "build": "prisma generate && cross-env TZ=UTC next build",
+    "start": "cross-env TZ=UTC next start",
+    "typecheck": "tsc --noEmit",
+    "test": "cross-env TZ=UTC node --experimental-strip-types --disable-warning=ExperimentalWarning --test tests/*.test.ts",
+    "postinstall": "prisma generate",
+    "prisma:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev",
+    "db:deploy": "prisma migrate deploy",
+    "db:reset": "prisma migrate reset",
+    "db:seed": "npm run db:seed:robo && npm run db:seed:attendance",
+    "db:seed:robo": "cross-env TZ=UTC tsx --env-file=.env prisma/seed-robo.ts",
+    "db:seed:attendance": "cross-env TZ=UTC tsx --env-file=.env prisma/seed-attendance.ts",
+    "db:studio": "prisma studio"
+  },
+  "prisma": {
+    "seed": "npm run db:seed"
+  },
+  "dependencies": {
+    "@prisma/client": "6.19.3",
+    "next": "15.5.23",
+    "react": "19.2.6",
+    "react-dom": "19.2.6",
+    "recharts": "2.15.4",
+    "xlsx": "file:vendor/xlsx-0.20.3.tgz",
+    "xlsx-js-style": "1.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.19",
+    "@types/react": "19.2.15",
+    "@types/react-dom": "19.2.3",
+    "autoprefixer": "10.5.0",
+    "cross-env": "^7.0.3",
+    "postcss": "8.5.26",
+    "prisma": "6.19.3",
+    "tailwindcss": "3.4.19",
+    "tsx": "4.22.4",
+    "typescript": "5.9.3"
+  }
+}

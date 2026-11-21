@@ -1,0 +1,2586 @@
+From 54af2983f082e7e9934ec28a863a2a937713508d Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 20 Oct 2026 12:26:12 +0000
+Subject: [PATCH 1/5] robo(reference): a design is the same design however the
+ spaces fall
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Downloads → Reference Sheet matched designs case-insensitively but only
+COLLAPSED runs of space. The register does not disagree about how many spaces
+there are — it disagrees about whether there is one. Taj Vein, Tajvein,
+TajVein, TAJVEIN and taj vein are one design, and only the last two matched
+each other.
+
+What that cost, in the live register on the day of the change:
+
+  "Taj vein"  setups run to batch D-1470, last slab 17 Oct 2026
+  "Tajvein"   setups stop at batch D-1398, last slab 31 Jul 2026
+
+So an operator who typed it without the space was handed the reference sheet
+for a batch nearly three months old — the wrong programs, the wrong delays —
+with nothing on screen to say so. The same for "CRYSTALLO - ARLINA", whose
+slabs are all under "CRYSTALLO-ARLINA": searching it with spaces round the
+hyphen returned "No previous production record found".
+
+designMatchKey now drops spacing entirely rather than collapsing it. \s in JS
+covers tabs, newlines and the Unicode spaces, so a name pasted out of a sheet
+folds like a typed one.
+
+CHECKED AGAINST THE WHOLE REGISTER FIRST, because a fold that is too eager
+silently merges two real designs: of 45 distinct names typed across 104
+setups, folding spaces away merges exactly those two pairs and nothing else.
+Only spacing is folded — a hyphen is a character the operator typed, so
+"Taj-Vein" stays its own name — and the trailing-thickness rule is unchanged,
+with "Statuario 5" still keeping its 5 and now keying as "Statuario5" does.
+
+Nothing else uses designMatchKey: the change is the Reference Sheet's search
+and nothing beyond it.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SPqDFZ7o6eq1utS7hzoQsF
+---
+ src/lib/robo/referenceSheet.ts   | 38 ++++++++++++++------
+ tests/roboReferenceSheet.test.ts | 60 +++++++++++++++++++++++++++++---
+ 2 files changed, 84 insertions(+), 14 deletions(-)
+
+diff --git a/src/lib/robo/referenceSheet.ts b/src/lib/robo/referenceSheet.ts
+index 4a35fd2..f90a0d6 100644
+--- a/src/lib/robo/referenceSheet.ts
++++ b/src/lib/robo/referenceSheet.ts
+@@ -28,16 +28,32 @@
+ 
+ /**
+  * The design's identity for matching: its name with a trailing thickness removed,
+- * lower-cased and whitespace-collapsed. So "Costa 2 cm", "Costa 3cm" and "costa"
+- * all key as "costa", while "Bellagio Green" and "Bellagio Grey" stay apart
+- * (neither ends in a thickness, so nothing is stripped).
++ * lower-cased, and with SPACING IGNORED ENTIRELY. So "Costa 2 cm", "Costa 3cm"
++ * and "costa" all key as "costa", and "Taj Vein", "Tajvein", "TajVein", "TAJVEIN"
++ * and "taj vein" are one design — while "Bellagio Green" and "Bellagio Grey"
++ * stay apart, as they should.
++ *
++ * ── WHY SPACES ARE DROPPED, NOT COLLAPSED (2026-10-20) ────────────────────
++ * Collapsing runs of space to one was not enough, because the register does not
++ * disagree about how MANY spaces — it disagrees about WHETHER there is one. The
++ * live setups carry "Taj vein" and "Tajvein" (six setups between them, one
++ * design) and "CRYSTALLO - ARLINA" and "CRYSTALLO-ARLINA". Searching one
++ * spelling found only that spelling's runs, so the sheet could name an older
++ * batch as the design's latest — or report nothing at all — purely on how the
++ * operator happened to type the name on the day.
++ *
++ * Checked against the whole register before the change: of 45 distinct names
++ * typed across 104 setups, folding spaces away merges exactly those two pairs
++ * and nothing else. No two designs that are actually different come together.
+  *
+  * Only a thickness token is removed, and only at the END: a number followed by
+- * cm or mm (with optional space and an optional trailing dot). A name that merely
+- * ends in a number ("Statuario 5") keeps it — that is not a thickness and dropping
+- * it would merge two real designs. Matching is case- and space-insensitive because
+- * a design typed by hand is not a database key: one batch can carry setups typed
+- * "calcatta gold" and "CALCATTA GOLD", and they are the same design.
++ * cm or mm (with optional space and an optional trailing dot). A name that
++ * merely ends in a number ("Statuario 5") keeps the number — that is not a
++ * thickness and dropping it would merge two real designs. It keys as
++ * "statuario5", which is exactly "Statuario5" typed without the space.
++ *
++ * A design typed by hand is not a database key, and this is the whole of what
++ * decides "same design".
+  */
+ export function designMatchKey(name: string | null | undefined): string {
+   return (name ?? "")
+@@ -45,8 +61,10 @@ export function designMatchKey(name: string | null | undefined): string {
+     .replace(/\s*\d+(?:\.\d+)?\s*(?:cm|mm)\.?\s*$/i, "")
+     // tidy any separator the strip left dangling ("Costa -" → "Costa")
+     .replace(/[\s\-_]+$/, "")
+-    .replace(/\s+/g, " ")
+-    .trim()
++    // every space, tab, non-breaking space and newline — \s in JS covers the
++    // Unicode spaces too, so a name pasted out of a sheet folds like a typed one.
++    // This also trims, so nothing further is needed.
++    .replace(/\s+/g, "")
+     .toLowerCase();
+ }
+ 
+diff --git a/tests/roboReferenceSheet.test.ts b/tests/roboReferenceSheet.test.ts
+index e8d6cc8..78b223e 100644
+--- a/tests/roboReferenceSheet.test.ts
++++ b/tests/roboReferenceSheet.test.ts
+@@ -28,22 +28,25 @@ test("thickness is stripped so 2 cm and 3 cm of one design match", () => {
+ 
+ test("designs that differ by name, not thickness, stay different", () => {
+   assert.notEqual(designMatchKey("Bellagio Green"), designMatchKey("Bellagio Grey"));
+-  assert.equal(designMatchKey("Bellagio Green"), "bellagio green");
+-  assert.equal(designMatchKey("Bellagio Grey"), "bellagio grey");
++  assert.equal(designMatchKey("Bellagio Green"), "bellagiogreen");
++  assert.equal(designMatchKey("Bellagio Grey"), "bellagiogrey");
+ });
+ 
+ test("a trailing number that is not a thickness is kept", () => {
+   // no cm/mm unit → not a thickness, must not be dropped
+-  assert.equal(designMatchKey("Statuario 5"), "statuario 5");
++  assert.equal(designMatchKey("Statuario 5"), "statuario5");
+   assert.notEqual(designMatchKey("Statuario 5"), designMatchKey("Statuario 7"));
++  // and it is the same design as the one typed without the space
++  assert.equal(designMatchKey("Statuario 5"), designMatchKey("Statuario5"));
+ });
+ 
+ test("null/blank design keys to empty string (no run can match it)", () => {
+   assert.equal(designMatchKey(null), "");
+   assert.equal(designMatchKey("   "), "");
++  assert.equal(designMatchKey("\t \n "), "");
+ });
+ 
+-/* ── designMatchKey — search is case-insensitive ─────────────────────────── */
++/* ── designMatchKey — search ignores case AND spacing ────────────────────── */
+ 
+ test("design search ignores capitalisation entirely — every variant the owner listed", () => {
+   const key = designMatchKey("Calcatta Gold");
+@@ -55,6 +58,40 @@ test("design search ignores capitalisation entirely — every variant the owner
+   }
+ });
+ 
++test("the owner's example: Taj Vein, Tajvein, TajVein, TAJVEIN and taj vein are one design", () => {
++  const key = designMatchKey("Taj Vein");
++  assert.equal(key, "tajvein");
++  for (const v of [
++    "Taj Vein", "Tajvein", "TajVein", "TAJVEIN", "taj vein",
++    "TAJ VEIN", "  taj   vein  ", "tajVein 2 cm", "Taj Vein 18mm.",
++  ]) {
++    assert.equal(designMatchKey(v), key, `"${v}" should match "Taj Vein"`);
++  }
++});
++
++test("the register's own two spellings of a design come together", () => {
++  // Both pairs are real: "Taj vein" / "Tajvein" (six setups) and
++  // "CRYSTALLO - ARLINA" / "CRYSTALLO-ARLINA" are each ONE design typed two
++  // ways. Searching either spelling has to find the other's runs, or the sheet
++  // names an older batch as the design's latest.
++  assert.equal(designMatchKey("Taj vein"), designMatchKey("Tajvein"));
++  assert.equal(designMatchKey("CRYSTALLO - ARLINA"), designMatchKey("CRYSTALLO-ARLINA"));
++});
++
++test("a space is not a letter, but a letter is still a letter", () => {
++  // The fold must not reach past spacing into the name itself.
++  assert.notEqual(designMatchKey("Taj Vein"), designMatchKey("Taj Veins"));
++  assert.notEqual(designMatchKey("Taj Vein"), designMatchKey("Taj-Vein"));
++  assert.notEqual(designMatchKey("Crystallo Arlina"), designMatchKey("Crystallo Arlena"));
++});
++
++test("a name pasted out of a sheet folds like a typed one", () => {
++  // Non-breaking space, tab, newline — \s covers them, so a paste matches.
++  assert.equal(designMatchKey("Taj Vein"), designMatchKey("Taj Vein"));
++  assert.equal(designMatchKey("Taj\tVein"), designMatchKey("Taj Vein"));
++  assert.equal(designMatchKey("Taj\nVein"), designMatchKey("Taj Vein"));
++});
++
+ /* ── isRobotDelayCode — robot delays are the C-codes (Section G) ──────────── */
+ 
+ test("robot delays are matched by C-code, not the stored category", () => {
+@@ -87,6 +124,21 @@ test("an undated slab never outranks a dated one", () => {
+   assert.ok(compareProduced(at("", "23:59"), at("2026-01-01", "00:01")) < 0);
+ });
+ 
++test("Taj Vein shape: the spelling searched must not decide which batch is 'latest'", () => {
++  /* The live register, 20 Oct 2026. "Taj vein" setups run to D-1470 (last slab
++     17 Oct); "Tajvein" setups stop at D-1398 (31 Jul). They are one design, so
++     an operator who types it without the space must not be handed a reference
++     sheet for a batch three months old. Both spellings key the same, so both
++     sets of setups are the design's and the latest slab of either picks. */
++  assert.equal(designMatchKey("Taj vein"), designMatchKey("Tajvein"));
++  const slabs = [
++    at("2026-07-31", "18:00", 1, "D-1398"), // typed "Tajvein"
++    at("2026-10-17", "09:30", 2, "D-1470"), // typed "Taj vein" — the real latest
++    at("2026-07-30", "11:00", 3, "D-1389"),
++  ];
++  assert.equal(latestProduced(slabs)!.batch, "D-1470");
++});
++
+ test("D-1445 shape: setups typed 'calcatta gold' and 'CALCATTA GOLD' are one design, one latest batch", () => {
+   // Both setups key the same, so both are the design's, and the latest slab of
+   // EITHER picks the batch — which is then taken whole (see the parity guard).
+-- 
+2.43.0
+
+
+From 8c67cdb293bd7aad6a2df138b83d083c62c444cc Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 21 Oct 2026 04:11:08 +0000
+Subject: [PATCH 2/5] robo(reports): an hour's delays are the hour's, cut at
+ the hour
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The tooltip was reading the register correctly and adding it up wrongly. On
+batch D-1473, 19 Oct, the 05:00 hour listed eight D1 rows totalling 1 hour 9
+minutes — of a sixty-minute hour — the last of them "26 minutes [05:41–06:07]",
+which is a stretch of time the 05:00 hour mostly did not contain.
+
+Two faults, both in how the hour was formed, neither in the data.
+
+1 — A DELAY WAS FILED WHOLE UNDER THE HOUR IT BEGAN IN. It is now CUT at each
+hour boundary and listed in every hour it ran through, keeping its code and
+carrying the part of itself that fell there:
+
+      D1 03:55 → 04:12    03:00–04:00   D1 — 5 minutes  [03:55–04:00]
+                          04:00–05:00   D1 — 12 minutes [04:00–04:12]
+
+  The register has 29 delays longer than an hour and the longest is T1
+  22:00 → 06:00, 480 minutes — a power cut. All 480 went into the 22:00
+  bucket, and the seven hours it actually covered — every one of them with no
+  slabs, FOR THAT REASON — read "No delays". Those hours now read T1 — 60
+  minutes [23:00–00:00] and so on, hour by hour, which is the owner's
+  zero-slab case exactly.
+
+2 — THE TOTAL WAS THE LINES ADDED UP. The floor logs a delay against the SLAB
+  it held up, so one stoppage is written down once per slab waiting on it and
+  the rows overlap: that 05:00 hour has D1 05:28–05:49 with D1 05:32–05:34 and
+  D1 05:36–05:39 inside it, and D1 05:41–06:07 starting before it ends. The
+  line was stopped 05:28 → 06:07, once. Total delays is now the minutes of the
+  hour that were under a delay, counted once — 49 for that hour — which cannot
+  exceed 60 because the pieces are clipped to the hour. Every row is still
+  listed with its own times, and when they overlap the box says so rather than
+  leaving a reader checking an addition that cannot work.
+
+HOW LONG a delay ran now comes from the END TIME, the operator's own record of
+when the line came back, wrapped at midnight (22:00 → 06:00 is eight hours,
+not minus sixteen). Checked across all 1,783 delays on record: every one has
+both times and every one has durationMinutes equal to that span, so the two
+never disagree; durationMinutes stays as the fallback for a missing end.
+
+AUDITED AGAINST THE WHOLE REGISTER, not just the batch reported. Of 628 hours
+that carry a delay, 40 claimed more than sixty minutes, the worst claiming
+480. After this: 0, and the worst hour claims exactly 60. 51 further hours had
+a delay running through them and were reading "No delays". Re-running the real
+D-1473 rows through the new code gives, hour by hour, exactly the figures an
+independent SQL sweep of the same rows gives — 49 minutes for the 05:00 hour,
+and all 144 slabs of the run still charted.
+
+Slab counts, the line, the shift colours and every other report are untouched:
+this changes which hour a delay is reported in and what the hour's total
+means, and nothing else.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SPqDFZ7o6eq1utS7hzoQsF
+---
+ src/components/robo/reports/report-charts.tsx |  25 +-
+ src/lib/robo/hourlyProduction.ts              | 174 +++++++++++---
+ tests/roboHourlyDelays.test.ts                | 224 +++++++++++++++++-
+ 3 files changed, 372 insertions(+), 51 deletions(-)
+
+diff --git a/src/components/robo/reports/report-charts.tsx b/src/components/robo/reports/report-charts.tsx
+index a86889f..1e44cc6 100644
+--- a/src/components/robo/reports/report-charts.tsx
++++ b/src/components/robo/reports/report-charts.tsx
+@@ -49,13 +49,21 @@ interface DotProps { cx?: number; cy?: number; index?: number }
+ 
+ /**
+  * What one hour of the run holds: the slabs that finished in it, and every
+- * delay that began in it — code, how long, and when — with their total.
++ * delay that ran in it — code, how long, and when — with the time the hour
++ * lost.
+  *
+- * The hour's delays are not a summary: each is the register's own row, so a
+- * supervisor can add the minutes up by eye and find every one of them in the
+- * Delay List. A delay that began in this hour and ran into the next is shown
+- * here whole, under the hour it started, which is why the total is exactly the
+- * sum of the lines above it.
++ * The hour's delays are not a summary: each line is the register's own row,
++ * findable in the Delay List by its code and its times. A delay that ran
++ * through this hour and on into the next is shown here CUT at the boundary,
++ * with the minutes and the start–end that fell inside this hour, and again in
++ * the next hour with the rest — so an hour never claims a stoppage that
++ * happened after it, and never hides one that happened during it.
++ *
++ * TOTAL DELAYS is the time the hour lost, which is not always the lines added
++ * up. The floor logs a delay against the slab it held up, so one stoppage is
++ * written down once per slab waiting on it and the rows overlap; an hour has
++ * only sixty minutes to lose whatever the rows say. When they do overlap the
++ * box says so, so nobody is left checking an addition that cannot work.
+  *
+  * Wider than a default Recharts tooltip because it has to be: a code, a
+  * duration and a time range on one line do not fit in the stock box, and
+@@ -91,6 +99,11 @@ function HourDetail({ b }: { b: HourBucket }) {
+         <div className="mt-2 border-t border-gray-100 pt-1.5 font-semibold text-gray-900">
+           Total delays: {fmtDurationLong(b.delayMins ?? 0)}
+         </div>
++        {b.delaysOverlap && (
++          <div className="mt-0.5 text-gray-500">
++            Some of these ran at the same time — the hour lost each minute once.
++          </div>
++        )}
+       </div>
+     </>
+   );
+diff --git a/src/lib/robo/hourlyProduction.ts b/src/lib/robo/hourlyProduction.ts
+index 26f4a53..b1c6f46 100644
+--- a/src/lib/robo/hourlyProduction.ts
++++ b/src/lib/robo/hourlyProduction.ts
+@@ -22,6 +22,25 @@
+  * run that crosses midnight flows 23:00–00:00 straight into 00:00–01:00 of the
+  * next date, with both dates marked on the axis.
+  *
++ * ── A DELAY BELONGS TO EVERY HOUR IT RAN THROUGH (2026-10-20) ──────────────
++ * It used to be listed whole under the hour it BEGAN in, on the reasoning that
++ * the register holds one delay of one duration. That reasoning does not survive
++ * the register: a power cut logged as T1 22:00 → 06:00, 480 minutes, put eight
++ * hours of stoppage into the 22:00 bucket and left the seven hours it actually
++ * covered — every one of them with no slabs, for that very reason — reading
++ * "No delays". Twenty-nine delays on record run longer than an hour.
++ *
++ * So a delay is now CUT at each hour boundary and listed in every hour it ran
++ * through, keeping its code and carrying the part of itself that fell in that
++ * hour (03:55 → 04:12 is 5 minutes of the 03:00 hour and 12 of the 04:00 one).
++ *
++ * And the hour's TOTAL is the minutes of the hour that were under a delay,
++ * counted once — not the entries added up. The floor logs a delay against the
++ * slab it held up, so one stoppage is written down once per slab waiting on it
++ * and the entries overlap: D-1473's 05:00 hour on 19 Oct lists eight D1 rows
++ * adding to 69 minutes of a sixty-minute hour. Every row is still shown; the
++ * total says what the hour lost, and says when the rows overlap.
++ *
+  * ── WHY THE STORED DATE, NOT A RECONSTRUCTED SEQUENCE (2026-09-16) ─────────
+  * An earlier version ignored the stored date and rebuilt the day from the
+  * production SEQUENCE — serialNumber order plus time-wrap detection, a day cursor
+@@ -114,11 +133,19 @@ export interface HourlyDelay {
+   date?: string | null;
+ }
+ 
+-/** One delay inside an hour, as the tooltip lists it. */
++/**
++ * One delay inside an hour, as the tooltip lists it — a delay that ran through
++ * more than one hour appears in EACH of them, cut at the hour boundary, with
++ * its own code and the part of itself that fell in that hour.
++ *
++ *   D1 03:55 → 04:12  →  03:00–04:00:  D1 — 5 minutes  [03:55–04:00]
++ *                        04:00–05:00:  D1 — 12 minutes [04:00–04:12]
++ */
+ export interface HourDelayEntry {
+   code: string;
++  /** Minutes of the delay that fell IN THIS HOUR, never its whole duration. */
+   minutes: number;
+-  /** "16:15" / "16:21", or "" when the register did not record one. */
++  /** "03:55" / "04:00" — this piece's own ends, clipped to the hour. */
+   start: string;
+   end: string;
+ }
+@@ -133,11 +160,18 @@ export interface HourBucket {
+   /** The calendar date (yyyy-mm-dd) this hour belongs to — the X-axis date
+    *  marker. null only when no slab carried a resolvable production date. */
+   date: string | null;
+-  /** The delays that BEGAN in this hour, earliest first. Empty when none did,
+-   *  and empty on every bucket when the caller passed no delays at all. */
++  /** The delays that RAN IN this hour, earliest first — each cut to the part
++   *  of it that fell inside. Empty when none did, and empty on every bucket
++   *  when the caller passed no delays at all. */
+   delays: HourDelayEntry[];
+-  /** Their minutes added up — the hour's total delay. */
++  /** How much of the hour was lost: the minutes of the hour that were under a
++   *  delay, counted ONCE however many entries covered them. Never more than
++   *  60, because an hour has 60. */
+   delayMins: number;
++  /** True when the entries above overlap each other, so their minutes add up
++   *  to more than delayMins. The tooltip says so rather than letting the
++   *  reader find an addition that does not work. */
++  delaysOverlap: boolean;
+ }
+ 
+ /** Minutes in a day — one day on the absolute timeline. */
+@@ -380,7 +414,8 @@ function gapTo(t: number, lo: number, hi: number): number {
+ }
+ 
+ /**
+- * The hour each delay began in, as an absolute hour index.
++ * WHEN a delay ran, as an absolute [from, to) in minutes on the chart's own
++ * timeline — the half of the rule that answers "which day".
+  *
+  * A delay carries a bare HH:MM, so it needs a day — and the day is the one the
+  * chart DREW ITS SLAB ON, not whatever date the delay's own row holds: the slab
+@@ -395,26 +430,80 @@ function gapTo(t: number, lo: number, hi: number): number {
+  * the next day; and a delay that began at 16:00 on a slab that went in at 16:05
+  * began five minutes early, not a day late.
+  *
++ * ── HOW LONG ──────────────────────────────────────────────────────────────
++ * From the END TIME the register holds, which is the operator's own record of
++ * when the line came back: `to − from` is the clock's own answer, and an end
++ * before the start crossed midnight (22:00 → 06:00 is eight hours, not minus
++ * sixteen). Checked across all 1,783 delays on record: every one of them has
++ * both times, and every one has durationMinutes equal to that span — so the
++ * two never disagree, and the clock is used because it is what the splitting
++ * needs. durationMinutes is the fallback for the two cases the clock cannot
++ * answer: no end time at all, and an end equal to the start on a row that
++ * records a duration anyway (a delay of exactly 24 hours reads as zero).
++ *
+  * A delay logged without a slab falls back to its own date. One with no start
+  * time cannot be placed in an hour at all, and is left out rather than guessed
+  * into one.
+  */
+-function delayHour(d: HourlyDelay, anchor: { inAbs: number | null; outAbs: number | null } | undefined): number | null {
++function delaySpan(
++  d: HourlyDelay,
++  anchor: { inAbs: number | null; outAbs: number | null } | undefined,
++): { from: number; to: number } | null {
+   const sm = toMins(d.startTime);
+   if (sm === null) return null;
++
++  const stated = Number.isFinite(d.minutes) && d.minutes > 0 ? d.minutes : 0;
++  const em = toMins(d.endTime);
++  const clock = em === null ? 0 : ((em - sm) % DAY + DAY) % DAY;
++  const length = clock > 0 ? clock : stated;
++
+   const ref = anchor?.inAbs ?? anchor?.outAbs ?? null;
+   if (ref === null) {
+     const dn = dayNum(d.date);
+-    return dn === null ? null : Math.floor((dn * DAY + sm) / 60);
++    if (dn === null) return null;
++    const from = dn * DAY + sm;
++    return { from, to: from + length };
+   }
+   const lo = anchor?.inAbs ?? ref;
+   const hi = anchor?.outAbs ?? ref;
+   const base = Math.floor(ref / DAY) * DAY + sm;
+-  let best = base;
++  let from = base;
+   for (const cand of [base - DAY, base + DAY]) {
+-    if (gapTo(cand, lo, hi) < gapTo(best, lo, hi)) best = cand;
++    if (gapTo(cand, lo, hi) < gapTo(from, lo, hi)) from = cand;
+   }
+-  return Math.floor(best / 60);
++  return { from, to: from + length };
++}
++
++/**
++ * How many minutes of [lo, hi) are covered by the intervals — overlapping ones
++ * counted ONCE.
++ *
++ * This is what an hour's total has to be, and the register is why. The floor
++ * logs a delay against the SLAB it held up, so one stoppage is written down
++ * several times over, once per slab waiting on it: on 19 Oct batch D-1473 has
++ * D1 05:28–05:49 and, inside it, D1 05:32–05:34 and D1 05:36–05:39, and then
++ * D1 05:41–06:07 which starts before the first has ended. Added up they are 69
++ * minutes of a sixty-minute hour. The line was in fact stopped from 05:28 to
++ * 06:07 — once — and 05:28 to 06:00 is the part of it this hour lost.
++ *
++ * Every entry is still listed with its own times, so nothing is hidden; this
++ * only decides what the hour's TOTAL says.
++ */
++function coveredMinutes(intervals: readonly (readonly [number, number])[]): number {
++  if (intervals.length === 0) return 0;
++  const sorted = [...intervals].sort((a, b) => a[0] - b[0] || a[1] - b[1]);
++  let total = 0;
++  let [open, close] = sorted[0];
++  for (const [a, b] of sorted.slice(1)) {
++    if (a > close) {
++      total += close - open;
++      open = a;
++      close = b;
++    } else if (b > close) {
++      close = b;
++    }
++  }
++  return total + (close - open);
+ }
+ 
+ export function hourlyProduction(
+@@ -460,32 +549,52 @@ export function hourlyProduction(
+     if (h >= startHour && h <= endHour) counts.set(h, (counts.get(h) ?? 0) + 1);
+   }
+ 
+-  /* Each delay under the hour it BEGAN in, whole. A delay that runs past the
+-     hour is not split across two: the register records one delay of one
+-     duration, and halving it would print a figure no one can find in the delay
+-     log. So the hour's total is the sum of the delays listed under it — the
+-     arithmetic a supervisor can check by eye. */
+-  const byHour = new Map<number, HourDelayEntry[]>();
++  /* Each delay CUT AT THE HOUR BOUNDARIES and listed in every hour it ran
++     through, with the part of itself that fell in that hour — the same code,
++     its own minutes, its own start and end. A stoppage from 03:55 to 04:12 is
++     5 minutes of the 03:00 hour and 12 minutes of the 04:00 one, which is what
++     each of those hours actually lost; carrying the whole 17 under 03:00 told
++     the 04:00 hour it had no delays at all, and that is how an hour with no
++     slabs and a power cut running through it came to read "No delays".
++
++     A delay of no length — start and end the same minute — still gets its one
++     line, at nought minutes, because the register holds it and a reader
++     looking for it must find it. */
++  const byHour = new Map<number, { entry: HourDelayEntry; at: [number, number] }[]>();
+   for (const d of delays) {
+-    const h = delayHour(d, d.slabId ? bySlab.get(d.slabId) : undefined);
+-    if (h === null || h < startHour || h > endHour) continue;
+-    const list = byHour.get(h);
+-    const entry: HourDelayEntry = {
+-      code: d.code,
+-      minutes: Number.isFinite(d.minutes) ? d.minutes : 0,
+-      start: d.startTime ?? "",
+-      end: d.endTime ?? "",
+-    };
+-    if (list) list.push(entry);
+-    else byHour.set(h, [entry]);
++    const span = delaySpan(d, d.slabId ? bySlab.get(d.slabId) : undefined);
++    if (span === null) continue;
++    const { from, to } = span;
++    const lastHour = to > from ? Math.floor((to - 1) / 60) : Math.floor(from / 60);
++    for (let h = Math.floor(from / 60); h <= lastHour; h++) {
++      if (h < startHour || h > endHour) continue;
++      const a = Math.max(from, h * 60);
++      const b = Math.min(to, (h + 1) * 60);
++      const piece = {
++        entry: {
++          code: d.code,
++          minutes: Math.max(0, b - a),
++          start: absToDateTime(a)?.time ?? "",
++          end: absToDateTime(Math.max(a, b))?.time ?? "",
++        },
++        at: [a, Math.max(a, b)] as [number, number],
++      };
++      const list = byHour.get(h);
++      if (list) list.push(piece);
++      else byHour.set(h, [piece]);
++    }
+   }
+   for (const list of byHour.values()) {
+-    list.sort((a, b) => a.start.localeCompare(b.start) || a.code.localeCompare(b.code));
++    list.sort((a, b) => a.at[0] - b.at[0] || a.entry.code.localeCompare(b.entry.code));
+   }
+ 
+   const out: HourBucket[] = [];
+   for (let h = startHour; h <= endHour; h++) {
+-    const hourDelays = byHour.get(h) ?? [];
++    const pieces = byHour.get(h) ?? [];
++    /* The hour lost what it lost: the minutes of it that were under a delay,
++       counted once however many entries covered them. Clipped to the hour, so
++       this cannot exceed 60 whatever the register holds. */
++    const lost = coveredMinutes(pieces.map((p) => p.at));
+     out.push({
+       label: hourLabel(h),
+       hour: ((h % 24) + 24) % 24,
+@@ -493,8 +602,9 @@ export function hourlyProduction(
+       // The day-number of an absolute hour is floor(h / 24); its calendar date is
+       // the axis marker for this hour.
+       date: dateFromDayNum(Math.floor(h / 24)),
+-      delays: hourDelays,
+-      delayMins: hourDelays.reduce((t, d) => t + d.minutes, 0),
++      delays: pieces.map((p) => p.entry),
++      delayMins: lost,
++      delaysOverlap: pieces.reduce((t, p) => t + p.entry.minutes, 0) > lost,
+     });
+   }
+   return out;
+diff --git a/tests/roboHourlyDelays.test.ts b/tests/roboHourlyDelays.test.ts
+index a8e4094..75edbd8 100644
+--- a/tests/roboHourlyDelays.test.ts
++++ b/tests/roboHourlyDelays.test.ts
+@@ -7,11 +7,19 @@ import { hourlyProduction, type HourlyDelay, type HourlySlab } from "../src/lib/
+ /* The delays behind each hour of "Production Rate per Hour" — what the chart's
+  * tooltip lists when a supervisor asks why an hour was quiet.
+  *
+- * The rule the whole thing rests on: a delay is listed under the hour it
+- * BEGAN in, whole. It is never split across the hours it ran through, because
+- * the register holds one delay of one duration and half of it is a figure
+- * nobody can find in the Delay List. That is what makes the hour's total
+- * exactly the sum of the lines above it — arithmetic a reader can check. */
++ * TWO RULES, both of them the register's own doing (2026-10-20):
++ *
++ *   1. A delay is listed in EVERY hour it ran through, cut at the boundary,
++ *      keeping its code and carrying the part of itself that fell in that
++ *      hour. It used to be listed whole under the hour it began in, which put
++ *      a 480-minute power cut into one bucket and left the seven hours it
++ *      actually covered reading "No delays".
++ *
++ *   2. The hour's TOTAL is the minutes of the hour that were under a delay,
++ *      counted once. The floor logs a delay against the slab it held up, so
++ *      one stoppage is written down once per slab waiting on it and the rows
++ *      overlap — an hour that lists 69 minutes of them still only lost sixty
++ *      at the very most. */
+ 
+ /** A slab of one batch, in and out within the hour given. */
+ const slab = (date: string, hour: number, id: string, n: string): HourlySlab => ({
+@@ -69,12 +77,19 @@ test("an hour with no delays says so, and totals nothing", () => {
+ });
+ 
+ test("every delay of an hour is listed, not the first one or two", () => {
++  // Six of them, one every eight minutes, each a minute longer than the last
++  // and none touching the next: 1+2+3+4+5+6 minutes of the hour lost.
+   const many = Array.from({ length: 6 }, (_, i) =>
+-    delay({ code: `C${i}`, minutes: i + 1, startTime: `16:${String(i * 8).padStart(2, "0")}`, endTime: `16:${String(i * 8 + 1).padStart(2, "0")}` }),
++    delay({
++      code: `C${i}`, minutes: i + 1,
++      startTime: `16:${String(i * 8).padStart(2, "0")}`,
++      endTime: `16:${String(i * 8 + i + 1).padStart(2, "0")}`,
++    }),
+   );
+   const b = at(hourlyProduction(RUN, many), "16:00–17:00");
+   assert.equal(b.delays.length, 6);
+   assert.equal(b.delayMins, 1 + 2 + 3 + 4 + 5 + 6);
++  assert.equal(b.delaysOverlap, false, "none of them overlap, so the lines add up");
+ });
+ 
+ test("the delays of an hour read in the order they happened", () => {
+@@ -87,14 +102,176 @@ test("the delays of an hour read in the order they happened", () => {
+ 
+ /* ── Where a delay lands ───────────────────────────────────────────── */
+ 
+-test("a delay belongs to the hour it began in, whole, even when it ran past it", () => {
+-  // 95 minutes from 16:40 runs into the 18:00 hour. It is one delay of 95
+-  // minutes in the register, so it is one line of 95 minutes under 16:00–17:00
+-  // — not 20 here and 60 there and 15 somewhere else.
++/* ── Rule 1: a delay is cut at the hour, and listed in each ────────── */
++
++test("the owner's example: 03:55 → 04:12 is 5 minutes of one hour and 12 of the next", () => {
++  const run: HourlySlab[] = [slab("2026-10-10", 3, "a", "9001"), slab("2026-10-10", 4, "b", "9002")];
++  const series = hourlyProduction(run, [
++    { slabId: "a", code: "D1", minutes: 17, startTime: "03:55", endTime: "04:12" },
++  ]);
++  assert.deepEqual(at(series, "03:00–04:00").delays, [{ code: "D1", minutes: 5, start: "03:55", end: "04:00" }]);
++  assert.deepEqual(at(series, "04:00–05:00").delays, [{ code: "D1", minutes: 12, start: "04:00", end: "04:12" }]);
++  assert.equal(at(series, "03:00–04:00").delayMins, 5);
++  assert.equal(at(series, "04:00–05:00").delayMins, 12);
++});
++
++test("a delay runs through every hour it covers, and each one gets its own part", () => {
++  // 95 minutes from 16:40: 20 of this hour, the whole of the next, 15 of the
++  // one after. The 17:00 hour used to read "No delays" while the line stood
++  // still for all sixty minutes of it.
+   const series = hourlyProduction(RUN, [delay({ code: "C10", minutes: 95, startTime: "16:40", endTime: "18:15" })]);
+-  assert.equal(at(series, "16:00–17:00").delayMins, 95);
+-  assert.equal(at(series, "17:00–18:00").delayMins, 0);
+-  assert.equal(at(series, "18:00–19:00").delayMins, 0);
++  assert.deepEqual(at(series, "16:00–17:00").delays, [{ code: "C10", minutes: 20, start: "16:40", end: "17:00" }]);
++  assert.deepEqual(at(series, "17:00–18:00").delays, [{ code: "C10", minutes: 60, start: "17:00", end: "18:00" }]);
++  assert.deepEqual(at(series, "18:00–19:00").delays, [{ code: "C10", minutes: 15, start: "18:00", end: "18:15" }]);
++  // And nothing was invented or lost on the way: the parts are the whole.
++  assert.equal(series.reduce((t, b) => t + b.delayMins, 0), 95);
++});
++
++test("a full-hour stoppage reads as the full hour, in the hour it stopped", () => {
++  /* The owner's case, and a real one: T1 22:00 → 06:00 on D-1449, 480 minutes
++     of power cut. Every hour of it has no slabs — BECAUSE of the cut — and
++     every one of them must say so. */
++  const run: HourlySlab[] = [
++    { productionDate: "2026-09-23", inTime: "21:30", outTime: "21:50", id: "before", slabNumber: "8000", createdAtMs: 1 },
++    { productionDate: "2026-09-24", inTime: "06:10", outTime: "06:40", id: "after", slabNumber: "8001", createdAtMs: 2 },
++  ];
++  const series = hourlyProduction(run, [
++    { slabId: "before", code: "T1", minutes: 480, startTime: "22:00", endTime: "06:00" },
++  ]);
++  for (const label of ["22:00–23:00", "23:00–00:00", "00:00–01:00", "03:00–04:00", "05:00–06:00"]) {
++    const b = at(series, label);
++    assert.equal(b.slabs, 0, `${label} made nothing`);
++    assert.equal(b.delayMins, 60, `${label} lost the whole hour`);
++    assert.deepEqual(b.delays, [{ code: "T1", minutes: 60, start: label.slice(0, 5), end: label.slice(6) }], label);
++  }
++  // Eight hours of it, and not a minute in the hour it ended on.
++  assert.equal(series.filter((b) => b.delayMins === 60).length, 8);
++  assert.equal(at(series, "06:00–07:00").delayMins, 0, "it ended AT 06:00, so the 06:00 hour lost none of it");
++  assert.equal(series.reduce((t, b) => t + b.delayMins, 0), 480);
++});
++
++test("a delay that ends on the hour does not leave an empty line in the next one", () => {
++  const series = hourlyProduction(RUN, [delay({ code: "D1", minutes: 20, startTime: "16:40", endTime: "17:00" })]);
++  assert.deepEqual(at(series, "16:00–17:00").delays, [{ code: "D1", minutes: 20, start: "16:40", end: "17:00" }]);
++  assert.deepEqual(at(series, "17:00–18:00").delays, []);
++});
++
++test("a delay of no length still gets its line, so it can be found", () => {
++  const b = at(hourlyProduction(RUN, [delay({ code: "D1", minutes: 0, startTime: "16:20", endTime: "16:20" })]), "16:00–17:00");
++  assert.deepEqual(b.delays, [{ code: "D1", minutes: 0, start: "16:20", end: "16:20" }]);
++  assert.equal(b.delayMins, 0);
++  // Including one logged ON the hour, where "the hour its last minute fell in"
++  // is the hour BEFORE the one it happened in.
++  const onTheHour = at(hourlyProduction(RUN, [delay({ code: "D1", minutes: 0, startTime: "17:00", endTime: "17:00" })]), "17:00–18:00");
++  assert.deepEqual(onTheHour.delays, [{ code: "D1", minutes: 0, start: "17:00", end: "17:00" }]);
++  assert.deepEqual(at(hourlyProduction(RUN, [delay({ code: "D1", minutes: 0, startTime: "17:00", endTime: "17:00" })]), "16:00–17:00").delays, []);
++});
++
++test("an end before the start crossed midnight, it did not run backwards", () => {
++  // Eight of the delays on record end before they start. 22:00 → 06:00 is
++  // eight hours, never minus sixteen.
++  const run: HourlySlab[] = [
++    { productionDate: "2026-10-10", inTime: "21:40", outTime: "21:55", id: "p", slabNumber: "8100", createdAtMs: 1 },
++    { productionDate: "2026-10-11", inTime: "02:10", outTime: "02:30", id: "q", slabNumber: "8101", createdAtMs: 2 },
++  ];
++  const series = hourlyProduction(run, [
++    { slabId: "p", code: "T1", minutes: 240, startTime: "23:00", endTime: "03:00" },
++  ]);
++  assert.equal(series.reduce((t, b) => t + b.delayMins, 0), 240);
++  assert.equal(at(series, "23:00–00:00").delayMins, 60);
++  assert.equal(at(series, "02:00–03:00").delayMins, 60);
++
++  /* And the CLOCK is what says how long, not the stored duration — the two
++     agree on every one of the 1,783 rows on record, so where they could not,
++     the operator's own "back at 03:00" is the record. Read without wrapping,
++     23:00 → 03:00 is minus twenty hours, and a stored figure standing in for
++     it would hide that. */
++  const wrong = hourlyProduction(run, [
++    { slabId: "p", code: "T1", minutes: 1, startTime: "23:00", endTime: "03:00" },
++  ]);
++  assert.equal(wrong.reduce((t, b) => t + b.delayMins, 0), 240);
++});
++
++test("with no end time the register's own duration says how long", () => {
++  const series = hourlyProduction(RUN, [delay({ code: "RM1", minutes: 25, startTime: "16:50", endTime: null })]);
++  assert.deepEqual(at(series, "16:00–17:00").delays, [{ code: "RM1", minutes: 10, start: "16:50", end: "17:00" }]);
++  assert.deepEqual(at(series, "17:00–18:00").delays, [{ code: "RM1", minutes: 15, start: "17:00", end: "17:15" }]);
++});
++
++/* ── Rule 2: an hour cannot lose more than it has ──────────────────── */
++
++test("D-1473, 19 Oct 05:00 — eight overlapping rows, and an hour that has 60 minutes", () => {
++  /* The register as it stands. Every one of these is a real row, logged
++     against the slab it held up, which is why they overlap: 05:28–05:49 runs
++     through 05:32–05:34 and 05:36–05:39, and 05:41–06:07 starts before it has
++     ended. Added up they are 69 minutes. The line was stopped 05:28 → 06:07,
++     once; this hour lost 05:00–05:10, 05:12–05:15, 05:16–05:20 and
++     05:28–06:00 — 49 minutes. */
++  const run: HourlySlab[] = Array.from({ length: 3 }, (_, i) =>
++    slab("2026-10-19", 4 + i, `r${i}`, String(167117 + i)));
++  const d = (minutes: number, startTime: string, endTime: string): HourlyDelay =>
++    ({ slabId: "r1", code: "D1", minutes, startTime, endTime });
++  const series = hourlyProduction(run, [
++    d(3, "05:00", "05:03"), d(7, "05:03", "05:10"), d(3, "05:12", "05:15"), d(4, "05:16", "05:20"),
++    d(21, "05:28", "05:49"), d(2, "05:32", "05:34"), d(3, "05:36", "05:39"), d(26, "05:41", "06:07"),
++  ]);
++  const b = at(series, "05:00–06:00");
++  assert.equal(b.delays.length, 8, "every row is still listed");
++  assert.equal(b.delayMins, 49);
++  assert.equal(b.delaysOverlap, true, "and the box says why they do not add up");
++  // The last one was cut at the hour; the rest of it is in the next.
++  assert.deepEqual(b.delays[7], { code: "D1", minutes: 19, start: "05:41", end: "06:00" });
++  assert.deepEqual(at(series, "06:00–07:00").delays[0], { code: "D1", minutes: 7, start: "06:00", end: "06:07" });
++});
++
++test("no hour of any run can ever lose more than sixty minutes", () => {
++  // The property, not an example: whatever the register holds — overlapping
++  // rows, rows longer than a day, rows piled on one minute — an hour has
++  // sixty minutes to lose.
++  const run: HourlySlab[] = Array.from({ length: 12 }, (_, i) => slab("2026-10-10", 8 + i, `h${i}`, String(9100 + i)));
++  const pile: HourlyDelay[] = [
++    { slabId: "h2", code: "T1", minutes: 480, startTime: "10:00", endTime: "18:00" },
++    { slabId: "h2", code: "D1", minutes: 90, startTime: "10:30", endTime: "12:00" },
++    { slabId: "h3", code: "RM1", minutes: 30, startTime: "11:10", endTime: "11:40" },
++    { slabId: "h3", code: "L1", minutes: 59, startTime: "11:00", endTime: "11:59" },
++    { slabId: "h5", code: "C1", minutes: 1, startTime: "13:00", endTime: "13:01" },
++    { slabId: "h5", code: "C2", minutes: 1, startTime: "13:00", endTime: "13:01" },
++  ];
++  for (const b of hourlyProduction(run, pile)) {
++    assert.ok(b.delayMins <= 60, `${b.label} claims ${b.delayMins} minutes of a 60-minute hour`);
++    assert.ok(b.delayMins >= 0, b.label);
++  }
++  // The 11:00 hour has four of them running at once and is simply gone.
++  assert.equal(at(hourlyProduction(run, pile), "11:00–12:00").delayMins, 60);
++});
++
++test("the same minute written down twice is one minute lost", () => {
++  const b = at(hourlyProduction(RUN, [
++    delay({ code: "C1", minutes: 1, startTime: "16:00", endTime: "16:01" }),
++    delay({ code: "C2", minutes: 1, startTime: "16:00", endTime: "16:01" }),
++  ]), "16:00–17:00");
++  assert.equal(b.delays.length, 2, "both rows are shown");
++  assert.equal(b.delayMins, 1);
++  assert.equal(b.delaysOverlap, true);
++});
++
++test("delays that do not overlap are not flagged, and their lines do add up", () => {
++  const b = at(hourlyProduction(RUN, [
++    delay({ code: "D1", minutes: 6, startTime: "16:15", endTime: "16:21" }),
++    delay({ code: "RM1", minutes: 22, startTime: "16:33", endTime: "16:55" }),
++  ]), "16:00–17:00");
++  assert.equal(b.delaysOverlap, false);
++  assert.equal(b.delayMins, b.delays.reduce((t, d) => t + d.minutes, 0));
++});
++
++test("one delay inside another is counted once, and both are still shown", () => {
++  const b = at(hourlyProduction(RUN, [
++    delay({ code: "T1", minutes: 40, startTime: "16:10", endTime: "16:50" }),
++    delay({ code: "D1", minutes: 5, startTime: "16:20", endTime: "16:25" }),
++  ]), "16:00–17:00");
++  assert.equal(b.delays.length, 2);
++  assert.equal(b.delayMins, 40);
++  assert.equal(b.delaysOverlap, true);
+ });
+ 
+ test("a delay with no start time is left out rather than guessed into an hour", () => {
+@@ -202,6 +379,27 @@ test("the tooltip shows the code, the duration, the range and the total", () =>
+   assert.match(s, /No delays/);
+ });
+ 
++test("the tooltip says when its lines overlap, instead of printing an addition that fails", () => {
++  assert.match(src("components/robo/reports/report-charts.tsx"), /\{b\.delaysOverlap && \(/);
++});
++
++test("the hour's total is the time covered, not the lines added up", () => {
++  // The guard against the fix being quietly undone: summing the entries is
++  // exactly what produced "1 hour 9 minutes" in a sixty-minute hour.
++  const s = src("lib/robo/hourlyProduction.ts");
++  assert.match(s, /const lost = coveredMinutes\(pieces\.map\(\(p\) => p\.at\)\)/);
++  assert.match(s, /delayMins: lost,/);
++  assert.doesNotMatch(s, /delayMins: hourDelays\.reduce/);
++});
++
++test("a delay is cut at the hour boundary, not filed under the hour it began in", () => {
++  const s = src("lib/robo/hourlyProduction.ts");
++  assert.match(s, /const a = Math\.max\(from, h \* 60\);/);
++  assert.match(s, /const b = Math\.min\(to, \(h \+ 1\) \* 60\);/);
++  // The old one-hour-only placement is gone, not merely unused.
++  assert.doesNotMatch(s, /function delayHour\b/);
++});
++
+ test("touch gets the reading under the chart, where a phone can show all of it", () => {
+   const s = src("components/robo/reports/report-charts.tsx");
+   assert.match(s, /trigger=\{coarsePointer \? "click" : "hover"\}/);
+-- 
+2.43.0
+
+
+From bf512a19661e2387cb63faf73227bd3b6cf166b3 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 05:43:58 +0000
+Subject: [PATCH 3/5] robo(reports): the shift band says how many slabs the
+ shift made
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Production Rate per Hour already named each stretch of the line — SHIFT A,
+SHIFT B, SHIFT C, under the hours it covers. It now also says what came off
+the line in it:
+
+        SHIFT B
+        44 SLABS
+
+The figure is the block's OWN HOURS ADDED UP — the same numbers the points
+above it are drawn from, not a second query with a second opinion. That is
+what makes the counting exact without a word of special-casing: a slab is
+counted in the hour its Out Time falls in (hourlyProduction), every hour
+belongs to exactly one shift by the plant's own windows (06:00–14:00,
+14:00–22:00, 22:00–06:00 — productionShift.SHIFT_WINDOWS, unchanged), and the
+blocks cover every hour of the run exactly once. So every slab is counted
+once, under the shift its production time fell in, and a day's three shifts
+add up to the day.
+
+The night shift is one figure across midnight, not two — 22:00 → 06:00 is one
+shift however many dates it touches — and a run only part-covering a shift is
+counted over the part that was run.
+
+TWO LINES, not "SHIFT B: 44 SLABS" on one, and the reason was measured rather
+than guessed. Bold at 14px, "SHIFT B" is 70px and the whole sentence 166px,
+while the chart gives every hour 52px — on one line it would need a four-hour
+block to clear its neighbours, and the first and last blocks of a run are
+routinely shorter. Stacked, the wider line is the count, 79px at three digits,
+which two hours covers with room to spare. A one-hour end block shows the
+letter and the bare number.
+
+The name keeps the shift's colour; the count wears the dark ink the date
+markers use. The band grew by one line and the chart grew with it — in
+chart-tokens, where HOURLY_PLOT_H is also what the page's loading placeholder
+reserves, so the two cannot drift — leaving the plot area exactly as tall as
+it was.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SPqDFZ7o6eq1utS7hzoQsF
+---
+ src/components/robo/reports/chart-tokens.ts   |   6 +-
+ src/components/robo/reports/report-charts.tsx |  40 +++-
+ src/lib/robo/hourlyShifts.ts                  |  68 ++++++-
+ tests/roboHourlyShifts.test.ts                | 172 +++++++++++++++++-
+ 4 files changed, 265 insertions(+), 21 deletions(-)
+
+diff --git a/src/components/robo/reports/chart-tokens.ts b/src/components/robo/reports/chart-tokens.ts
+index 6545ac5..060d1dd 100644
+--- a/src/components/robo/reports/chart-tokens.ts
++++ b/src/components/robo/reports/chart-tokens.ts
+@@ -64,7 +64,11 @@ export const DATE_TEXT = "#44423c";
+  *                    hour…" line under them is not counted: the placeholder is
+  *                    drawn before the page knows what kind of screen it is on.
+  */
+-export const HOURLY_PLOT_H = 418;
++/* 380 before the shift band under the hours, 418 before that band gained its
++   second line — the slabs each shift produced (lib/robo/hourlyShifts.ts). The
++   band grew by one line of text and the chart grew with it, so the plot area is
++   exactly as tall as it was and the placeholder still matches the chart. */
++export const HOURLY_PLOT_H = 436;
+ export const HOURLY_FIGURE_H = HOURLY_PLOT_H + 2 * (16 + 4);
+ 
+ export const TOOLTIP_STYLE = {
+diff --git a/src/components/robo/reports/report-charts.tsx b/src/components/robo/reports/report-charts.tsx
+index 1e44cc6..a601b19 100644
+--- a/src/components/robo/reports/report-charts.tsx
++++ b/src/components/robo/reports/report-charts.tsx
+@@ -14,7 +14,7 @@ import {
+ import { fmtDuration, fmtDurationLong } from "@/lib/robo/utils";
+ import type { HourBucket } from "@/lib/robo/hourlyProduction";
+ import { hourlyYAxis } from "@/lib/robo/hourlyAxis";
+-import { shiftBlockLabel, shiftBlocks, shiftOfHour, shiftSpans } from "@/lib/robo/hourlyShifts";
++import { shiftBlockLines, shiftBlocks, shiftOfHour, shiftSpans } from "@/lib/robo/hourlyShifts";
+ import { dailyRateYAxis } from "@/lib/robo/dailyRate";
+ import {
+   DELAY_HUE, PRODUCTION_HUE, GRID, AXIS, MUTED, DATE_RULE, DATE_TEXT, SHIFT_HUES, TOOLTIP_STYLE, HOURLY_PLOT_H,
+@@ -35,7 +35,7 @@ function shortDate(d: string | null | undefined): string {
+ const HP_HEIGHT = HOURLY_PLOT_H; // chart height — chart-tokens, where the page's placeholder reads it too
+ const HP_AXIS_W = 46;    // Y-axis gutter — also the width of the pinned overlay
+ const HP_XAXIS_H = 74;   // bottom room for the angled time labels
+-const HP_SHIFT_H = 32;   // the SHIFT A / B / C band under them
++const HP_SHIFT_H = 50;   // the SHIFT A / B / C band under them, name over count
+ const HP_TOP = 24;       // top room for the per-point value labels and date markers
+ const HP_HOUR_PX = 52;   // readable width per hour before horizontal scroll kicks in
+ /** Both X-axes carry the same padding, so the shift labels line up exactly with
+@@ -144,6 +144,12 @@ function HourTooltip({ active, payload }: HourTooltipProps) {
+  * and why. A band under the time labels names each stretch in its own colour,
+  * repeating as the run carries on through the next day's shifts, so the chart
+  * is as readable in black and white as in colour.
++ *
++ * SLABS PER SHIFT: under each name the band prints what that shift produced —
++ * SHIFT B / 39 SLABS — being the block's own hours added up. So the figure is
++ * the plotted line read off, the three shifts of a day add up to the day, and
++ * no slab is counted twice or missed: each belongs to the hour its Out Time
++ * fell in, and each hour to exactly one shift.
+  */
+ export function HourlyProductionLine({ data }: { data: HourBucket[] }) {
+   const { max: yMax, ticks } = hourlyYAxis(data.reduce((m, b) => Math.max(m, b.slabs), 0));
+@@ -159,11 +165,15 @@ export function HourlyProductionLine({ data }: { data: HourBucket[] }) {
+   // The shift of each hour, and from it: the gradient that colours the line,
+   // and the labels under the axis. Both come from the one function, so a
+   // colour and the name beneath it can never disagree.
++  //
++  // The band's counts are the SAME numbers as the points above it — each
++  // block's own hours added up — so a shift's total is the plotted line read
++  // off rather than a second answer to the same question.
+   const hours = data.map((b) => b.hour);
+   const spans = shiftSpans(hours);
+   const hueAt = (i: number) => SHIFT_HUES[shiftOfHour(hours[i] ?? 0)];
+   const shiftLabels = new Map(
+-    shiftBlocks(hours).map((b) => [b.mid, { code: b.code, text: shiftBlockLabel(b) }]),
++    shiftBlocks(hours, data.map((b) => b.slabs)).map((b) => [b.mid, { code: b.code, lines: shiftBlockLines(b) }]),
+   );
+   // One <defs> id per mounted chart — two charts on a page must not share a
+   // gradient, and a bare "#id" would be the same for both.
+@@ -183,15 +193,25 @@ export function HourlyProductionLine({ data }: { data: HourBucket[] }) {
+   }, []);
+   const tappedHour = coarsePointer && tapped !== null ? data[tapped] : undefined;
+ 
+-  /** SHIFT A / SHIFT B / SHIFT C, centred under the hours it covers. Drawn as a
+-   *  second X-axis so it sits in the chart's own coordinate space and stays
+-   *  aligned with the hours at any width, scrolled or not. */
++  /** SHIFT A / SHIFT B / SHIFT C and the slabs it produced, centred under the
++   *  hours it covers. Drawn as a second X-axis so it sits in the chart's own
++   *  coordinate space and stays aligned with the hours at any width, scrolled
++   *  or not.
++   *
++   *  The name wears the shift's colour, tying it to the stretch of line above
++   *  it; the count is a reading, so it wears ink — the same dark neutral as the
++   *  date markers. A figure is easier to read in it, and the colour is already
++   *  saying everything it has to say. */
+   const shiftTick = ({ x = 0, y = 0, payload }: TickProps) => {
+     const hit = shiftLabels.get(Number(payload?.value));
+     if (!hit) return <g />;
+     return (
+-      <text x={x} y={y + 20} textAnchor="middle" fill={SHIFT_HUES[hit.code]}
+-        style={{ fontSize: 14, fontWeight: 800, letterSpacing: "0.08em" }}>{hit.text}</text>
++      <g>
++        <text x={x} y={y + 18} textAnchor="middle" fill={SHIFT_HUES[hit.code]}
++          style={{ fontSize: 14, fontWeight: 800, letterSpacing: "0.08em" }}>{hit.lines[0]}</text>
++        <text x={x} y={y + 35} textAnchor="middle" fill={DATE_TEXT}
++          style={{ fontSize: 12, fontWeight: 700, letterSpacing: "0.06em" }}>{hit.lines[1]}</text>
++      </g>
+     );
+   };
+ 
+@@ -298,7 +318,9 @@ export function HourlyProductionLine({ data }: { data: HourBucket[] }) {
+       </div>
+       </div>
+ 
+-      <div className="mt-1 text-center text-xs font-semibold uppercase tracking-wide text-gray-500">
++      {/* Clear of the band's count line, which is set in the same dark ink: at
++          the old single line of margin the two read as one block of text. */}
++      <div className="mt-3 text-center text-xs font-semibold uppercase tracking-wide text-gray-500">
+         Time Duration (in Hours)
+       </div>
+ 
+diff --git a/src/lib/robo/hourlyShifts.ts b/src/lib/robo/hourlyShifts.ts
+index 0021547..c0a9f8d 100644
+--- a/src/lib/robo/hourlyShifts.ts
++++ b/src/lib/robo/hourlyShifts.ts
+@@ -1,11 +1,12 @@
+ /**
+  * Which shift each hour of the "Production Rate per Hour" chart belongs to, and
+  * how the chart draws that: one continuous line whose COLOUR changes at the
+- * shift boundaries, and one bold label per block under the axis.
++ * shift boundaries, and one bold label per block under the axis naming the
++ * shift and the slabs that came off the line in it.
+  *
+  * Pure and alias-free so `node --test` can reach it, and kept out of the chart
+- * component so the blocks and the colour stops can be pinned by tests rather
+- * than eyeballed in a browser.
++ * component so the blocks, the counts and the colour stops can be pinned by
++ * tests rather than eyeballed in a browser.
+  *
+  * ── THE SHIFT OF AN HOUR, NOT OF A SLAB ───────────────────────────────────
+  * The chart's X-axis is a run of clock HOURS, so the shift here is a property
+@@ -29,6 +30,21 @@
+  * first point to the last. So point i sits at i/(n-1), independent of the
+  * chart's margins, axis width and padding — nothing here needs to know the
+  * pixel geometry, and the colours cannot drift out of step with the plot.
++ *
++ * ── THE SLABS OF A SHIFT ──────────────────────────────────────────────────
++ * A block's count is its own hours' counts added up, and that is the whole of
++ * it. It needs no separate pass over the slabs and cannot disagree with the
++ * line drawn above it, because it is the same numbers: a slab is counted in
++ * the hour its Out Time falls in (hourlyProduction.ts), every hour belongs to
++ * exactly ONE shift, and the blocks cover every hour of the run exactly once —
++ * so every slab the chart draws is counted once, under the shift whose window
++ * its production time fell in, and the three shift totals of a day add up to
++ * the day's slabs with nothing double-counted and nothing dropped.
++ *
++ * A block that the run only part-covers is counted over the part that was run:
++ * a batch that started at 16:00 has no 14:00–16:00 to count, and its Shift B
++ * figure is the slabs that batch made on Shift B. The chart is one batch's own
++ * run, and the count is of what it draws.
+  */
+ 
+ import { SHIFT_WINDOWS, type ShiftCode } from "./productionShift.ts";
+@@ -58,25 +74,34 @@ export interface ShiftBlock {
+   hours: number;
+   /** The bucket to hang the label on — the middle of the stretch. */
+   mid: number;
++  /** Slabs completed in the stretch: its hours' own counts added up. 0 when
++   *  the caller gave no counts, and 0 for a shift that finished nothing. */
++  slabs: number;
+ }
+ 
+ /**
+  * The hours split into consecutive same-shift blocks, in order. A run crossing
+  * midnight simply continues: 22:00 → 06:00 is ONE block of Shift C whether or
+  * not the date changed inside it, which is what the night shift is.
++ *
++ * `slabs` is the per-hour counts, in the same order as `hours` — bucket i's
++ * count is slabs[i], so `data.map(b => b.slabs)` of the chart's own buckets is
++ * exactly what to pass. Each one lands in the single block that holds its hour.
+  */
+-export function shiftBlocks(hours: readonly number[]): ShiftBlock[] {
++export function shiftBlocks(hours: readonly number[], slabs: readonly number[] = []): ShiftBlock[] {
+   const blocks: ShiftBlock[] = [];
+   hours.forEach((h, i) => {
+     const code = shiftOfHour(h);
++    const n = Number.isFinite(slabs[i]) ? (slabs[i] as number) : 0;
+     // The hours arrive in order, so the open block is always the previous hour's.
+     const last = blocks[blocks.length - 1];
+     if (last && last.code === code) {
+       last.to = i;
+       last.hours = last.to - last.from + 1;
+       last.mid = Math.floor((last.from + last.to) / 2);
++      last.slabs += n;
+     } else {
+-      blocks.push({ code, from: i, to: i, hours: 1, mid: i });
++      blocks.push({ code, from: i, to: i, hours: 1, mid: i, slabs: n });
+     }
+   });
+   return blocks;
+@@ -114,12 +139,35 @@ export function shiftSpans(hours: readonly number[]): ShiftSpan[] {
+ }
+ 
+ /**
+- * What a block's label reads. "SHIFT A" set bold at 14px is about 75px wide and
+- * the chart gives every hour at least 52px, so two hours is room enough. A run
+- * that starts or ends on the last hour of a shift leaves a one-hour block,
+- * where the full name would collide with its neighbours — that one shows the
+- * letter alone, in the same colour, which the hours either side already explain.
++ * What a block's label reads: the shift, and under it the slabs it produced —
++ *
++ *     SHIFT B
++ *     39 SLABS
++ *
++ * TWO LINES, not "SHIFT B: 39 SLABS" on one, and the reason is measured. Set
++ * bold at 14px, "SHIFT B" is 70px wide and the whole sentence is 166px, while
++ * the chart gives every hour 52px: on one line the label would need a FOUR-hour
++ * block to clear its neighbours, and the first and last blocks of a run are
++ * routinely shorter than that — a batch that starts at 20:00 leaves two hours
++ * of Shift B. Stacked, the wider of the two lines is the count ("128 SLABS" is
++ * 79px at 12px), which two hours already covers with room to spare.
++ *
++ * A one-hour block — a run that starts or ends on a shift's last hour — shows
++ * the letter and the bare number, which the hours either side already explain.
+  */
++export function shiftBlockLines(block: ShiftBlock): [string, string] {
++  return [shiftBlockLabel(block), shiftBlockCount(block)];
++}
++
++/** Line one: the shift's name, or its letter alone in a one-hour block. */
+ export function shiftBlockLabel(block: ShiftBlock): string {
+   return block.hours >= 2 ? `SHIFT ${block.code}` : block.code;
+ }
++
++/** Line two: the slabs the shift produced. "1 SLAB" reads as English, and a
++ *  shift that finished nothing says "0 SLABS" rather than going blank — an
++ *  empty line under a named shift reads as a bug, not as a quiet night. */
++export function shiftBlockCount(block: ShiftBlock): string {
++  const n = block.slabs;
++  return block.hours >= 2 ? `${n} ${n === 1 ? "SLAB" : "SLABS"}` : String(n);
++}
+diff --git a/tests/roboHourlyShifts.test.ts b/tests/roboHourlyShifts.test.ts
+index 6c42df4..94fe97a 100644
+--- a/tests/roboHourlyShifts.test.ts
++++ b/tests/roboHourlyShifts.test.ts
+@@ -3,11 +3,15 @@ import assert from "node:assert/strict";
+ import { readFileSync } from "node:fs";
+ 
+ import {
++  shiftBlockCount,
+   shiftBlockLabel,
++  shiftBlockLines,
+   shiftBlocks,
+   shiftOfHour,
+   shiftSpans,
+ } from "../src/lib/robo/hourlyShifts.ts";
++import { hourlyProduction, type HourlySlab } from "../src/lib/robo/hourlyProduction.ts";
++import { shiftFromTime } from "../src/lib/robo/productionShift.ts";
+ 
+ /* The shift colouring of "Production Rate per Hour".
+  *
+@@ -122,6 +126,62 @@ test("one hour of data is one full-width colour, not a division by zero", () =>
+   assert.deepEqual(shiftSpans([9]), [{ code: "A", from: 0, to: 1 }]);
+ });
+ 
++/* ── The slabs of a shift ──────────────────────────────────────────── */
++
++/** A count for every hour of the owner's run, so each block has a known total:
++ *  hour i produces i+1 slabs. */
++const RISING = OWNERS_RUN.map((_, i) => i + 1);
++
++test("a block's total is its own hours added up", () => {
++  const blocks = shiftBlocks(OWNERS_RUN, RISING);
++  blocks.forEach((b) => {
++    const own = RISING.slice(b.from, b.to + 1).reduce((t, n) => t + n, 0);
++    assert.equal(b.slabs, own, `${b.code} ${b.from}–${b.to}`);
++  });
++});
++
++test("every slab is counted exactly once: the blocks add up to the run", () => {
++  // The one property that matters. The blocks cover every hour once (tested
++  // above), so a count can be neither double-counted into two shifts nor lost
++  // between them, whatever the run.
++  const total = RISING.reduce((t, n) => t + n, 0);
++  assert.equal(shiftBlocks(OWNERS_RUN, RISING).reduce((t, b) => t + b.slabs, 0), total);
++});
++
++test("a slab is counted under the shift its hour belongs to, boundaries included", () => {
++  // 13:00–14:00 is the last hour of A, 14:00–15:00 the first of B — one slab
++  // each, and the boundary does not put either in the other's column.
++  const blocks = shiftBlocks([12, 13, 14, 15], [5, 1, 1, 7]);
++  assert.deepEqual(blocks.map((b) => [b.code, b.slabs]), [["A", 6], ["B", 8]]);
++  // And the same at 22:00, where the night shift takes over.
++  assert.deepEqual(
++    shiftBlocks([20, 21, 22, 23], [2, 3, 4, 5]).map((b) => [b.code, b.slabs]),
++    [["B", 5], ["C", 9]],
++  );
++});
++
++test("the night shift's count is one figure across midnight, not two", () => {
++  // 22:00 → 06:00 is one shift however many dates it touches. Counting it as
++  // two would halve every night on the chart.
++  const night = [22, 23, 0, 1, 2, 3, 4, 5];
++  const blocks = shiftBlocks(night, [4, 6, 3, 0, 2, 5, 9, 10]);
++  assert.equal(blocks.length, 1);
++  assert.equal(blocks[0].slabs, 39);
++});
++
++test("a shift that finished nothing counts nothing, and says so", () => {
++  const [a] = shiftBlocks([6, 7, 8], [0, 0, 0]);
++  assert.equal(a.slabs, 0);
++  assert.equal(shiftBlockCount(a), "0 SLABS");
++});
++
++test("counts are optional — the colouring never needed them", () => {
++  // shiftSpans and the gradient ask only for hours. Passing none must not make
++  // a block's total undefined or NaN.
++  for (const b of shiftBlocks(OWNERS_RUN)) assert.equal(b.slabs, 0);
++  assert.equal(shiftBlocks([6, 7], [3])[0].slabs, 3, "a short count array does not poison the total");
++});
++
+ /* ── The labels ────────────────────────────────────────────────────── */
+ 
+ test("a block names its shift in full, and a single hour shows the letter", () => {
+@@ -138,6 +198,76 @@ test("every block of the owner's run is named", () => {
+   );
+ });
+ 
++test("the owner's example reads SHIFT B over 39 SLABS", () => {
++  // Eight hours of Shift B that produced 39 slabs between them.
++  const [b] = shiftBlocks([14, 15, 16, 17, 18, 19, 20, 21], [4, 6, 5, 3, 7, 5, 4, 5]);
++  assert.equal(b.slabs, 39);
++  assert.deepEqual(shiftBlockLines(b), ["SHIFT B", "39 SLABS"]);
++});
++
++test("one slab is one SLAB, and the rest are SLABS", () => {
++  assert.equal(shiftBlockCount(shiftBlocks([14, 15], [1, 0])[0]), "1 SLAB");
++  assert.equal(shiftBlockCount(shiftBlocks([14, 15], [1, 1])[0]), "2 SLABS");
++});
++
++test("a one-hour block shows the letter and the bare number", () => {
++  // There is no room for "SHIFT A" and "7 SLABS" under a single 52px hour, and
++  // the hours either side already name the shift.
++  const [first] = shiftBlocks([13, 14, 15], [7, 2, 2]);
++  assert.deepEqual(shiftBlockLines(first), ["A", "7"]);
++});
++
++test("the two lines are two lines — the sentence on one would not fit", () => {
++  // Measured: "SHIFT B: 39 SLABS" bold at 14px is 166px and an hour is 52px, so
++  // one line needs a four-hour block. Runs routinely end in two-hour ones.
++  for (const b of shiftBlocks(OWNERS_RUN, RISING)) {
++    const lines = shiftBlockLines(b);
++    assert.equal(lines.length, 2);
++    assert.doesNotMatch(lines[0], /\d/, "the name line carries no figure");
++    assert.match(lines[1], /^\d+( SLABS?)?$/, "the count line is the figure");
++  }
++});
++
++/* ── End to end: the band against an independent count ─────────────── */
++
++test("the band's totals are the slabs of each shift, counted from their own times", () => {
++  /* The chart's own pipeline — slabs → hourly buckets → shift blocks — against
++     a count that shares none of it: each slab assigned by the shift its Out
++     Time falls in (productionShift.shiftFromTime), straight off the register.
++     If a slab ever landed in two blocks, or in none, these two would differ. */
++  const outs = [
++    "06:10", "07:45", "09:00", "13:59", // A — 4
++    "14:00", "15:30", "18:20", "21:59", "20:05", // B — 5, including both boundaries
++    "22:00", "23:30", "00:40", "03:15", "05:59", "04:00", // C — 6, across midnight
++  ];
++  const slabs: HourlySlab[] = outs.map((out, i) => ({
++    productionDate: "2026-10-18",
++    // In an hour before the Out, so nothing is read as an overnight slab except
++    // the ones that really are.
++    inTime: out >= "00:00" && out < "06:00" && i > 10 ? "23:50" : out,
++    outTime: out,
++    slabNumber: String(100 + i),
++    id: `s${i}`,
++  }));
++
++  const buckets = hourlyProduction(slabs);
++  const got = new Map<string, number>();
++  for (const b of shiftBlocks(buckets.map((x) => x.hour), buckets.map((x) => x.slabs))) {
++    got.set(b.code, (got.get(b.code) ?? 0) + b.slabs);
++  }
++
++  const want = new Map<string, number>();
++  for (const out of outs) {
++    const code = shiftFromTime(out) as string;
++    want.set(code, (want.get(code) ?? 0) + 1);
++  }
++
++  assert.deepEqual(Object.fromEntries([...want].sort()), { A: 4, B: 5, C: 6 });
++  assert.deepEqual(Object.fromEntries([...got].sort()), Object.fromEntries([...want].sort()));
++  // And nothing was invented or lost on the way through.
++  assert.equal([...got.values()].reduce((t, n) => t + n, 0), outs.length);
++});
++
+ /* ── Wiring guards ─────────────────────────────────────────────────── */
+ 
+ /** A source file as the repository holds it: LF, whatever the checkout did to it.
+@@ -170,6 +300,45 @@ test("the shift band and the time labels share one padding, so they line up", ()
+   assert.equal((s.match(/padding=\{HP_XPAD\}/g) ?? []).length, 2);
+ });
+ 
++test("the band counts the chart's OWN buckets, so the figure is the line read off", () => {
++  // Not a second query and not a second rule: the same numbers the points are
++  // drawn from. A separate count is how a band comes to disagree with the
++  // chart above it.
++  const s = src("components/robo/reports/report-charts.tsx");
++  assert.match(s, /shiftBlocks\(hours, data\.map\(\(b\) => b\.slabs\)\)/);
++  assert.match(s, /shiftBlockLines\(b\)/);
++});
++
++test("the band draws both lines, the name in the shift's colour and the count in ink", () => {
++  const s = src("components/robo/reports/report-charts.tsx");
++  const tick = s.slice(s.indexOf("const shiftTick"), s.indexOf("return (\n    <div>"));
++  assert.match(tick, /fill=\{SHIFT_HUES\[hit\.code\]\}[\s\S]*\{hit\.lines\[0\]\}/);
++  assert.match(tick, /fill=\{DATE_TEXT\}[\s\S]*\{hit\.lines\[1\]\}/);
++  // Two baselines, the second below the first.
++  const ys = [...tick.matchAll(/y=\{y \+ (\d+)\}/g)].map((m) => Number(m[1]));
++  assert.equal(ys.length, 2);
++  assert.ok(ys[1] > ys[0], "the count sits under the name");
++});
++
++test("the count line was given its own room, not taken out of the plot", () => {
++  // The band grew by the height of a second line; the chart grew with it, so
++  // the plot area is exactly as tall as it was.
++  const s = src("components/robo/reports/report-charts.tsx");
++  const num = (name: string, from = s) => {
++    const m = new RegExp(`const ${name} = (\\d+);`).exec(from);
++    assert.ok(m, `${name} is gone`);
++    return Number(m[1]);
++  };
++  // The chart's height lives in chart-tokens, where the page's placeholder
++  // reads it too, so the two cannot drift apart.
++  const H = num("HOURLY_PLOT_H", src("components/robo/reports/chart-tokens.ts"));
++  assert.match(s, /const HP_HEIGHT = HOURLY_PLOT_H;/);
++  const X = num("HP_XAXIS_H");
++  const B = num("HP_SHIFT_H");
++  assert.ok(B >= 46, `the band must hold two lines of text (is ${B})`);
++  assert.equal(H - X - B, 312, "the plot area changed height");
++});
++
+ test("the date divider is heavier than the gridlines", () => {
+   const s = src("components/robo/reports/report-charts.tsx");
+   assert.match(s, /<ReferenceLine[^>]*stroke=\{DATE_RULE\}[^>]*strokeWidth=\{2\}/s);
+@@ -184,7 +353,8 @@ test("both axes are named", () => {
+ 
+ test("the hourly chart's placeholder is the figure's own height, read without pulling Recharts in", () => {
+   const tokens = src("components/robo/reports/chart-tokens.ts");
+-  assert.match(tokens, /export const HOURLY_PLOT_H = 418;/);
++  // 436 since the band gained its count line; the placeholder moves with it.
++  assert.match(tokens, /export const HOURLY_PLOT_H = 436;/);
+   assert.match(tokens, /export const HOURLY_FIGURE_H = HOURLY_PLOT_H \+ 2 \* \(16 \+ 4\);/);
+   assert.doesNotMatch(tokens, /from "recharts"/);
+   assert.match(src("components/robo/reports/report-charts.tsx"), /const HP_HEIGHT = HOURLY_PLOT_H;/);
+-- 
+2.43.0
+
+
+From 30d78f23de1dedebab7e04baaa1645ed0ee063d7 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 05:56:56 +0000
+Subject: [PATCH 4/5] attendance: an In-Time may be ten minutes old, and the
+ Out-Time is stamped, not typed
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two rules, so a day cannot be written as something other than what happened.
+
+1 — AN IN-TIME MAY BE UP TO TEN MINUTES OLD, AND NOT IN THE FUTURE. At 18:43
+the earliest is 18:33, exactly as the owner put it. Ten minutes is room to
+finish walking to the tablet; it is not room to write this morning in at six
+o'clock this evening. The field opens ON THE CLOCK for a row that has none
+yet, shows "18:33 or later" underneath, and turns red with the reason — and
+Save with it — the moment anything earlier is typed.
+
+2 — AN OUT-TIME IS NEVER TYPED. It is stamped with the clock, so it cannot be
+back-dated, cannot be post-dated, and is exactly the moment the operator
+pressed it. The box is a div and two buttons, not an input: there is nothing
+to type in.
+
+WHOSE CLOCK: the plant's, Asia/Kolkata, on both ends — the same reading
+lib/chromia/plant-time gives the rest of the ERP. The page runs the two
+functions so the operator is told at once; THE SERVER runs them again against
+its own reading before anything is stored, because a page can be edited and a
+request can be made without one. The browser never decides what is stored.
+
+Both comparisons go the SHORT way round the clock, so 23:58 is two minutes
+before 00:00 rather than twenty-three hours and fifty-eight minutes after it:
+the night shift marks in across midnight every night and must not meet a wall
+when it does. A tablet running up to two minutes fast is believed, or ordinary
+drift would refuse every honest entry for a reason nobody on the floor could
+see; an Out-Time, which is the one the record really turns on, is not typed at
+all and so is never in the future by a second.
+
+THE RULE IS ABOUT ENTERING A TIME, NOT CARRYING ONE. An In-Time that did not
+change is left alone however old it is — otherwise opening this morning's row
+in the evening to tick the other line would send its 06:00 back, be refused,
+and the row could never be corrected again. The page and the server spare it
+by the same test, or the page would refuse to send what the server would have
+accepted.
+
+One register, two ERPs: this is the one handler both doors reach, so the rules
+are the same on the Robo tablet and the Chromia one by construction.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SPqDFZ7o6eq1utS7hzoQsF
+---
+ .../attendance/AttendanceClient.tsx           |  86 +++++++-
+ src/lib/attendance/clock.ts                   | 144 +++++++++++++
+ src/lib/attendance/server.ts                  |  26 ++-
+ tests/attendanceClock.test.ts                 | 201 ++++++++++++++++++
+ 4 files changed, 444 insertions(+), 13 deletions(-)
+ create mode 100644 src/lib/attendance/clock.ts
+ create mode 100644 tests/attendanceClock.test.ts
+
+diff --git a/src/components/attendance/AttendanceClient.tsx b/src/components/attendance/AttendanceClient.tsx
+index 98f4e4c..475fb78 100644
+--- a/src/components/attendance/AttendanceClient.tsx
++++ b/src/components/attendance/AttendanceClient.tsx
+@@ -20,6 +20,8 @@ import {
+   inp, lbl, btnPrimary, btnGhost, btnDanger, th as thBase, thead, errorBox, noteBox, dmy, today,
+ } from "@/components/commercial/invoices/ui";
+ import { LINES, LINE_LABELS, linesLabel, parseLines, workedLabel, type LineCode } from "@/lib/attendance/attendance";
++import { IN_TIME_GRACE_MINUTES, earliestInTime, inTimeError, inTimeUnchanged } from "@/lib/attendance/clock";
++import { toPlantTimeInput } from "@/lib/chromia/plant-time";
+ import {
+   PERIOD_LABELS, PERIOD_MODES, RECORD_TYPES, RECORD_TYPE_LABELS,
+   type PeriodMode, type RecordType,
+@@ -52,6 +54,12 @@ const lineChip = (on: boolean) =>
+ const todayStr = today;
+ const thisMonth = () => todayStr().slice(0, 7);
+ 
++/** The tablet's clock, read in plant time (Asia/Kolkata) — what the operator
++ *  is standing in front of, and what the In-Time window is measured from on
++ *  screen. The server checks the same rules against its own reading of the
++ *  same clock before anything is stored; see lib/attendance/clock.ts. */
++const nowPlant = () => toPlantTimeInput(new Date());
++
+ interface DayRow {
+   operatorId: string;
+   operatorName: string;
+@@ -110,6 +118,15 @@ export function AttendanceClient({ api }: {
+   const [editing, setEditing] = useState<string | null>(null);
+   const [draft, setDraft] = useState<Draft>(NO_DRAFT);
+   const [saving, setSaving] = useState(false);
++  /* The clock, kept fresh while a row is open: the earliest In-Time it allows
++     moves with it, and a row left open for a few minutes must not go on
++     offering the window it had when it was opened. */
++  const [now, setNow] = useState(nowPlant);
++  useEffect(() => {
++    if (!editing) return;
++    const t = setInterval(() => setNow(nowPlant()), 15_000);
++    return () => clearInterval(t);
++  }, [editing]);
+ 
+   const call = useCallback(async (path: string, init?: RequestInit) => {
+     const res = await fetch(`${api}/${path}`, { cache: "no-store", ...init });
+@@ -169,7 +186,13 @@ export function AttendanceClient({ api }: {
+ 
+   const startEdit = (r: DayRow) => {
+     setEditing(r.operatorId);
+-    setDraft({ lines: parseLines(r.lines), inTime: r.inTime, outTime: r.outTime });
++    /* A row with no In-Time yet opens ON THE CLOCK, which is the time the
++       operator is marking: the ten minutes are there for the walk to the
++       tablet, not as a field to fill in from memory. One already entered is
++       left exactly as it was. */
++    const clock = nowPlant();
++    setNow(clock);
++    setDraft({ lines: parseLines(r.lines), inTime: r.inTime || clock, outTime: r.outTime });
+     setRowError(null);
+   };
+ 
+@@ -198,6 +221,19 @@ export function AttendanceClient({ api }: {
+      will store, from the same function, so the row never changes on save. */
+   const draftWorked = useMemo(() => workedLabel(draft.inTime, draft.outTime), [draft.inTime, draft.outTime]);
+ 
++  /* Why the drafted In-Time cannot be used, or null. The SAME function the
++     server will use, and on the same terms:
++       • empty is not an error — a row may be saved for its Line alone;
++       • an UNCHANGED one is not an error either, however old. Opening this
++         morning's row in the evening to tick the other line sends its 06:00
++         back; judging that would make the row uncorrectable for the rest of
++         the day, and the rule is about entering a time, not carrying one. */
++  const originalIn = editing ? (rows.find((r) => r.operatorId === editing)?.inTime ?? "") : "";
++  const inError = useMemo(
++    () => (draft.inTime.trim() && !inTimeUnchanged(draft.inTime, originalIn) ? inTimeError(draft.inTime, now) : null),
++    [draft.inTime, originalIn, now],
++  );
++
+   return (
+     <div className="space-y-6">
+       <Toast trigger={toast.n} text={toast.text} />
+@@ -206,6 +242,9 @@ export function AttendanceClient({ api }: {
+         date={date} setDate={changeDate} rows={rows} loading={loading}
+         dayError={dayError} retry={() => void loadDay(date)} error={error} notice={notice} rowError={rowError}
+         editing={editing} draft={draft} draftWorked={draftWorked} saving={saving}
++        now={now} inError={inError}
++        markOut={() => { const t = nowPlant(); setNow(t); setDraft((d) => ({ ...d, outTime: t })); }}
++        clearOut={() => setDraft((d) => ({ ...d, outTime: "" }))}
+         startEdit={startEdit} cancel={() => { setEditing(null); setRowError(null); }} toggleLine={toggleLine}
+         setDraft={setDraft} saveRow={saveRow}
+         operators={operators} operatorsFailed={operatorsFailed}
+@@ -236,6 +275,10 @@ function DailyAttendance(props: {
+   dayError: string; retry: () => void; error: string; notice: string;
+   rowError: { operatorId: string; message: string } | null;
+   editing: string | null; draft: Draft; draftWorked: string; saving: boolean;
++  /** The plant clock, and why the drafted In-Time cannot be used (null when it can). */
++  now: string; inError: string | null;
++  /** Stamp the Out-Time with the clock, or take it off again. It is never typed. */
++  markOut: () => void; clearOut: () => void;
+   startEdit: (r: DayRow) => void; cancel: () => void; toggleLine: (c: LineCode) => void;
+   setDraft: (f: (d: Draft) => Draft) => void; saveRow: (id: string) => void;
+   operators: Operator[]; operatorsFailed: boolean;
+@@ -243,7 +286,7 @@ function DailyAttendance(props: {
+   call: (path: string, init?: RequestInit) => Promise<unknown>;
+   setError: (m: string) => void;
+ }) {
+-  const { date, setDate, rows, loading, dayError, rowError, editing, draft, draftWorked, saving } = props;
++  const { date, setDate, rows, loading, dayError, rowError, editing, draft, draftWorked, saving, now, inError } = props;
+   const [managing, setManaging] = useState(false);
+   /* A failed save is said under its own row, and brought into view: the row
+      can be far down a long roster, below the fold on a tablet. */
+@@ -257,7 +300,7 @@ function DailyAttendance(props: {
+       <Card>
+         <SectionHead
+           title="Daily Attendance"
+-          subtitle="One line per operator for the day. An operator on both lines has one In and one Out — they came to work once."
++          subtitle={`One line per operator for the day. An operator on both lines has one In and one Out — they came to work once. Mark in as you arrive: an In-Time may be up to ${IN_TIME_GRACE_MINUTES} minutes old, and the Out-Time is stamped with the clock.`}
+         />
+         <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
+           <div className="w-full sm:w-56">
+@@ -323,21 +366,44 @@ function DailyAttendance(props: {
+                       ) : linesLabel(r.lines)}
+                     </td>
+                     <td className={td}>
+-                      {isEditing
+-                        ? <TimeInput value={draft.inTime} onChange={(v) => props.setDraft((d) => ({ ...d, inTime: v }))} className={`${inp} w-24`} />
+-                        : (r.inTime || "-")}
++                      {isEditing ? (
++                        <div className="min-w-[7rem]">
++                          <TimeInput value={draft.inTime} onChange={(v) => props.setDraft((d) => ({ ...d, inTime: v }))}
++                            className={`${inp} w-24 ${inError ? "border-red-400 focus:border-red-400 focus:ring-red-100" : ""}`} />
++                          {inError
++                            ? <p role="alert" className="mt-1 text-xs font-medium text-red-600">{inError}</p>
++                            : <p className="mt-1 text-xs text-gray-400">{earliestInTime(now)} or later</p>}
++                        </div>
++                      ) : (r.inTime || "-")}
+                     </td>
++                    {/* The Out-Time is stamped, never typed: it is the moment
++                        the operator pressed it, so it cannot be back-dated and
++                        cannot be set ahead. The server stamps it again from its
++                        own clock, so this button is the convenience, not the
++                        rule. */}
+                     <td className={td}>
+-                      {isEditing
+-                        ? <TimeInput value={draft.outTime} onChange={(v) => props.setDraft((d) => ({ ...d, outTime: v }))} className={`${inp} w-24`} />
+-                        : (r.outTime || "-")}
++                      {isEditing ? (
++                        <div className="min-w-[8rem]">
++                          <div className={`${inp} w-24 ${draft.outTime ? "font-medium text-gray-900" : "text-gray-400"}`}>
++                            {draft.outTime || "—"}
++                          </div>
++                          <div className="mt-1 flex flex-wrap gap-1.5">
++                            <button type="button" className={btnGhost} onClick={props.markOut}>
++                              {draft.outTime ? "Update to now" : "Mark out now"}
++                            </button>
++                            {draft.outTime && (
++                              <button type="button" className={btnGhost} onClick={props.clearOut}>Clear</button>
++                            )}
++                          </div>
++                        </div>
++                      ) : (r.outTime || "-")}
+                     </td>
+                     <td className={`${td} font-medium text-gray-900`}>{isEditing ? draftWorked : r.worked}</td>
+                     <td className={`${td} pr-0 text-right`}>
+                       {isEditing ? (
+                         <div className="flex justify-end gap-2 whitespace-nowrap">
+                           <button type="button" className={btnGhost} onClick={props.cancel} disabled={saving}>Cancel</button>
+-                          <button type="button" className={btnPrimary} onClick={() => props.saveRow(r.operatorId)} disabled={saving}>
++                          <button type="button" className={btnPrimary} onClick={() => props.saveRow(r.operatorId)} disabled={saving || Boolean(inError)}>
+                             {saving ? "Saving…" : "Save"}
+                           </button>
+                         </div>
+diff --git a/src/lib/attendance/clock.ts b/src/lib/attendance/clock.ts
+new file mode 100644
+index 0000000..58e3bca
+--- /dev/null
++++ b/src/lib/attendance/clock.ts
+@@ -0,0 +1,144 @@
++/**
++ * When attendance may be marked — the two rules that stop a day being written
++ * as something other than what happened.
++ *
++ * Pure and alias-free so `node --test` can reach it, and so the page and the
++ * server decide identically rather than each having an opinion.
++ *
++ * ── THE RULES ─────────────────────────────────────────────────────────────
++ *   1. An In-Time may be no earlier than IN_TIME_GRACE_MINUTES before now, and
++ *      not in the future. Ten minutes is room to finish walking to the tablet;
++ *      it is not room to write this morning in at six o'clock this evening.
++ *   2. An Out-Time is never typed. It is stamped with the clock, so it cannot
++ *      be back-dated, cannot be post-dated, and is exactly the moment the
++ *      operator pressed it.
++ *
++ * ── WHOSE CLOCK ───────────────────────────────────────────────────────────
++ * The plant's, Asia/Kolkata, on both ends. The tablet shows it and fills the
++ * field with it; the SERVER then checks and stamps against its own reading of
++ * the same clock, because a page can be edited and a request can be made
++ * without one. The browser never decides what is stored.
++ *
++ * Both clocks are read as "HH:MM" minutes-of-day, and the comparison goes the
++ * SHORT way round, so 23:58 is two minutes before 00:00 rather than twenty-three
++ * hours and fifty-eight minutes after it. The night shift marks in across
++ * midnight every night and must not meet a wall when it does.
++ */
++
++/** How far back an In-Time may be set from the clock. */
++export const IN_TIME_GRACE_MINUTES = 10;
++
++/**
++ * How far AHEAD of the server a tablet may be and still be believed.
++ *
++ * The owner's rule is about back-dating, and this is not a loosening of it: it
++ * is for the honest entry. A shop-floor tablet keeps its own clock, and one
++ * running a couple of minutes fast would have every single operator's In-Time
++ * refused as "in the future" — for a reason nobody on the floor could see, let
++ * alone fix. Two minutes absorbs ordinary drift and nothing more; an Out-Time,
++ * which is the one the record really turns on, is not typed at all and so is
++ * never in the future by even a second.
++ */
++export const CLOCK_SKEW_MINUTES = 2;
++
++const HALF_DAY = 12 * 60;
++const DAY = 24 * 60;
++
++/** Minutes since midnight for "HH:MM", or null when it is not a time. */
++export function clockMinutes(t: string | null | undefined): number | null {
++  const m = /^\s*(\d{1,2}):(\d{2})\s*$/.exec(t ?? "");
++  if (!m) return null;
++  const h = Number(m[1]);
++  const min = Number(m[2]);
++  return h > 23 || min > 59 ? null : h * 60 + min;
++}
++
++/** "HH:MM" for minutes since midnight, wrapping at both ends. */
++export function clockLabel(minutes: number): string {
++  const m = ((Math.round(minutes) % DAY) + DAY) % DAY;
++  return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
++}
++
++/**
++ * How many minutes BEFORE `now` the time `t` is, the short way round the clock:
++ * 0 when they are the same, 10 when t was ten minutes ago, and NEGATIVE when t
++ * is still to come. 23:55 against a clock reading 00:05 is 10, not −1430.
++ *
++ * Anything more than half a day away is read as the other direction, which is
++ * the only sane reading of a bare clock time: nothing on this screen is ever
++ * meant to be thirteen hours out.
++ */
++export function minutesBefore(t: number, now: number): number {
++  let d = now - t;
++  if (d > HALF_DAY) d -= DAY;
++  if (d < -HALF_DAY) d += DAY;
++  return d;
++}
++
++/**
++ * Why this In-Time cannot be used, or null when it can.
++ *
++ * `now` is "HH:MM" on the plant clock — the tablet's on screen, the server's
++ * when it matters. The message names the earliest time that WOULD work, so the
++ * operator is told what to do rather than only what is wrong.
++ */
++export function inTimeError(value: string | null | undefined, now: string): string | null {
++  const t = clockMinutes(value);
++  if (t === null) return "Enter the In-Time as HH:MM.";
++  const n = clockMinutes(now);
++  if (n === null) return null; // no usable clock — do not block the floor over it
++  const before = minutesBefore(t, n);
++  if (before > IN_TIME_GRACE_MINUTES) {
++    return `In-Time cannot be before ${clockLabel(n - IN_TIME_GRACE_MINUTES)} — mark attendance when you arrive.`;
++  }
++  if (before < -CLOCK_SKEW_MINUTES) {
++    return `In-Time cannot be later than now (${clockLabel(n)}).`;
++  }
++  return null;
++}
++
++/** The earliest In-Time a clock reading of `now` allows — what the field's
++ *  hint shows, from the same arithmetic as the check. */
++export function earliestInTime(now: string): string {
++  const n = clockMinutes(now);
++  return n === null ? "" : clockLabel(n - IN_TIME_GRACE_MINUTES);
++}
++
++/**
++ * What to store for an Out-Time, given what arrived, what the row already holds
++ * and the server's own clock.
++ *
++ *   • nothing sent, or sent empty  → null: the operator cleared it, or has not
++ *     marked out yet. Clearing is allowed because a mis-tap has to be
++ *     recoverable, and a re-stamp can only ever be the clock again.
++ *   • sent unchanged               → the stored value, untouched. This is the
++ *     case that matters most: saving a row to correct its LINE must not move an
++ *     Out-Time stamped hours ago to now.
++ *   • anything else                → `now`. Whatever the browser sent is
++ *     discarded. That is the whole of rule 2: there is no path by which a typed
++ *     time, a future time or an edited time reaches the column.
++ */
++export function outTimeToStore(
++  sent: string | null | undefined,
++  existing: string | null | undefined,
++  now: string,
++): string | null {
++  const s = String(sent ?? "").trim();
++  if (!s) return null;
++  const e = String(existing ?? "").trim();
++  if (e && s === e) return e;
++  return clockMinutes(now) === null ? e || null : now;
++}
++
++/**
++ * Likewise for the In-Time: an unchanged one is kept as it stands, whatever the
++ * clock says now.
++ *
++ * Without this, opening this morning's row at six in the evening to tick the
++ * other line would send its 06:00 In-Time back, the window would refuse it, and
++ * the row could never be corrected again. The rule is about ENTERING a time,
++ * not about carrying one.
++ */
++export function inTimeUnchanged(sent: string | null | undefined, existing: string | null | undefined): boolean {
++  return String(sent ?? "").trim() === String(existing ?? "").trim();
++}
+diff --git a/src/lib/attendance/server.ts b/src/lib/attendance/server.ts
+index 0f8521d..6b03b05 100644
+--- a/src/lib/attendance/server.ts
++++ b/src/lib/attendance/server.ts
+@@ -51,8 +51,9 @@ import { prisma } from "@/lib/prisma";
+ import { logActionTx } from "@/lib/actionLog";
+ import { unlessViewing, viewAsBlocked } from "@/lib/viewAsServer";
+ import { styleRoboSheet } from "@/lib/robo/exportStyle";
+-import { toPlantDateInput } from "@/lib/chromia/plant-time";
++import { toPlantDateInput, toPlantTimeInput } from "@/lib/chromia/plant-time";
+ import { isValidTime } from "@/lib/robo/time";
++import { inTimeError, inTimeUnchanged, outTimeToStore } from "./clock.ts";
+ import {
+   cleanOperatorName,
+   compareOperatorNames,
+@@ -383,11 +384,30 @@ async function route(req: Request, segments: string[], method: string): Promise<
+       const operatorId = String(b.operatorId ?? "");
+       if (!operatorId) return bad("Pick an operator.");
+       const inTime = timeOrNull(b.inTime);
+-      const outTime = timeOrNull(b.outTime);
+       if (inTime === undefined) return bad("In-Time is not a valid time.");
+-      if (outTime === undefined) return bad("Out-Time is not a valid time.");
+       const lines = joinLines(Array.isArray(b.lines) ? b.lines.map(String) : String(b.lines ?? "").split(","));
+       const date = b.date;
++
++      /* THE CLOCK IS THE SERVER'S, not the browser's.
++         The page checks the same two rules so the operator is told at once, but
++         a page can be edited and a request can be made without one, so what is
++         stored is decided here against this machine's own reading of the plant
++         clock. See lib/attendance/clock.ts. */
++      const nowPlant = toPlantTimeInput(new Date());
++      const existing = await prisma.attendanceDay.findUnique({
++        where: { date_operatorId: { date, operatorId } },
++        select: { inTime: true, outTime: true },
++      });
++      // Rule 1 — only when the In-Time is being ENTERED or changed. Carrying an
++      // old one back (saving the row to correct its Line) must not be refused.
++      if (!inTimeUnchanged(b.inTime as string, existing?.inTime)) {
++        const refused = inTime === null ? null : inTimeError(inTime, nowPlant);
++        if (refused) return bad(refused);
++      }
++      // Rule 2 — the Out-Time is stamped, never taken. Whatever arrived is
++      // discarded unless it is the one already stored.
++      const outTime = outTimeToStore(b.outTime as string, existing?.outTime, nowPlant);
++
+       const row = await prisma.$transaction(async (tx) => {
+         const before = await tx.attendanceDay.findUnique({ where: { date_operatorId: { date, operatorId } } });
+         /* The upsert IS the "no duplicates" rule: (date, operatorId) is unique in
+diff --git a/tests/attendanceClock.test.ts b/tests/attendanceClock.test.ts
+new file mode 100644
+index 0000000..aa10750
+--- /dev/null
++++ b/tests/attendanceClock.test.ts
+@@ -0,0 +1,201 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { readFileSync } from "node:fs";
++
++import {
++  CLOCK_SKEW_MINUTES,
++  IN_TIME_GRACE_MINUTES,
++  clockLabel,
++  clockMinutes,
++  earliestInTime,
++  inTimeError,
++  inTimeUnchanged,
++  minutesBefore,
++  outTimeToStore,
++} from "../src/lib/attendance/clock.ts";
++
++/* When attendance may be marked.
++ *
++ *   1. An In-Time may be up to ten minutes old and no later than now.
++ *   2. An Out-Time is stamped with the clock, never typed.
++ *
++ * Both are checked on the SERVER against its own reading of the plant clock —
++ * the page runs the same two functions so the operator is told at once, but it
++ * is not what decides. These tests are the rules; the wiring guards at the
++ * bottom are what keep the two ends on them. */
++
++const NOW = "18:43"; // the owner's example: the earliest In-Time is 18:33
++
++/* ── Reading the clock ─────────────────────────────────────────────── */
++
++test("a clock time reads as minutes, and nonsense does not", () => {
++  assert.equal(clockMinutes("18:43"), 18 * 60 + 43);
++  assert.equal(clockMinutes("00:00"), 0);
++  assert.equal(clockMinutes("23:59"), 1439);
++  for (const bad of ["", "  ", null, undefined, "24:00", "18:60", "6pm", "1843", "18:4"]) {
++    assert.equal(clockMinutes(bad as string), null, String(bad));
++  }
++});
++
++test("minutes read back as a clock, wrapping at both ends", () => {
++  assert.equal(clockLabel(0), "00:00");
++  assert.equal(clockLabel(18 * 60 + 33), "18:33");
++  assert.equal(clockLabel(-10), "23:50"); // ten minutes before midnight
++  assert.equal(clockLabel(1440 + 5), "00:05");
++});
++
++test("the distance is the short way round the clock", () => {
++  const at = (t: string) => clockMinutes(t) as number;
++  assert.equal(minutesBefore(at("18:33"), at("18:43")), 10);
++  assert.equal(minutesBefore(at("18:43"), at("18:43")), 0);
++  assert.equal(minutesBefore(at("18:50"), at("18:43")), -7); // still to come
++  // Across midnight, which the night shift does every night: 23:55 is ten
++  // minutes before 00:05, not twenty-three hours and fifty minutes after it.
++  assert.equal(minutesBefore(at("23:55"), at("00:05")), 10);
++  assert.equal(minutesBefore(at("00:05"), at("23:55")), -10);
++});
++
++/* ── Rule 1: the In-Time window ────────────────────────────────────── */
++
++test("the owner's example: at 18:43 the earliest In-Time is 18:33", () => {
++  assert.equal(IN_TIME_GRACE_MINUTES, 10);
++  assert.equal(earliestInTime(NOW), "18:33");
++  assert.equal(inTimeError("18:33", NOW), null);
++  assert.equal(inTimeError("18:40", NOW), null);
++  assert.equal(inTimeError("18:43", NOW), null);
++});
++
++test("a minute earlier than the window is refused, and the message says what would work", () => {
++  const err = inTimeError("18:32", NOW);
++  assert.ok(err, "18:32 should be refused at 18:43");
++  assert.match(err, /18:33/);
++});
++
++test("the morning cannot be written in during the evening", () => {
++  // The whole point: at 18:43 nobody marks themselves in at six o'clock.
++  for (const t of ["06:00", "09:15", "13:00", "17:00"]) {
++    assert.ok(inTimeError(t, NOW), `${t} should be refused at ${NOW}`);
++  }
++});
++
++test("the window holds across midnight", () => {
++  assert.equal(earliestInTime("00:05"), "23:55");
++  assert.equal(inTimeError("23:55", "00:05"), null);
++  assert.equal(inTimeError("00:00", "00:05"), null);
++  assert.ok(inTimeError("23:54", "00:05"), "a minute before the window, the day before");
++  assert.equal(earliestInTime("00:00"), "23:50");
++  assert.equal(inTimeError("23:50", "00:00"), null);
++});
++
++test("an In-Time in the future is refused, bar a tablet's couple of minutes of drift", () => {
++  assert.equal(CLOCK_SKEW_MINUTES, 2);
++  assert.equal(inTimeError("18:45", NOW), null, "two minutes fast is believed");
++  const err = inTimeError("18:50", NOW);
++  assert.ok(err, "seven minutes ahead is not");
++  assert.match(err, /later than now/);
++  // And across midnight the same way.
++  assert.ok(inTimeError("00:30", "23:55"), "half an hour into tomorrow");
++});
++
++test("something that is not a time is refused before anything else", () => {
++  assert.match(String(inTimeError("25:00", NOW)), /HH:MM/);
++  assert.match(String(inTimeError("", NOW)), /HH:MM/);
++});
++
++test("an unreadable clock never blocks the floor", () => {
++  // If the server could not read its own clock the register still has to work;
++  // refusing every entry would stop the line to no purpose.
++  assert.equal(inTimeError("06:00", ""), null);
++  assert.equal(earliestInTime("nonsense"), "");
++});
++
++/* ── Rule 2: the Out-Time is stamped ───────────────────────────────── */
++
++test("an Out-Time is the clock, whatever was sent", () => {
++  // Typed, pasted, or posted straight at the API — it makes no difference.
++  assert.equal(outTimeToStore("23:59", null, NOW), NOW);
++  assert.equal(outTimeToStore("06:00", null, NOW), NOW);
++  assert.equal(outTimeToStore("18:43", null, NOW), NOW);
++});
++
++test("an Out-Time can never be in the future, because it is never taken from the sender", () => {
++  for (const sent of ["19:00", "23:59", "18:44"]) {
++    assert.equal(outTimeToStore(sent, null, NOW), NOW, sent);
++  }
++});
++
++test("an Out-Time already stored is left alone when the row is saved again", () => {
++  // The case that matters: opening this morning's row at six to tick the other
++  // line must not move an Out-Time stamped at 14:30 to now.
++  assert.equal(outTimeToStore("14:30", "14:30", NOW), "14:30");
++});
++
++test("an Out-Time can be cleared, and re-stamping can only ever be the clock", () => {
++  assert.equal(outTimeToStore("", "14:30", NOW), null);
++  assert.equal(outTimeToStore(null, "14:30", NOW), null);
++  assert.equal(outTimeToStore("09:00", "14:30", NOW), NOW, "changed to anything = stamped now");
++});
++
++test("with no clock to read, an Out-Time is not invented", () => {
++  assert.equal(outTimeToStore("19:00", null, ""), null);
++  assert.equal(outTimeToStore("19:00", "14:30", ""), "14:30");
++});
++
++/* ── Carrying a time back is not entering one ──────────────────────── */
++
++test("an In-Time that did not change is recognised as unchanged", () => {
++  assert.equal(inTimeUnchanged("06:00", "06:00"), true);
++  assert.equal(inTimeUnchanged(" 06:00 ", "06:00"), true);
++  assert.equal(inTimeUnchanged("", null), true);
++  assert.equal(inTimeUnchanged("06:05", "06:00"), false);
++  assert.equal(inTimeUnchanged("06:00", null), false);
++});
++
++/* ── Wiring guards ─────────────────────────────────────────────────── */
++
++/** A source file as the repository holds it: LF, whatever the checkout did to
++ *  it — see tests/sourceLineEndings.test.ts. */
++const src = (p: string) => readFileSync(new URL(`../src/${p}`, import.meta.url), "utf8").replace(/\r\n/g, "\n");
++
++test("the server checks against ITS OWN clock, not the one that was sent", () => {
++  const s = src("lib/attendance/server.ts");
++  assert.match(s, /const nowPlant = toPlantTimeInput\(new Date\(\)\)/);
++  assert.match(s, /inTimeError\(inTime, nowPlant\)/);
++  assert.match(s, /outTimeToStore\(b\.outTime as string, existing\?\.outTime, nowPlant\)/);
++  // The body's own outTime must not reach the row by any other path.
++  assert.doesNotMatch(s, /outTime\s*=\s*timeOrNull\(b\.outTime\)/);
++});
++
++test("the server only judges an In-Time that is being entered", () => {
++  // Without this, a row saved this morning could never be corrected again:
++  // its own 06:00 would come back and the window would refuse it.
++  assert.match(src("lib/attendance/server.ts"), /if \(!inTimeUnchanged\(b\.inTime as string, existing\?\.inTime\)\) \{/);
++});
++
++test("the page runs the same two rules, and will not save past them", () => {
++  const s = src("components/attendance/AttendanceClient.tsx");
++  assert.match(s, /from "@\/lib\/attendance\/clock"/);
++  assert.match(s, /inTimeError\(draft\.inTime, now\)/);
++  assert.match(s, /disabled=\{saving \|\| Boolean\(inError\)\}/);
++});
++
++test("the page spares an unchanged In-Time exactly as the server does", () => {
++  // Both ends have to agree on this or the page refuses to send what the
++  // server would have accepted: a row entered this morning would be stuck,
++  // its Line uncorrectable, with no way past it on the floor.
++  assert.match(src("components/attendance/AttendanceClient.tsx"), /!inTimeUnchanged\(draft\.inTime, originalIn\)/);
++});
++
++test("the Out-Time box cannot be typed into", () => {
++  // It is a div and two buttons, not an input: there is nothing to type in.
++  const s = src("components/attendance/AttendanceClient.tsx");
++  const cell = s.slice(s.indexOf("The Out-Time is stamped, never typed"), s.indexOf("{/* ── 2. Request Leave"));
++  assert.doesNotMatch(cell, /<TimeInput[^>]*draft\.outTime/);
++  assert.match(cell, /onClick=\{props\.markOut\}/);
++});
++
++test("both ends read the plant's clock, not the server's own timezone", () => {
++  for (const p of ["lib/attendance/server.ts", "components/attendance/AttendanceClient.tsx"]) {
++    assert.match(src(p), /toPlantTimeInput/, p);
++  }
++});
+-- 
+2.43.0
+
+
+From e2cde958c72942384bf0c571a3f8a33573996008 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 06:01:27 +0000
+Subject: [PATCH 5/5] attendance: the roster is the owner's twelve, in the
+ owner's order
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The register sorted alphabetically. The floor's list is not alphabetical — it
+is the order the line is called in, and the owner gave it as a numbered list:
+
+    1 Jagadeesh      5 Praveen S.    9 Sebul
+    2 Rajesh         6 Venkatraj    10 Shiva
+    3 Saravanan .L   7 U Kumar      11 Mani Bharathi
+    4 Kiran          8 Aaquib       12 Yogender Reddy
+
+Alphabetical would open with Aaquib, which is a different document from the one
+the floor keeps. So the position is now data: "sortOrder" on the operator, and
+the only thing any reader orders by.
+
+  • listOperators returns [sortOrder asc, id asc] — the screen, the + Add
+    Operator panel and the Downloads operator picker all read that one list.
+  • the sheet orders [date, operator.sortOrder, operatorId], so a day reads
+    down the page exactly as the register reads on screen.
+  • compareOperatorNames is deleted rather than left unused: exported, it is
+    one import away from sorting the register again.
+  • a new operator is appended (max + 1), read INSIDE the add's own
+    transaction so two tablets adding at once cannot take the same number;
+    and a rename may write name and isActive only, so editing a name cannot
+    reorder the list.
+
+Add, Rename and Remove are untouched and still work on every operator, trail
+and all, and because both ERPs were already one handler over one table this is
+one roster: a name added, renamed or removed on the Robo side is the same row
+the Chromia side reads.
+
+scripts/0137 adds the column; the owner's numbering is DATA, not schema, so
+prisma/seed-attendance.ts holds the twelve and numbers them 1..12 (npm run
+db:seed:attendance, idempotent). The column and the twelve are already on Neon
+from 20 Oct — the script is IF NOT EXISTS, so it is the record of what was
+done and what a fresh database runs.
+
+Spelling is the owner's, down to the space in "Saravanan .L" and the stop in
+"Praveen S." — a tidy-up would quietly create a thirteenth operator next time
+the seed ran.
+
+tests/roboShiftAttendance0123 held the schema block to 0123 column for column;
+a column added later had no way to exist. It now reads the later scripts too,
+named one at a time, so the model is still exactly what the scripts built and
+a new attendance column is a line in that test as well as a script.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SPqDFZ7o6eq1utS7hzoQsF
+---
+ package.json                             |   1 +
+ prisma/schema.prisma                     |  10 ++
+ prisma/seed-attendance.ts                |  56 ++++++++++
+ scripts/0137-attendance-roster-order.sql |  79 ++++++++++++++
+ src/lib/attendance/attendance.ts         |  14 ---
+ src/lib/attendance/server.ts             |  36 +++++--
+ tests/attendance.test.ts                 |  16 ---
+ tests/attendanceRoster.test.ts           | 129 +++++++++++++++++++++++
+ tests/roboShiftAttendance0123.test.ts    |  59 +++++++++--
+ 9 files changed, 350 insertions(+), 50 deletions(-)
+ create mode 100644 prisma/seed-attendance.ts
+ create mode 100644 scripts/0137-attendance-roster-order.sql
+ create mode 100644 tests/attendanceRoster.test.ts
+
+diff --git a/package.json b/package.json
+index d7a1993..b62ad62 100644
+--- a/package.json
++++ b/package.json
+@@ -22,6 +22,7 @@
+     "db:seed:chromia": "tsx prisma/seed-chromia.ts",
+     "db:seed:lab": "tsx prisma/seed-lab.ts",
+     "db:seed:robo": "tsx prisma/seed-robo.ts",
++    "db:seed:attendance": "tsx prisma/seed-attendance.ts",
+     "db:seed:qc": "tsx prisma/seed-qc.ts",
+     "import": "tsx scripts/import.ts"
+   },
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index f5edd9b..a8baf50 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -9558,6 +9558,16 @@ model AttendanceOperator {
+   isActive  Boolean  @default(true)
+   createdAt DateTime @default(now())
+   updatedAt DateTime @updatedAt
++  /// Where the name sits in the register, and the ONLY thing that decides it.
++  /// The roster is the owner's list in the owner's order — the order the line
++  /// is called in, which is not alphabetical and must not be re-sorted into it.
++  /// A new operator is appended (max + 1), so adding one never moves another.
++  ///
++  /// LAST in the model because it is last in the table: it was added after the
++  /// three tables were made, by scripts/0137-attendance-roster-order.sql, and
++  /// ADD COLUMN appends. tests/roboShiftAttendance0123.test.ts holds the two
++  /// orders to one another.
++  sortOrder Int      @default(0)
+ 
+   days   AttendanceDay[]
+   leaves AttendanceLeave[]
+diff --git a/prisma/seed-attendance.ts b/prisma/seed-attendance.ts
+new file mode 100644
+index 0000000..3d6a424
+--- /dev/null
++++ b/prisma/seed-attendance.ts
+@@ -0,0 +1,56 @@
++import { PrismaClient } from '@prisma/client'
++
++const prisma = new PrismaClient()
++
++/**
++ * The attendance roster — the plant's operators, in the plant's own order.
++ *
++ * THE ORDER IS THE DATA. It is the order the line is called in, which the
++ * owner gave as a numbered list, and it is NOT alphabetical: Jagadeesh,
++ * Rajesh, Saravanan .L, Kiran… A screen or a sheet that sorts it into
++ * "Aaquib, Jagadeesh, Kiran…" is a different document from the register the
++ * floor keeps, so `sortOrder` is what every reader orders by and nothing
++ * re-sorts it. See lib/attendance/server.ts (listOperators).
++ *
++ * Spelling is the owner's too, down to the space in "Saravanan .L" and the
++ * stop in "Praveen S.": these are the names as the register writes them.
++ *
++ * Idempotent, like every seed here — running it twice puts the list back the
++ * way it is written below without touching anybody's attendance, and an
++ * operator added on the floor since (further down the order) is left alone.
++ */
++const ROSTER = [
++  "Jagadeesh",
++  "Rajesh",
++  "Saravanan .L",
++  "Kiran",
++  "Praveen S.",
++  "Venkatraj",
++  "U Kumar",
++  "Aaquib",
++  "Sebul",
++  "Shiva",
++  "Mani Bharathi",
++  "Yogender Reddy",
++];
++
++async function main() {
++  for (const [i, name] of ROSTER.entries()) {
++    const sortOrder = i + 1;
++    await prisma.attendanceOperator.upsert({
++      where: { name },
++      update: { sortOrder, isActive: true },
++      create: { name, sortOrder },
++    });
++  }
++  const listed = await prisma.attendanceOperator.findMany({
++    orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }],
++    select: { sortOrder: true, name: true },
++  });
++  console.log(`Attendance roster (${listed.length}):`);
++  for (const o of listed) console.log(`  ${String(o.sortOrder).padStart(2)}  ${o.name}`);
++}
++
++main()
++  .catch((e) => { console.error(e); process.exit(1); })
++  .finally(() => prisma.$disconnect());
+diff --git a/scripts/0137-attendance-roster-order.sql b/scripts/0137-attendance-roster-order.sql
+new file mode 100644
+index 0000000..46eb8f3
+--- /dev/null
++++ b/scripts/0137-attendance-roster-order.sql
+@@ -0,0 +1,79 @@
++-- 0137: attendance_operator."sortOrder" — the register's own order. One new
++-- column on one existing table. No row is created, none is deleted, and no
++-- other table is touched.
++--
++-- WHY. The owner, 20 Oct 2026, giving the twelve operators by name: "Add these
++-- 12 operators in exactly the following order. Do not sort them
++-- alphabetically." The register sorted alphabetically, in the application
++-- (lib/attendance/attendance.ts compareOperatorNames, now deleted). The floor's
++-- list is not alphabetical — it is the order the line is called in, which
++-- begins Jagadeesh, Rajesh, Saravanan .L, Kiran — so the position had to stop
++-- being derived from the name and become data. This is that column.
++--
++-- WHAT.
++--   attendance_operator."sortOrder"  INTEGER NOT NULL DEFAULT 0
++--     Where the name sits in the register, and the only thing any reader
++--     orders by (lib/attendance/server.ts listOperators, and the downloads
++--     query within a date). A new operator is appended, max + 1, so adding one
++--     never moves another. The model is AttendanceOperator.sortOrder, declared
++--     LAST because ADD COLUMN appends and the two orders are held together by
++--     tests/roboShiftAttendance0123.test.ts.
++--
++-- DEFAULT 0 AND NO BACK-FILL. Every row already there keeps 0 and they tie on
++-- it, which `id` then breaks, so the list can never come back shuffled. The
++-- roster's actual numbering is DATA, not schema: prisma/seed-attendance.ts
++-- holds the owner's twelve and numbers them 1..12 (`npm run db:seed:attendance`,
++-- idempotent). This script does not write it, because a schema script that
++-- seeded a particular plant's people could not be run anywhere else.
++--
++-- ALREADY ON NEON. The column was added out-of-band on 20 Oct 2026, with the
++-- twelve numbered 1..12, while this change was being written. IF NOT EXISTS
++-- therefore finds it in place and adds nothing: this file is the record of
++-- what was done, and the thing a fresh database runs. Either way a second run
++-- is a no-op.
++--
++-- ORDER. Before the code that reads the column is deployed. Until it runs,
++-- listOperators' ORDER BY names a column that is not there and the register
++-- fails to read; after it runs, the old code is unaffected (it never names it).
++--
++-- Applied with:
++--   npx prisma db execute --schema prisma/schema.prisma --file scripts/0137-attendance-roster-order.sql
++
++BEGIN;
++
++-- Never queue the live ERP behind this script; if a lock it needs is held,
++-- give up after 5 s and roll back whole rather than wait. Run it again later.
++SET LOCAL lock_timeout = '5s';
++
++-- The precondition: 0123's table is there. Checked before anything is changed,
++-- so a refusal leaves the database exactly as it was.
++DO $$ BEGIN
++  IF to_regclass('attendance_operator') IS NULL THEN
++    RAISE EXCEPTION '0137: attendance_operator does not exist — run scripts/0123-robo-shift-attendance.sql first. Nothing was changed.';
++  END IF;
++END $$;
++
++-- What this run adds, read from the catalogue BEFORE adding it, for the log at
++-- the end. A second run finds it in place, adds nothing and logs nothing.
++CREATE TEMP TABLE added (what text) ON COMMIT DROP;
++INSERT INTO added
++SELECT 'attendance_operator."sortOrder"'
++WHERE NOT EXISTS (
++  SELECT 1 FROM information_schema.columns
++  WHERE table_name = 'attendance_operator' AND column_name = 'sortOrder'
++);
++
++-- ─────────────────────────────── the column ─────────────────────────────────
++ALTER TABLE attendance_operator
++  ADD COLUMN IF NOT EXISTS "sortOrder" INTEGER NOT NULL DEFAULT 0;
++
++-- ─────────────────────────────── the record ─────────────────────────────────
++-- One action_log row, and only when this run actually added the column, so a
++-- re-run leaves no second entry. The shape the other scripts here use.
++INSERT INTO action_log (id, actor, kind, model, summary, payload)
++SELECT gen_random_uuid()::text, 'schema change (scripts/0137)', 'edit', 'AttendanceOperator',
++       'Attendance roster order (scripts/0137): attendance_operator."sortOrder" added — the register keeps the owner''s order and is no longer sorted by name.',
++       jsonb_build_object('action', '0137-attendance-roster-order', 'added', (SELECT jsonb_agg(what) FROM added))
++WHERE EXISTS (SELECT 1 FROM added);
++
++COMMIT;
+diff --git a/src/lib/attendance/attendance.ts b/src/lib/attendance/attendance.ts
+index 31c9ba3..57215ad 100644
+--- a/src/lib/attendance/attendance.ts
++++ b/src/lib/attendance/attendance.ts
+@@ -112,20 +112,6 @@ export function leaveLabel(fromTime: string | null | undefined, toTime: string |
+   return `${from}–${to}`;
+ }
+ 
+-/* ── Sorting ───────────────────────────────────────────────────────── */
+-
+-/**
+- * Operator names in alphabetical order, as the register shows them.
+- *
+- * Compared case- and punctuation-insensitively so "Praveen Kumar.S" and
+- * "praveen kumar s" sort as the same word — the register is typed by hand and
+- * a stray capital should not move a name down the page.
+- */
+-export function compareOperatorNames(a: string, b: string): number {
+-  const key = (s: string) => s.replace(/[^\p{L}\p{N}]+/gu, " ").trim().toLocaleLowerCase();
+-  return key(a).localeCompare(key(b)) || a.localeCompare(b);
+-}
+-
+ /* ── What an operator's name may be ────────────────────────────────── */
+ 
+ /** A typed operator name, tidied: inner runs of space collapsed, ends
+diff --git a/src/lib/attendance/server.ts b/src/lib/attendance/server.ts
+index 6b03b05..f071337 100644
+--- a/src/lib/attendance/server.ts
++++ b/src/lib/attendance/server.ts
+@@ -56,7 +56,6 @@ import { isValidTime } from "@/lib/robo/time";
+ import { inTimeError, inTimeUnchanged, outTimeToStore } from "./clock.ts";
+ import {
+   cleanOperatorName,
+-  compareOperatorNames,
+   joinLines,
+   leaveLabel,
+   linesLabel,
+@@ -99,11 +98,26 @@ function timeOrNull(v: unknown): string | null | undefined {
+ /* ── Operators ─────────────────────────────────────────────────────── */
+ 
+ async function listOperators() {
+-  const rows = await prisma.attendanceOperator.findMany({
+-    select: { id: true, name: true, isActive: true },
++  /* THE ROSTER'S OWN ORDER, which is the owner's list in the owner's order —
++     the order the line is called in. It is NOT alphabetical and must not be
++     re-sorted into it: "Jagadeesh, Rajesh, Saravanan .L, Kiran…" is how the
++     register reads on paper, and a screen that answers with "Aaquib, Jagadeesh,
++     Kiran…" is a different document. `id` only breaks a tie between two rows
++     left on the same number, so the list can never come back shuffled. */
++  return prisma.attendanceOperator.findMany({
++    select: { id: true, name: true, isActive: true, sortOrder: true },
++    orderBy: [{ sortOrder: "asc" }, { id: "asc" }],
+   });
+-  // Alphabetical, the way the register reads — not by when they were added.
+-  return rows.sort((a, b) => compareOperatorNames(a.name, b.name));
++}
++
++/** Where a newly added operator goes: the end. Adding one never moves anybody
++ *  already on the list. */
++async function nextSortOrder(tx: Tx): Promise<number> {
++  const last = await tx.attendanceOperator.findFirst({
++    orderBy: { sortOrder: "desc" },
++    select: { sortOrder: true },
++  });
++  return (last?.sortOrder ?? 0) + 1;
+ }
+ 
+ /* ── The day's register ────────────────────────────────────────────── */
+@@ -229,13 +243,14 @@ async function filteredRows(f: AttendanceFilter, today: string) {
+       } as Record<string, string | number>;
+     });
+   }
++  /* Date first, then the roster's own order within the date — so a day in the
++     sheet reads down the page exactly as the register does on screen. */
+   const rows = await prisma.attendanceDay.findMany({
+     where,
+-    orderBy: [{ date: "asc" }],
++    orderBy: [{ date: "asc" }, { operator: { sortOrder: "asc" } }, { operatorId: "asc" }],
+     include: { operator: { select: { name: true } } },
+   });
+-  return [...rows]
+-    .sort((a, b) => a.date.localeCompare(b.date) || compareOperatorNames(a.operator?.name ?? "", b.operator?.name ?? ""))
++  return rows
+     .map((r) => ({
+       "Date": r.date,
+       "Operator Name": r.operator?.name ?? "",
+@@ -307,7 +322,10 @@ async function route(req: Request, segments: string[], method: string): Promise<
+       const clash = await prisma.attendanceOperator.findUnique({ where: { name }, select: { id: true } });
+       if (clash) return bad(`${name} is already on the list.`, 409);
+       const row = await prisma.$transaction(async (tx) => {
+-        const made = await tx.attendanceOperator.create({ data: { name }, select: { id: true, name: true, isActive: true } });
++        const made = await tx.attendanceOperator.create({
++          data: { name, sortOrder: await nextSortOrder(tx) },
++          select: { id: true, name: true, isActive: true, sortOrder: true },
++        });
+         await trail(tx, "AttendanceOperator", `Attendance: operator ${name} added`,
+           { action: "attendance.operator.add", after: made });
+         return made;
+diff --git a/tests/attendance.test.ts b/tests/attendance.test.ts
+index e84c62b..2b04879 100644
+--- a/tests/attendance.test.ts
++++ b/tests/attendance.test.ts
+@@ -6,7 +6,6 @@ import {
+   LINES,
+   MAX_SHIFT_MINUTES,
+   cleanOperatorName,
+-  compareOperatorNames,
+   joinLines,
+   leaveLabel,
+   linesLabel,
+@@ -111,21 +110,6 @@ test("leave reads as the hours away, or as the whole day", () => {
+ 
+ /* ── Operator names ────────────────────────────────────────────────── */
+ 
+-test("names sort alphabetically, whatever the capitals and dots", () => {
+-  const names = ["Saravanan.L", "praveen kumar s", "Arun R", "Praveen Kumar.S"];
+-  assert.deepEqual(
+-    [...names].sort(compareOperatorNames),
+-    ["Arun R", "praveen kumar s", "Praveen Kumar.S", "Saravanan.L"],
+-  );
+-});
+-
+-test("the owner's two operators are in the order the register shows them", () => {
+-  assert.deepEqual(
+-    ["Saravanan.L", "Praveen Kumar.S"].sort(compareOperatorNames),
+-    ["Praveen Kumar.S", "Saravanan.L"],
+-  );
+-});
+-
+ test("a typed name is tidied, and an empty one refused", () => {
+   assert.equal(cleanOperatorName("  Praveen   Kumar.S  "), "Praveen Kumar.S");
+   assert.equal(operatorNameError("Praveen Kumar.S"), null);
+diff --git a/tests/attendanceRoster.test.ts b/tests/attendanceRoster.test.ts
+new file mode 100644
+index 0000000..b3ea655
+--- /dev/null
++++ b/tests/attendanceRoster.test.ts
+@@ -0,0 +1,129 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { readFileSync } from "node:fs";
++
++/* The attendance roster — the plant's operators in the plant's own order.
++ *
++ * THE ORDER IS THE DATA. It is the order the line is called in: Jagadeesh,
++ * Rajesh, Saravanan .L, Kiran… Alphabetical would be a different document
++ * from the register the floor keeps, so nothing in the module is allowed to
++ * sort it into one. These tests are what stops that creeping back in. */
++
++/** A repository file as it is held: LF, whatever the checkout did to it —
++ *  see tests/sourceLineEndings.test.ts. */
++const read = (p: string) => readFileSync(new URL(`../${p}`, import.meta.url), "utf8").replace(/\r\n/g, "\n");
++const src = (p: string) => read(`src/${p}`);
++
++/** The roster as the seed writes it, in file order. */
++function seedRoster(): string[] {
++  const s = read("prisma/seed-attendance.ts");
++  const block = /const ROSTER = \[([\s\S]*?)\n\];/.exec(s);
++  assert.ok(block, "seed-attendance.ts no longer declares ROSTER");
++  return [...block[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
++}
++
++/* ── The owner's list, exactly ─────────────────────────────────────── */
++
++test("the twelve operators are the owner's, in the owner's order", () => {
++  assert.deepEqual(seedRoster(), [
++    "Jagadeesh",
++    "Rajesh",
++    "Saravanan .L",
++    "Kiran",
++    "Praveen S.",
++    "Venkatraj",
++    "U Kumar",
++    "Aaquib",
++    "Sebul",
++    "Shiva",
++    "Mani Bharathi",
++    "Yogender Reddy",
++  ]);
++});
++
++test("the order is deliberately NOT alphabetical", () => {
++  // If this ever passes, somebody has sorted the list and the register no
++  // longer reads the way the line is called.
++  const roster = seedRoster();
++  const sorted = [...roster].sort((a, b) => a.localeCompare(b));
++  assert.notDeepEqual(roster, sorted, "the roster has been alphabetised");
++  assert.equal(roster[0], "Jagadeesh");
++  assert.equal(sorted[0], "Aaquib");
++});
++
++test("the names are spelt the way the register writes them", () => {
++  const roster = seedRoster();
++  // The space and the stop are the owner's, and a tidy-up would quietly
++  // create a second operator next time the seed runs.
++  assert.ok(roster.includes("Saravanan .L"), "Saravanan .L, with the space");
++  assert.ok(roster.includes("Praveen S."), "Praveen S., with the stop");
++  assert.equal(new Set(roster).size, roster.length, "no name is listed twice");
++  for (const n of roster) assert.equal(n, n.trim(), `"${n}" has stray space at an end`);
++});
++
++test("the seed numbers them 1..12 from their position, and is safe to run twice", () => {
++  const s = read("prisma/seed-attendance.ts");
++  assert.match(s, /const sortOrder = i \+ 1;/);
++  assert.match(s, /attendanceOperator\.upsert/);
++  assert.doesNotMatch(s, /deleteMany|\.delete\(/, "a seed must not remove anybody's operator");
++});
++
++/* ── Nothing re-sorts it ───────────────────────────────────────────── */
++
++test("the roster is read in its own order, by the column that holds it", () => {
++  const s = src("lib/attendance/server.ts");
++  assert.match(s, /orderBy: \[\{ sortOrder: "asc" \}, \{ id: "asc" \}\]/);
++});
++
++test("the alphabetical comparator is gone, not merely unused", () => {
++  // It sorted the register until the owner's order arrived. Left exported, it
++  // is one import away from sorting it again.
++  const s = src("lib/attendance/attendance.ts");
++  assert.doesNotMatch(s, /compareOperatorNames/);
++  for (const p of ["lib/attendance/server.ts", "components/attendance/AttendanceClient.tsx"]) {
++    assert.doesNotMatch(src(p), /compareOperatorNames/, p);
++  }
++});
++
++test("the page shows the roster as the server hands it over", () => {
++  // Any .sort() on the operator list in the page would undo the order on the
++  // way to the screen, whatever the server did.
++  const s = src("components/attendance/AttendanceClient.tsx");
++  assert.doesNotMatch(s, /operators[\s\S]{0,40}\.sort\(/);
++  assert.doesNotMatch(s, /rows[\s\S]{0,20}\.sort\(/);
++});
++
++test("the sheet reads down the page in the same order as the register", () => {
++  const s = src("lib/attendance/server.ts");
++  assert.match(s, /orderBy: \[\{ date: "asc" \}, \{ operator: \{ sortOrder: "asc" \} \}, \{ operatorId: "asc" \}\]/);
++});
++
++/* ── Adding, renaming, removing ────────────────────────────────────── */
++
++test("a new operator joins at the end, so adding one never moves another", () => {
++  const s = src("lib/attendance/server.ts");
++  // Read inside the write's own transaction, so two tablets adding an operator
++  // at once cannot both read the same last number.
++  assert.match(s, /async function nextSortOrder\(tx: Tx\)/);
++  assert.match(s, /return \(last\?\.sortOrder \?\? 0\) \+ 1;/);
++  assert.match(s, /data: \{ name, sortOrder: await nextSortOrder\(tx\) \}/);
++});
++
++test("the three operator actions are all still there", () => {
++  const s = src("lib/attendance/server.ts");
++  assert.match(s, /head === "operators" && !id/);     // GET + POST (add)
++  assert.match(s, /attendanceOperator\.update/);       // PATCH (rename)
++  assert.match(s, /attendanceOperator\.delete/);       // DELETE (remove)
++  const page = src("components/attendance/AttendanceClient.tsx");
++  for (const label of [">Add<", ">Rename<", ">Remove<"]) {
++    assert.ok(page.includes(label), `the page offers ${label.replace(/[<>]/g, "")}`);
++  }
++});
++
++test("renaming does not reorder: a rename cannot even name sortOrder", () => {
++  // The shape of what a PATCH may write is the guarantee — a rename changes
++  // the name and whether they are on the roster, and has no way to say where
++  // in the list they sit.
++  const s = src("lib/attendance/server.ts");
++  assert.match(s, /const data: \{ name\?: string; isActive\?: boolean \} = \{\};/);
++});
+diff --git a/tests/roboShiftAttendance0123.test.ts b/tests/roboShiftAttendance0123.test.ts
+index 6d891e8..ddfaeda 100644
+--- a/tests/roboShiftAttendance0123.test.ts
++++ b/tests/roboShiftAttendance0123.test.ts
+@@ -211,15 +211,49 @@ function tableBody(table: string): string {
+   assert.ok(m, `the script creates ${table}`);
+   return m[1]!;
+ }
++/** One line of DDL — a CREATE TABLE column or an ADD COLUMN — as a column. */
++function readColumn(table: string, line: string): SqlColumn {
++  const m = /^"([A-Za-z][A-Za-z0-9]*)"\s+(TEXT|BOOLEAN|INTEGER|TIMESTAMP\(3\))(.*)$/.exec(line);
++  assert.ok(m, `${table}: a quoted column: ${line}`);
++  const rest = m[3]!;
++  assert.doesNotMatch(rest, /REFERENCES|CHECK|UNIQUE/, `${table}.${m[1]}: no inline constraint — Prisma names its own, and so does this script`);
++  const def = /DEFAULT ('[^']*'|\S+)/.exec(rest);
++  return { name: m[1]!, type: m[2]!, notNull: /NOT NULL/.test(rest), primary: /PRIMARY KEY/.test(rest), def: def ? def[1]! : null };
++}
++
++/* A COLUMN ADDED AFTER THE TABLE WAS MADE is still part of what the model must
++   describe, and ADD COLUMN appends it — so the model declares it last and this
++   reads it from the script that added it. Named one by one on purpose: a new
++   attendance column is a line here as well as a script, which is the point.
++   The guarantee is unchanged — the model is exactly what the scripts built. */
++const LATER: { script: string; table: string }[] = [
++  { script: "scripts/0137-attendance-roster-order.sql", table: "attendance_operator" },
++];
++
++function addedColumns(table: string): SqlColumn[] {
++  const out: SqlColumn[] = [];
++  for (const { script, table: t } of LATER) {
++    if (t !== table) continue;
++    const sql = src(script).replace(/--.*$/gm, "");
++    for (const m of sql.matchAll(/ALTER TABLE\s+(\w+)\s+ADD COLUMN IF NOT EXISTS\s+([\s\S]*?);/g)) {
++      assert.equal(m[1], table, `${script}: alters ${m[1]}, not ${table}`);
++      out.push(readColumn(table, m[2]!.replace(/\s+/g, " ").trim()));
++    }
++  }
++  return out;
++}
++
++/** The columns THIS script creates — what its own header counts and what its
++ *  shape check holds an existing table to. */
+ function sqlColumns(table: string): SqlColumn[] {
+-  return tableBody(table).split("\n").map((l) => l.trim().replace(/,$/, "")).filter(Boolean).map((l) => {
+-    const m = /^"([A-Za-z][A-Za-z0-9]*)"\s+(TEXT|BOOLEAN|TIMESTAMP\(3\))(.*)$/.exec(l);
+-    assert.ok(m, `${table}: a quoted column: ${l}`);
+-    const rest = m[3]!;
+-    assert.doesNotMatch(rest, /REFERENCES|CHECK|UNIQUE/, `${table}.${m[1]}: no inline constraint — Prisma names its own, and so does this script`);
+-    const def = /DEFAULT ('[^']*'|\S+)/.exec(rest);
+-    return { name: m[1]!, type: m[2]!, notNull: /NOT NULL/.test(rest), primary: /PRIMARY KEY/.test(rest), def: def ? def[1]! : null };
+-  });
++  return tableBody(table).split("\n").map((l) => l.trim().replace(/,$/, "")).filter(Boolean)
++    .map((l) => readColumn(table, l));
++}
++
++/** Every column the table has now: the ones this script created, then the ones
++ *  later scripts appended. What the MODEL must describe, in this order. */
++function modelColumns(table: string): SqlColumn[] {
++  return [...sqlColumns(table), ...addedColumns(table)];
+ }
+ 
+ interface PrismaField { name: string; type: string; optional: boolean; list: boolean; attrs: string }
+@@ -265,7 +299,7 @@ test("the block holds exactly the three Attendance models, names its script, and
+ function assertSame(table: string, col: SqlColumn, f: PrismaField | undefined): void {
+   const where = `${table}."${col.name}"`;
+   assert.ok(f, `${where} is a field`);
+-  const plain: Record<string, string> = { TEXT: "String", BOOLEAN: "Boolean", "TIMESTAMP(3)": "DateTime" };
++  const plain: Record<string, string> = { TEXT: "String", BOOLEAN: "Boolean", INTEGER: "Int", "TIMESTAMP(3)": "DateTime" };
+   assert.equal(f.type, plain[col.type], where);
+   assert.doesNotMatch(f.attrs, /@db\./, `${where}: Prisma's own mapping of ${f.type} is ${col.type}`);
+   assert.equal(f.optional, !(col.notNull || col.primary), `${where}: nullable in both or in neither`);
+@@ -284,7 +318,8 @@ function assertSame(table: string, col: SqlColumn, f: PrismaField | undefined):
+ test("every table: every column, its type, nullability and default, as its model declares it — in the same order", () => {
+   let columns = 0;
+   for (const table of TABLES) {
+-    const cols = sqlColumns(table);
++    // Created here, plus anything a later script appended (LATER above).
++    const cols = modelColumns(table);
+     const model = modelOf(table);
+     const scalars = scalarsOf(model);
+     assert.deepEqual(scalars.map(columnOf), cols.map((c) => c.name), `${table}: the same columns, no more and no fewer, in the same order`);
+@@ -293,7 +328,9 @@ test("every table: every column, its type, nullability and default, as its model
+     for (const f of scalars) assert.doesNotMatch(f.attrs, /@map\(/, `${model.name}.${f.name}: no @map, so the column is "${f.name}"`);
+     columns += cols.length;
+   }
+-  assert.equal(columns, 22);
++  // 22 as 0123 created them, and one appended since: attendance_operator's
++  // "sortOrder" (scripts/0137).
++  assert.equal(columns, 23);
+ });
+ 
+ test("the header's column counts are the tables' own", () => {
+-- 
+2.43.0
+

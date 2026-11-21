@@ -1,0 +1,890 @@
+// Pure scoring arithmetic - no database, no Prisma, no I/O.
+//
+// Split out of shiftScore.ts so `node --test` can reach it without a database.
+// These functions decide money and every one of them has already been wrong
+// once: CTS scored as a reject, two spellings of one man paid twice, a floor
+// that zeroed the whole board. Cheap to test, expensive to get wrong.
+//
+// shiftScore.ts re-exports everything here, so no caller needs to know.
+
+/** Ideal MEASURED thickness at Jot, per nominal slab class.
+ *  A slab leaves the line thicker than nominal and is ground down in polishing,
+ *  so 3 cm is not 30 mm here — it is 34. Confirmed for 3 cm; the others follow
+ *  the same +4 mm allowance and should be confirmed before anyone is paid. */
+export const IDEAL_MM: Record<string, number> = {
+  "3 cm": 34,
+  "2 cm": 24,
+  "12 mm": 16, // canonThickness's spelling since 2026-09-30 (was "1.2 cm")
+};
+
+/** Deviation (mm) at which the quality score reaches zero; inside the band the
+ *  score falls off linearly (34.0 -> 100%, 36.0 -> 50%, 38.0 -> 0% at tol 4).
+ *
+ *  CALIBRATION, NOT A GUESS. The line currently averages 36.9 mm on 3 cm. At a
+ *  ±2 mm band that is already zero, so every shift scored nothing and the whole
+ *  scoreboard read 1% — an incentive nobody can earn is one nobody plays. 4 mm
+ *  puts today's output around 27% and makes each millimetre of improvement
+ *  visibly worth money, which is the behaviour this is meant to buy. Tighten it
+ *  as the line gets closer to target. */
+export const TOLERANCE_MM = 4;
+
+/** Readings outside this are physically impossible and are data-entry errors
+ *  (the live data holds a 3.3 mm and a 267 mm on slabs declared 3 cm / 2 cm).
+ *  Scoring them would let one typo wipe out a shift, so they are dropped and
+ *  counted separately instead. */
+export const MIN_PLAUSIBLE_MM = 5;
+export const MAX_PLAUSIBLE_MM = 60;
+
+/** Widest slab range one MIS hour may declare before it is treated as a typo.
+ *
+ *  CALIBRATED ON THE PLANT'S OWN ENTRIES, not guessed. Over the last 120 days
+ *  every real hour declares 2-20 slabs; the single widest legitimate row is 35.
+ *  Above that the data is only digit slips - 112, 503, 1,011, 9,005, 30,010,
+ *  135,513 and two rows over 1.2 MILLION slabs.
+ *
+ *  The old cap of 500 was ~25x the real ceiling, so it caught the millions and
+ *  waved the 112 through: on 2026-07-17 an hour typed 148551-148662 instead of
+ *  ~148551-148562 and swallowed 100 slabs that Pradhap's rows had already
+ *  claimed. Both shifts then lost them to the double-claim rule. 60 is 3x the
+ *  widest hour this plant has ever really worked and still rejects that row. */
+export const MAX_SLABS_PER_HOUR = 60;
+
+/** Slabs an MIS hour declares: end - start + 1, both ends inclusive (an hour
+ *  running 154962-154973 made twelve, not eleven). Null, NOT zero, when the
+ *  hour declares nothing — a null hour is excluded from a target, a zero would
+ *  be counted as a miss. Null too when the range is impossible: backwards, or
+ *  MAX_SLABS_PER_HOUR wide and above, the entry form's own refusal threshold.
+ *
+ *  THIS IS THE CEO REPORT'S RULE, and it is here so it can be the downtime
+ *  page's and the emailed PDF's rule as well. Three surfaces counted "slabs
+ *  made" three ways — the web report from these ranges with this guard, the
+ *  PDF from the ranges without it, the downtime page from the press table —
+ *  and on 30 August they printed 329, 329 and 97 for the same day. */
+export function slabsDeclared(start: unknown, end: unknown): number | null {
+  const s = Number(start), e = Number(end);
+  if (start == null || end == null || !Number.isFinite(s) || !Number.isFinite(e)) return null;
+  const n = e - s + 1;
+  if (n <= 0) return null;
+  if (e - s >= MAX_SLABS_PER_HOUR) return null;
+  return n;
+}
+
+/** True when both ends are typed and the range cannot be real — the case a
+ *  report should COUNT and say it set aside, rather than drop in silence. */
+export function rangeImpossible(start: unknown, end: unknown): boolean {
+  if (start == null || end == null) return false;
+  const s = Number(start), e = Number(end);
+  if (!Number.isFinite(s) || !Number.isFinite(e)) return false;
+  return e < s || e - s >= MAX_SLABS_PER_HOUR;
+}
+
+export const IST_MIN = 330;
+const SHIFT_START: Record<ShiftLetter, number> = { A: 6, B: 14, C: 22 };
+export type ShiftLetter = "A" | "B" | "C";
+
+export const plusDay = (d: string, n: number) => {
+  const x = new Date(`${d}T12:00:00Z`);
+  x.setUTCDate(x.getUTCDate() + n);
+  return x.toISOString().slice(0, 10);
+};
+
+/** UTC span of one shift instance (anchor = the IST date the shift STARTED). */
+export function shiftRange(anchor: string, shift: ShiftLetter) {
+  const istStart = new Date(`${anchor}T${String(SHIFT_START[shift]).padStart(2, "0")}:00:00.000Z`);
+  const start = new Date(istStart.getTime() - IST_MIN * 60_000);
+  return { start, end: new Date(start.getTime() + 8 * 3600_000) };
+}
+
+/** Grade -> quality credit. A is the saleable target, B is usable but worth
+ *  less, C is a reject and earns nothing. Anything else (CTS, Printing,
+ *  "Not graded yet") is not a verdict on production and is excluded entirely
+ *  rather than scored as zero. */
+/** The grade share every shift already clears. Quality is scored on the distance
+ *  ABOVE this, not from zero.
+ *
+ *  WHY A FLOOR AT ALL. Raw grade share does not discriminate: in July every
+ *  shift landed between 93.6% and 98.0%, so the quality factor was ~0.95 for
+ *  everyone and the ranking collapsed into pure quantity — the second axis was
+ *  decorative. C grades are only ~3% of output, so there is simply not much room
+ *  below 100%. Stretching a narrow band into a wide one is what makes quality
+ *  decide places again. A shift below the floor scores zero on quality and
+ *  therefore takes nothing from the quality pool, which is the intended cliff.
+ *
+ *  WHY 87, NOT 90. Set by decision 2026-08-06 together with QUALITY_TARGET. The
+ *  band is still ten points wide, so a point of grade share is worth the same
+ *  ten points of score it always was — the window simply slides down three, and
+ *  a shift having a bad month is no longer wiped out at 89%. */
+export const QUALITY_FLOOR = 0.87;
+
+/** The grade share that scores a FULL 100% on quality. Above it there is nothing
+ *  further to win.
+ *
+ *  WHY NOT 100%. A perfect grade share is not a target anyone can plan for — it
+ *  is the absence of the one bad slab that was always going to happen. Scoring
+ *  against it meant the top of the scale was permanently out of reach, and the
+ *  shifts genuinely running the plant's best quality were still being told they
+ *  had 20% left to find. 97% is the number the good months actually hit.
+ *
+ *  THE COST, STATED PLAINLY: this compresses the top. A shift at 97% and a shift
+ *  at 99.5% now tie on quality at 100%, where before they scored 70% and 95%.
+ *  Above 97% the quality pool is split evenly and only volume separates them.
+ *  That is the intended trade — a reachable ceiling beats a discriminating one —
+ *  but if the field ever bunches ABOVE 97%, raise this rather than the floor. */
+export const QUALITY_TARGET = 0.97;
+
+/** Raw grade share -> scored quality, stretched between the floor and the target.
+ *  87% -> 0, 92% -> 50%, 97% and anything above -> 100%. */
+export function scaleQuality(raw: number | null): number | null {
+  if (raw == null) return null;
+  return Math.max(0, Math.min(1, (raw - QUALITY_FLOOR) / (QUALITY_TARGET - QUALITY_FLOOR)));
+}
+
+/** The same treatment for uptime, and for the same reason: unstretched, the
+ *  electrical and mechanical shares came out near-equal by headcount however the
+ *  month actually went.
+ *
+ *  CALIBRATED, like TOLERANCE_MM. Measured against hours logged, July 2026 runs
+ *  84.4% to 93.9% for everyone with more than one shift. A 90% floor zeroed two
+ *  of the four electricals outright and handed 40% of their pool to a man with a
+ *  single quiet shift. 0.75 keeps the whole real field on the board and still
+ *  turns a 9-point spread into a 38-point one. */
+export const UPTIME_FLOOR = 0.75;
+export function scaleUptime(raw: number | null): number | null {
+  if (raw == null) return null;
+  return Math.max(0, Math.min(1, (raw - UPTIME_FLOOR) / (1 - UPTIME_FLOOR)));
+}
+
+/** Polishing has its own floor because it is a different measurement. "Finished
+ *  OK" runs 89.3-91.5% across the three calliberators, so scoring it from the
+ *  90% grade floor put one of the three on zero and told the other two almost
+ *  nothing. 0.85 sits below the real field and still separates it. */
+export const POLISH_FLOOR = 0.85;
+export function scalePolish(raw: number | null): number | null {
+  if (raw == null) return null;
+  return Math.max(0, Math.min(1, (raw - POLISH_FLOOR) / (1 - POLISH_FLOOR)));
+}
+
+// --------------------------------------------------------------------------
+// SLOW PRODUCTS COUNT DOUBLE
+// --------------------------------------------------------------------------
+// Not every slab costs the same to make. The MIS hour carries the STANDARD
+// output for what was running that hour - slabs_per_hour_std - and it ranges
+// from 3 to 16 across August. A shift on a 15-an-hour design and a shift on a
+// 7-an-hour one were paid per slab at the same rate, so the hard work paid
+// barely half as much per hour of the same effort. Nobody wants the difficult
+// design.
+//
+// So a product whose STANDARD is 10 an hour or less counts each good slab as
+// TWO. Set by decision; the threshold is on the STANDARD, not on what the shift
+// actually achieved, which matters: it is a property of the product the plant
+// chose to run, not of how the shift performed. A shift cannot earn the
+// multiplier by running slowly.
+//
+// In August this covers 242 of the 636 hours that carry a standard - 1,663 of
+// the 6,327 slabs claimed, about a quarter of the month.
+//
+// A BLANK STANDARD IS NOT A SLOW ONE. 100 August rows have no standard at all,
+// and every one of them also declares no slab range, so they claim nothing
+// either way - but the rule is written to be explicit rather than to rely on
+// that: no standard means no multiplier. Zero is treated the same, being a
+// missing value wearing a number.
+export const SLOW_STD_MAX = 10;
+export const SLOW_STD_MULTIPLIER = 2;
+
+/** What one good slab is worth, given the standard output of the hour that
+ *  claimed it. 2 for a slow product, 1 for everything else. */
+export function stdMultiplier(std: number | null | undefined): number {
+  const n = Number(std);
+  if (!Number.isFinite(n) || n <= 0) return 1;   // blank, or a missing value written as 0
+  return n <= SLOW_STD_MAX ? SLOW_STD_MULTIPLIER : 1;
+}
+
+export function gradeCredit(grade: string | null | undefined): number | null {
+  const g = String(grade ?? "").trim().toUpperCase();
+  if (!g || g.startsWith("NOT GRADED")) return null;
+  // CTS ("cut to size") and PRINTING are routings, not verdicts on the slab, and
+  // must be tested BEFORE the C branch — "CTS".startsWith("C") is true, so they
+  // were scoring as rejects. The doc above always said they were excluded; the
+  // code did not. 37 slabs live, and each one cost a shift 9 points.
+  if (g === "CTS" || g.startsWith("PRINT")) return null;
+  if (g.startsWith("A")) return 1;      // A and A2
+  if (g.startsWith("B")) return 0.5;
+  if (g.startsWith("C")) return 0;      // "C" / "C (Reject)"
+  return null;
+}
+
+// --------------------------------------------------------------------------
+// Polishing outcome — the QC measure for the POLISH line, not the press line
+// --------------------------------------------------------------------------
+// A grade is a verdict on the slab the press made. It is the wrong measure for
+// the calliberator, who does not decide what arrives at his machine — his job is
+// to send it out finished, and to RESCUE the ones that come back. QC records
+// exactly that in two columns:
+//
+//   rw_status        Direct Ok | RW Done Ok | RW Required and ongoing | Can't be Reworked
+//   repolish_status  Polish Ok | Direct Ok  | Repolish Done           | Repolish Required
+//
+// so the polishing board is scored on what those say happened, and on how many
+// slabs went through — not on A/B/C, which the polisher did not cause.
+const RW_OK = new Set(["DIRECT OK", "RW DONE OK"]);
+const RW_LOST = new Set(["CAN'T BE REWORKED", "CANT BE REWORKED"]);
+const RP_OK = new Set(["POLISH OK", "DIRECT OK", "REPOLISH DONE"]);
+const RP_OPEN = new Set(["REPOLISH REQUIRED"]);
+const norm = (v: unknown) => String(v ?? "").trim().toUpperCase();
+
+/** 1 = finished OK (first pass or rescued), 0 = lost, null = still open.
+ *  Open work is excluded exactly as an ungraded slab is: never counted as bad. */
+export function polishCredit(rw: unknown, rp: unknown): number | null {
+  const r = norm(rw), p = norm(rp);
+  if (RW_LOST.has(r)) return 0;                 // scrapped at rework — a loss
+  if (r === "RW REQUIRED AND ONGOING") return null;
+  if (RP_OPEN.has(p)) return null;              // came back, not yet redone
+  if (RP_OK.has(p) || RW_OK.has(r)) return 1;   // "RW Done Ok" / "Repolish Done" count here
+  return null;                                  // no verdict recorded either way
+}
+
+/** One spelling per person.
+ *
+ *  Names are free text on the MIS form, so the same person arrives in several
+ *  forms and the board showed them as separate people with separate scores —
+ *  "SURESH" appeared beside "Suresh" with 1 shift against his 187 rows. Case and
+ *  spacing are folded here; genuine misspellings (Sundhar for Sundar, Josep for
+ *  Joseph) still need the alias map below, because no rule can safely guess
+ *  that two different spellings are the same human. */
+const PERSON_ALIAS: Record<string, string> = {
+  // lower-cased variant -> canonical spelling
+  sundhar: "Sundar",
+
+  // ---- "Sivaiah" is Sivaiha (owner, 2026-11-16: "yes do both") -------------
+  // His login, and so the name on his 552 hours, is "Sivaiha". "Sivaiah" was
+  // typed by hand on two hours of 4 Oct 2026 ("Suresh, Sivaiah", filed from
+  // Suresh's login), which made a second person of him with two hours to his
+  // name. The MIS box is a pick-list from the same day (lib/prodIncharge), so
+  // it cannot be typed again; this line is for the hours already filed and for
+  // any name that arrives another way.
+  sivaiah: "Sivaiha",
+
+  // ---- Capitals the title-case rule below would otherwise flatten ----------
+  // This MERGES NOBODY. The fallback at the foot of canonPerson title-cases
+  // every word so "SURESH" and "suresh" land on one display name, and that rule
+  // also rewrites a name whose capitals are load-bearing: "MA Raju" became "Ma
+  // Raju" on the board that pays him. Set by the owner on 2026-09-06.
+  "ma raju": "MA Raju",
+
+  // ---- SivaPrakash's shifts are Mohan's (owner, 2026-10-08) ----------------
+  // "remove shivaprakash add to mohan … mohan is the guy who remains." Every
+  // shift filed under SivaPrakash, past and future, scores as Mohan's, and the
+  // MIS form no longer offers SivaPrakash (MisShiftSheet MECH_INCHARGE). A
+  // shift naming both counts once: crewFromRows and the scorer collect names
+  // in a Set.
+  sivaprakash: "Mohan", "siva prakash": "Mohan", shivaprakash: "Mohan", "shiva prakash": "Mohan",
+
+  // ---- Appalaraju IS MA Raju: one man, renamed 2026-09-06 -----------------
+  // The rename went through the data too (scripts/0078 rewrote 852 rows), so
+  // this entry looks redundant. It is not, and the hour after that script ran
+  // proved it: MIS row cmtpwxksm0006ik045cix63mv, filed 14:34 UTC for hour
+  // 19-20, came back saying "Appalaraju" in BOTH columns. Two reasons, and
+  // neither is fixed by rewriting rows again:
+  //
+  //   * The form's PROD_INCHARGE roster is a datalist, not a closed list — the
+  //     field "stays typeable" on purpose (MisShiftSheet.tsx) — so the old
+  //     spelling can always be typed, and until this deploys the roster still
+  //     OFFERS it.
+  //   * submitted_by is stamped from the session (stampOperator, OPERATOR_FIELDS
+  //     in app/tables/actions.ts), and the jwt callback revalidates
+  //     sessionVersion without re-reading users.name. His token carries
+  //     "Appalaraju" until it expires — up to 8 hours after the rename.
+  //
+  // A backfill is a moment in time; an alias is the rule. With this line the
+  // scoreboard cannot rank him twice however his name arrives, and the 363
+  // hours behind him stay behind him. It merges nobody: "Appalaraju" has only
+  // ever been this one man (users.email appalaraju@gmail.com, unchanged).
+  appalaraju: "MA Raju",
+
+  // ---- Maintenance in-charges: one person, several names ------------------
+  // Confirmed by the owner on 2026-09-02, with the LEADING name the one that
+  // shows. Counts are MIS rows in the 120 days to that date, so the scale of
+  // the split is on record: the mechanical board was ranking "Joseph" (380
+  // rows) and "Manikya" (40) as two men, and "Narayanan" (132) beside "Arun"
+  // (172) — with 124 more rows naming BOTH, as "Narayanan, Arun", for one
+  // person. Every one of those rows diluted the man's own uptime share.
+  //
+  // "Ram" and "Kumar" are stand-alone spellings here only: the longer
+  // production names ("Satish Kumar", "Madhan Kumar") are keyed whole, below,
+  // and never reach these entries.
+  joseph: "Manikya", josep: "Manikya", jose: "Manikya",   // mechanical
+  arun: "Narayanan", narayana: "Narayanan",              // mechanical — "Narayanan" is the sheet's own spelling
+  ramarasan: "Kumar", ram: "Kumar",                      // electrical
+
+  // ---- Station operators: the Airtable spelling vs the ERP one --------------
+  // Every station carries the same person twice, and the split is a clean
+  // changeover, not a typo: the long Airtable name stops in June 2026 and the
+  // short ERP-form name starts. Inside one recent month only one spelling
+  // appears, so a monthly payout is unaffected — but any range reaching back
+  // past June splits one operator into two rows, halves his per-shift rate and
+  // dilutes everyone else's share, because the divisor counts him twice.
+  //
+  // CONFIRM THESE AGAINST THE ACTUAL ROSTER BEFORE ANYONE IS PAID on a range
+  // that crosses June 2026. They are read off the changeover pattern, and no
+  // rule can safely guess that two spellings are one human.
+  "prasanna venkatesan": "Prasanna",
+  "duraipandian ashokan": "Duraipandain",
+  "sathiyamoorthy a": "Satyamoorthi",
+  "balmukund saw": "Balmukund",
+  "durairaj krishnan": "Durairaj",
+  "elayaraja mani": "Illayaraja",
+  rajinish: "Rajneeshraj",
+  "satish kumar": "Satish",
+  "sukantha kumar": "Sukanta",
+  "madhan kumar": "Madhan",
+  mathan: "Madhan",
+};
+
+/** Accounts that appear in an operator column but are not operators: the office
+ *  and admin logins used to correct a record. Ranking them puts a desk on a
+ *  shop-floor board and takes a real slice of the pool. */
+export const NOT_OPERATORS = new Set(["administrator", "neelam hemanth krishna"]);
+
+/** Rows an operator needs at a station before they are RANKED there. A handful
+ *  of rows is somebody covering for an hour or fixing an entry, not working the
+ *  machine — and with per-shift rates a single lucky row can outrank a month of
+ *  real work. They still appear, unranked, so nothing is hidden. */
+export const MIN_ROWS_TO_RANK_STATION = 25;
+
+export function canonPerson(raw: unknown): string {
+  const t = String(raw ?? "").trim().replace(/\s+/g, " ");
+  if (!t) return "";
+  const key = t.toLowerCase();
+  if (PERSON_ALIAS[key]) return PERSON_ALIAS[key];
+  // Title Case so "SURESH" and "suresh" land on the same display name.
+  return t.replace(/\S+/g, (w) => w[0].toUpperCase() + w.slice(1).toLowerCase());
+}
+
+/** The people named on a shift's MIS rows, kept per role. */
+export interface ShiftCrew { production: string[]; electrical: string[]; mechanical: string[] }
+
+/** Who was named on this shift — the closest thing to a roster the ERP holds.
+ *  Production / electrical / mechanical incharge on the shift's MIS rows.
+ *  A real ShiftTeam roster would replace this; until one exists these are the
+ *  only names attributable to a shift.
+ *
+ *  PURE: derives the crew from MIS rows the caller already fetched for the same
+ *  shift window. It used to be its own query (crewOnShift) against the identical
+ *  where-clause — one extra round-trip per shift instance, ~90 per month
+ *  scoreboard load (measured 2026-08-14). No try/catch anywhere on this path:
+ *  a failed read must not return an empty crew — that does not mean "nobody
+ *  worked", it silently deletes the shift's points from everyone who did and
+ *  raises every other person's share to fill the gap. A scoreboard that pays
+ *  money must fail loudly, not quietly redistribute — so the caller's fetch
+ *  still throws, and this stays a pure function tests can hit without a DB.
+ *
+ *  It lives here, beside canonPerson, rather than in shiftScore.ts (which
+ *  re-exports it) so that a module node --test can reach — the Production
+ *  Dashboard's shift availability card — names a shift's crew by this very
+ *  rule instead of a copy of it. */
+export function crewFromRows(rows: { productionInchargeName?: unknown; electricalInchargeName?: unknown; mechanicalInchargeName?: unknown }[]): ShiftCrew {
+  const prod = new Set<string>(), elec = new Set<string>(), mech = new Set<string>();
+  // multi-select incharges are stored comma-joined in one text column
+  const add = (set: Set<string>, v: unknown) => {
+    for (const name of String(v ?? "").split(",")) { const n = canonPerson(name); if (n) set.add(n); }
+  };
+  for (const r of rows) {
+    add(prod, r.productionInchargeName);
+    add(elec, r.electricalInchargeName);
+    add(mech, r.mechanicalInchargeName);
+  }
+  // submittedBy is NOT a fallback for the production incharge. It holds the
+  // login display name — "Incharge - Prathap", "Incharge - MA Raju",
+  // "Supervisor - Sivaiah", "Administrator" — so the fallback put a second,
+  // differently-spelled row on the paid board for a man already ranked as
+  // "pradhap", and ranked the Administrator account alongside him. An hour that
+  // names no production incharge names nobody; that gap is reported instead.
+  const srt = (x: Set<string>) => [...x].filter(Boolean).sort();
+  return { production: srt(prod), electrical: srt(elec), mechanical: srt(mech) };
+}
+
+// --------------------------------------------------------------------------
+// How the pool is split
+// --------------------------------------------------------------------------
+// TWO POOLS, NOT ONE PRODUCT.
+//
+// The old score was volume x a quality share measured from 90%. Multiply that
+// out and it is exactly:
+//
+//     points = A - 4B - 9C
+//
+// One more Grade-A slab is worth +1. One more C is worth -9. So the most
+// profitable thing a shift could do was NOT ENTER the slabs it thought had come
+// out badly - nine times more profitable than pressing a good one. The scheme
+// was paying for concealment while the notice on the wall told the floor to
+// record everything.
+//
+// The fix is to stop multiplying. Volume is paid on GOOD SLABS (A = 1, B = 0.5,
+// C = 0), where adding a bad slab is worth exactly zero - never negative - so
+// there is nothing to gain by hiding it. Quality is paid from its own pool, so
+// it still decides real money without ever making a slab worth less than
+// nothing.
+export const POOL_VOLUME = 0.7;
+export const POOL_QUALITY = 0.3;
+
+// --------------------------------------------------------------------------
+// A SHIFT IS WORTH THE TIME THE LINE COULD ACTUALLY RUN
+// --------------------------------------------------------------------------
+// The per-shift rate divides good slabs by shifts worked. Counting a shift the
+// plant spent broken as a whole shift charges the incharge for a stoppage he
+// did not cause and cannot fix — 2026-08-03 C was down 480 minutes of 480, made
+// nothing, and still halved Suresh's rate as if he had worked a normal night
+// and produced nothing.
+//
+// So a shift counts for the fraction of its LOGGED hours the line was not
+// stopped. A shift dead throughout counts as zero shifts: it contributes no
+// slabs and no divisor, and drops out of the rate instead of dragging it down.
+//
+// ONLY MECHANICAL/ELECTRICAL BREAKDOWN AND POWEROUT ARE REMOVED. Process and
+// cleaning delay stay in, because they are the shift's own work and its own
+// pace — removing those would pay a man for running his line slowly.
+//
+// WHY THIS IS NOT A LICENCE TO CLAIM DOWNTIME. Shrinking the divisor raises the
+// rate, so an invented breakdown is worth money. Two things sit against it: the
+// hour cannot claim more than 60 minutes, and the SAME figure is what the
+// electrical and mechanical incharge are scored on — a breakdown that did not
+// happen takes money out of a colleague's pocket on the same shift, and he is
+// standing right there. The claim has a witness with the opposite incentive.
+
+/** Floor on a shift that DECLARED SLABS: one hour of an eight-hour shift.
+ *
+ *  A shift that pressed slabs was running for some of it, whatever the delay
+ *  columns say. Without this floor a row claiming a full stoppage AND a slab
+ *  range divides real output by zero, and one contradictory entry takes the
+ *  whole pool. It is a rail against bad data, not a scoring rule — no shift in
+ *  the live range hits it. */
+export const MIN_RUNNING_SHIFT = 1 / 8;
+
+/** What one shift instance is worth as a divisor: 1 for a shift that ran
+ *  clean, 0 for one that never ran at all.
+ *
+ *  `stoppedMin` is breakdown + powerout only. Measured against the hours MIS
+ *  ACTUALLY LOGGED, exactly as uptime is — an hour never entered is not an hour
+ *  the line was running, so it cannot be claimed as one. */
+export function shiftWeight(hoursLogged: number, stoppedMin: number, declaredSlabs = 0): number {
+  if (!(hoursLogged > 0)) return 0;
+  const running = Math.max(0, Math.min(1, 1 - stoppedMin / (hoursLogged * 60)));
+  return declaredSlabs > 0 ? Math.max(running, MIN_RUNNING_SHIFT) : running;
+}
+
+// --------------------------------------------------------------------------
+// OEE — REPORTED, NOT PAID
+// --------------------------------------------------------------------------
+// Availability x Performance x Quality, the standard manufacturing measure, so
+// the plant has one number it can compare against the rest of the industry and
+// three it can act on. Every input below is already collected for the payout
+// maths; nothing new has to be entered to produce it.
+//
+// IT DOES NOT DECIDE MONEY, DELIBERATELY. The payout is still 70% good slabs /
+// 30% quality (POOL_VOLUME / POOL_QUALITY) and this changes none of it. Two
+// reasons. Availability and Quality are ALREADY in the payout — availability
+// through shiftWeight shrinking the divisor, quality through its own pool — so
+// paying OEE on top pays twice for one thing. And Performance depends on
+// TARGET_SLABS_PER_SHIFT below, which is a decision, not a measurement: putting
+// an unvalidated target into a payout is how an incentive loses the floor's
+// trust in its first month. Show it, let the floor watch it move for a month,
+// then decide whether it should carry weight.
+
+/** Good slabs an eight-hour shift is expected to produce when the line runs.
+ *
+ *  NOT MEASURED — A DECISION. It was originally read off the incentive ladder:
+ *  the notice's landmark tier was 9,000 good slabs a month, which across 90
+ *  shifts is 100 a shift, and that was the row the sheet called "a full extra
+ *  month's pay for everyone". Tying Performance to it meant 100% Performance
+ *  and the landmark payout described the same night's work.
+ *
+ *  THAT DERIVATION NO LONGER HOLDS, and the number is now standing on its own.
+ *  On 2026-08-06 the notice's floor moved to 7,000 slabs, its top pool was cut
+ *  to Rs 25 lakh, and the line grew to 72 people — so NO tier pays a full
+ *  month's salary any more (the top row, 12,000 slabs, pays 92%) and there is
+ *  no landmark left to read a target off. 100 is kept because it is a sane
+ *  eight-hour target and because moving it would silently restate every
+ *  Performance and OEE figure on the scoreboard, not because the ladder still
+ *  points at it.
+ *
+ *  For context on how far that is: July 2026 ran 44-51 good slabs per shift, so
+ *  the plant currently sits near 50% Performance. That is the point — a target
+ *  already being hit measures nothing.
+ *
+ *  This is REPORTED only and decides no money, so a stale target misleads a
+ *  board rather than a payout. Revisit it deliberately. */
+export const TARGET_SLABS_PER_SHIFT = 100;
+export const SHIFT_HOURS = 8;
+
+/** The three numbers every board shows, and their product.
+ *
+ *  Each is null when the shift carries nothing to measure it from, and OEE is
+ *  null unless all three are real — a product with a missing term is not a
+ *  smaller OEE, it is an unknown one, and rendering it as a number would put a
+ *  confident figure on absent data. */
+export interface Oee {
+  /** Running time / time MIS actually logged. Breakdown and powerout only —
+   *  the same minutes shiftWeight removes, for the same reason. */
+  availability: number | null;
+  /** Good slabs against what the running time should have produced. Measured
+   *  against RUNNING hours, not logged hours: a line that was stopped is an
+   *  availability loss and must not be charged again as a pace loss. */
+  performance: number | null;
+  /** The raw QC grade share (A = 1, B = 0.5, C = 0) — unstretched. This is the
+   *  industry definition; QUALITY_FLOOR/QUALITY_TARGET belong to the payout and
+   *  would make the figure incomparable with anyone else's OEE. */
+  quality: number | null;
+  oee: number | null;
+}
+
+/** World-class benchmarks, shown beside each figure so the number reads as
+ *  "against what". These are the standard targets, not the plant's current
+ *  performance — 85% OEE is the classic world-class mark. */
+export const OEE_TARGET = { availability: 0.95, performance: 0.95, quality: 0.98, oee: 0.85 };
+
+export function oeeOf(
+  hoursLogged: number, stoppedMin: number, points: number, rawQuality: number | null,
+): Oee {
+  const availability = hoursLogged > 0
+    ? Math.max(0, Math.min(1, 1 - stoppedMin / (hoursLogged * 60)))
+    : null;
+  // Running hours, capped at the shift length: MIS occasionally files more than
+  // eight rows for one shift (a corrected hour re-entered), and without the cap
+  // that inflates the expected output and understates a good shift.
+  const runningHours = availability == null ? 0 : Math.min(hoursLogged, SHIFT_HOURS) * availability;
+  const expected = runningHours * (TARGET_SLABS_PER_SHIFT / SHIFT_HOURS);
+  const performance = expected > 0 ? Math.max(0, Math.min(1, points / expected)) : null;
+  const oee = availability != null && performance != null && rawQuality != null
+    ? availability * performance * rawQuality
+    : null;
+  return { availability, performance, quality: rawQuality, oee };
+}
+
+/** Sum OEE across shifts the way a plant figure must be summed: pool the inputs
+ *  and divide once. Averaging each shift's OEE weights a two-hour shift the same
+ *  as a full one, which is how a plant number ends up describing nobody. */
+export function oeeTotal(
+  rows: { hoursLogged: number; breakdownMin: number; poweroutMin: number; points: number }[],
+  rawQuality: number | null,
+): Oee {
+  const hours = rows.reduce((a, r) => a + r.hoursLogged, 0);
+  const stopped = rows.reduce((a, r) => a + r.breakdownMin + r.poweroutMin, 0);
+  const points = rows.reduce((a, r) => a + r.points, 0);
+  // Expected output is per shift, so it has to be built shift by shift — the
+  // eight-hour cap does not survive being applied to a month of logged hours.
+  const expected = rows.reduce((a, r) => {
+    const av = r.hoursLogged > 0
+      ? Math.max(0, Math.min(1, 1 - (r.breakdownMin + r.poweroutMin) / (r.hoursLogged * 60))) : 0;
+    return a + Math.min(r.hoursLogged, SHIFT_HOURS) * av * (TARGET_SLABS_PER_SHIFT / SHIFT_HOURS);
+  }, 0);
+  const availability = hours > 0 ? Math.max(0, Math.min(1, 1 - stopped / (hours * 60))) : null;
+  const performance = expected > 0 ? Math.max(0, Math.min(1, points / expected)) : null;
+  const oee = availability != null && performance != null && rawQuality != null
+    ? availability * performance * rawQuality : null;
+  return { availability, performance, quality: rawQuality, oee };
+}
+
+// --------------------------------------------------------------------------
+// MIS DISCIPLINE — also reported, not paid
+// --------------------------------------------------------------------------
+// The notice already tells the floor that an unentered hour claims nothing and a
+// disputed slab is paid to nobody. Until now the consequence was only visible
+// after the fact, inside a payout nobody could reconstruct. This puts the same
+// three failures on the board as one number per shift, so the shift can see the
+// points it is throwing away while there is still time to correct the entry.
+//
+// It is NOT scored, for the same reason as OEE: every one of these already costs
+// the shift real points through the payout maths (an unfiled hour claims no
+// slabs, a wide row is ignored, a disputed slab is dropped from both shifts).
+// Scoring it as well would charge for the same mistake twice.
+
+/** 0-1: how completely a shift filed its own MIS.
+ *  1.0 = eight hours filed, nothing disputed, no impossible ranges. */
+export function misDiscipline(
+  hoursLogged: number, wideRows: number, contested: number, quantity: number,
+): number | null {
+  if (hoursLogged <= 0) return null;
+  const filed = Math.min(1, hoursLogged / SHIFT_HOURS);
+  const clean = hoursLogged > 0 ? Math.max(0, 1 - wideRows / hoursLogged) : 1;
+  // Disputed slabs as a share of what the shift claimed. A shift that claimed
+  // nothing cannot have disputed anything, so this term is 1 rather than 0.
+  const undisputed = quantity > 0 ? Math.max(0, 1 - contested / quantity) : 1;
+  return filed * clean * undisputed;
+}
+
+/** Shifts before a per-shift RATE is trusted at face value.
+ *
+ *  Both pools are shared on rates, which is what the plant asked for: 3 shifts
+ *  making 300 good slabs should beat 10 making 500. But a rate from one shift
+ *  is not evidence - a single good night would otherwise take the largest slice
+ *  of the month from people who worked twenty. Below this, the share is scaled
+ *  down in proportion; at or above it, the rate counts in full.
+ *
+ *  MEASURED ON SHIFTS ATTENDED, NOT RUNNING SHIFTS — deliberately. Credibility
+ *  asks how many times we have watched this man run a shift, and he turned up
+ *  for all of them. Scaling it by running time instead cancels the whole
+ *  downtime adjustment for exactly the people it protects: below the ramp the
+ *  volume term is `(points / shifts) x (shifts / N)`, which is `points / N`
+ *  whatever the divisor, so a man whose night was lost to a breakdown would
+ *  come out of the fix strictly worse off than before it — punished twice for
+ *  one stoppage.
+ *
+ *  CALIBRATED, like TOLERANCE_MM and UPTIME_FLOOR — 5 was too blunt for a
+ *  three-man rotation. On 2026-07-31..08-06 Suresh ran 106 slabs at 100% QC
+ *  through the one shift of his two the line was alive for: 111 good slabs per
+ *  running shift, nearly double the next man. At 5 that became 111 x 0.40 = 44
+ *  and put him THIRD on the money behind rates of 64 and 50 — the board showed
+ *  him first on performance and paid him third, which is exactly the reading
+ *  that makes an incentive stop working.
+ *
+ *  At 3 he places first (29.2% against Sivaiha's 28.4%) and the guard is still
+ *  live where it matters: two shifts are discounted a third, one shift is cut
+ *  to 0.33, so a single lucky night still cannot take the month. Set by
+ *  decision on those figures — revisit it if the rotation gets deeper. */
+export const CREDIBLE_SHIFTS = 3;
+export const credibility = (shifts: number) => Math.min(1, Math.max(0, shifts) / CREDIBLE_SHIFTS);
+
+/** Shifts a person must have worked before they can be RANKED.
+ *  Set to 1 by decision: everyone who worked at all is placed, however few
+ *  shifts they did. The per-shift rate is the measure, and a short month should
+ *  not remove someone from the board. Raise this if a one-shift rate ever wins
+ *  in a way that reads unfairly — the mechanism is still here. */
+export const MIN_SHIFTS_TO_RANK = 1;
+
+/** Which shift instance a UTC timestamp falls in (IST clock). */
+export function shiftKeyOf(d: Date): string {
+  const ist = new Date(d.getTime() + IST_MIN * 60_000);
+  const h = ist.getUTCHours();
+  const day = ist.toISOString().slice(0, 10);
+  if (h >= 6 && h < 14) return `${day}A`;
+  if (h >= 14 && h < 22) return `${day}B`;
+  return `${h >= 22 ? day : plusDay(day, -1)}C`;
+}
+
+// --------------------------------------------------------------------------
+// The corrected pay rules, and the one day they start
+// --------------------------------------------------------------------------
+// REP-1 and REP-2 of the code review of 20 Oct 2026. Both change what workers
+// are paid, so both start on the same production day, named once below.
+
+/** THE FIRST PRODUCTION DAY THE CORRECTED PAY RULES APPLY TO. The single date
+ *  behind REP-1 (the double-claim guard at a range's edge) and REP-2 (the
+ *  station boards' clock), kept in one constant so the two corrections cannot
+ *  start on different days.
+ *
+ *  THE OWNER'S RULING, 20 Oct 2026: the corrected incentive and payout rules
+ *  apply from NEXT MONTH ONLY, and no closed month is recomputed. So every
+ *  range that ends before this day is scored exactly as it always was —
+ *  October 2026 and every month before it print the same figures after this
+ *  change as before it, and tests/correctedPayRules.test.ts holds them to it. On and
+ *  after this day:
+ *
+ *    REP-1  the double-claim guard also reads the shift just outside each end
+ *           of the range (edgeShifts), so a slab that the last night of one
+ *           month and the first shift of the next both claimed is paid in
+ *           neither until an admin rules, instead of in both.
+ *    REP-2  the five naive-IST station boards window and count days on the
+ *           station's own clock (stationWindow, stationDayKey) instead of on a
+ *           real-UTC bound that read their columns 5h30m early.
+ *
+ *  AT THE SEAM, OCTOBER STAYS EXACTLY AS IT WAS AND NOVEMBER FITS ITSELF TO
+ *  IT. October is scored by the old rules and November by the new, so:
+ *    - a slab Oct 31 C and Nov 1 A both claimed still counts in October, for
+ *      Oct 31 C: October's trailing edge is not widened, so it never sees the
+ *      contest. November reads Oct 31 C as its leading edge and finds the
+ *      overlap, but a ruling there could only pay the slab a second time (an
+ *      award to Nov 1 A put it in November's total as well; the code review's
+ *      re-check, 20 Oct 2026). So a slab an edge shift ON THE OLD RULES also
+ *      claimed is out of every November shift whatever is awarded, and its
+ *      card offers no ruling (edgeOnOldRules, paidBeforeBySlab): it is paid
+ *      once, in October, and not again. From the Nov/Dec seam on both sides
+ *      are corrected, and the ordinary contest runs in both months;
+ *    - the press / distributor / kreos / oven / jot rows of Oct 31 C's last
+ *      5h30m (00:30–06:00 IST on 1 Nov) were never on October's station
+ *      board, whose old window stops at 00:30 IST on 1 Nov. November's board
+ *      therefore starts THERE, not at 06:00 (stationWindow), so those rows are
+ *      paid in November and every row is on exactly one month's board. Every
+ *      later range starts at its own 06:00. (October took in 30 Sep's C tail,
+ *      the same error from the other side; it is closed and stays as it was.)
+ *  Neither needs October recomputed, which is the option the owner declined.
+ *
+ *  A production-day label (06:00→06:00 IST), compared as YYYY-MM-DD text. Move
+ *  it only on a new ruling: moving it earlier rescores months already closed
+ *  and paid. */
+export const CORRECTED_PAY_RULES_FROM = "2026-11-01";
+
+/** The shift instances just OUTSIDE a scored range whose MIS claims the
+ *  double-claim guard must also read (REP-1): the C shift of the day before
+ *  `from`, and the A shift of the day after `scoredTo`.
+ *
+ *  WHY. A slab two shifts both claimed is paid to neither until an admin
+ *  rules. The guard only ever compared the shifts INSIDE the range, so the
+ *  night of Oct 31 and the morning of Nov 1 were never compared with each
+ *  other: each month saw one claim, found it uncontested, and the slab was
+ *  paid twice — once in each month's counted total, the figure that picks the
+ *  ladder rung. A prefill that was not end+1, or a one-digit slip, overlaps the
+ *  shift beside it, and at a range edge that shift is outside the range. (A
+ *  slip that lands on a shift days away is still caught only when both shifts
+ *  are inside one range, as before; the review's case is the adjoining one.)
+ *
+ *  THEY CONTEST, THEY NEVER SCORE. The callers add an edge shift's claims to
+ *  the list of who claimed a slab, and to nothing else: an edge shift is not
+ *  scored, not paid and owns no slab in this range. It belongs to the range
+ *  next door, which scores it itself.
+ *
+ *  Only the edges on the corrected side of CORRECTED_PAY_RULES_FROM — the
+ *  leading edge when the range starts on or after it, the trailing edge when
+ *  the range ends on or after it — and only an edge shift that has ENDED by
+ *  `now`, the rule every scored instance already follows: a shift still running
+ *  has not finished typing its claim. */
+export function edgeShifts(from: string, scoredTo: string, now: Date): { anchor: string; shift: ShiftLetter }[] {
+  const out: { anchor: string; shift: ShiftLetter }[] = [];
+  if (from >= CORRECTED_PAY_RULES_FROM) out.push({ anchor: plusDay(from, -1), shift: "C" });
+  if (scoredTo >= CORRECTED_PAY_RULES_FROM) out.push({ anchor: plusDay(scoredTo, 1), shift: "A" });
+  return out.filter(({ anchor, shift }) => shiftRange(anchor, shift).end <= now);
+}
+
+/** The window a station board reads for the production days from..to, on THAT
+ *  STATION'S OWN CLOCK (REP-2).
+ *
+ *  TWO CLOCKS (see dashboard/time.ts). polish_entry.created and imported_at are
+ *  REAL instants, so from..to is shiftRange(from, A).start → shiftRange(to,
+ *  C).end, 00:30Z → 00:30Z. press / distributor / kreos / oven / jot `.date`
+ *  are NAIVE IST — the wall clock stored as if it were UTC — so on them the
+ *  same days run `${from}T06:00Z` → `${to + 1}T06:00Z`: dashboard/time.ts
+ *  naiveIstBounds, the bounds pressLogDaily is given. Binding the real-instant
+ *  bounds to a naive column read 00:30 → 00:30 IST: it took in the night
+ *  before the range's C tail and left out the range's own last one, so a
+ *  C-shift operator's good slabs at both edges landed in the wrong range and
+ *  moved his station share.
+ *
+ *  The corrected naive bound applies on each end only on the corrected side of
+ *  CORRECTED_PAY_RULES_FROM, so a range that ends before it reads exactly the
+ *  rows it always read.
+ *
+ *  AND A RANGE THAT STARTS ON THAT DAY KEEPS THE OLD LOWER BOUND (the code
+ *  review's re-check, 20 Oct 2026). October's old window stops at 00:30 IST on
+ *  1 Nov on these columns; starting November at 06:00 left Oct 31 C's last
+ *  5h30m on no month's board, unpaid in both. Starting it at October's old
+ *  stop takes exactly those rows into November, so every row is on one board
+ *  and October does not move. Only on CORRECTED_PAY_RULES_FROM itself: a range
+ *  starting later starts at its own 06:00, where the range before it now
+ *  stops. */
+export function stationWindow(from: string, to: string, naiveIst: boolean): { lo: Date; hi: Date } {
+  const lo = shiftRange(from, "A").start, hi = shiftRange(to, "C").end;
+  if (!naiveIst) return { lo, hi };
+  return {
+    lo: from > CORRECTED_PAY_RULES_FROM ? new Date(`${from}T06:00:00.000Z`) : lo,
+    hi: to >= CORRECTED_PAY_RULES_FROM ? new Date(`${plusDay(to, 1)}T06:00:00.000Z`) : hi,
+  };
+}
+
+/** The production day a station row counts toward "days present" (REP-2).
+ *  A REAL instant moves +05:30 to the IST clock and then −06:00 to the
+ *  production day. A NAIVE value already IS the IST clock, so it moves only
+ *  −06:00 — the key pressLogDaily groups by (dashboard/server/sql.ts). Giving a
+ *  naive value the real-instant shift keyed it at ts − 30 min, which cut every
+ *  night at 00:30 IST and counted one C shift as two days present.
+ *
+ *  Corrected for naive rows from where November's board starts — 00:30 IST on
+ *  1 Nov, October's old upper bound (see stationWindow) — so Oct 31 C's tail,
+ *  which is on November's board, counts as the one night it was. Every earlier
+ *  row was on a closed month's board and keeps the key it always had, so a
+ *  closed month's Days column does not move. */
+export function stationDayKey(ts: Date, naiveIst: boolean): string {
+  const ms = ts.getTime();
+  if (naiveIst && ms >= shiftRange(CORRECTED_PAY_RULES_FROM, "A").start.getTime()) {
+    return new Date(ms - 6 * 3600_000).toISOString().slice(0, 10);
+  }
+  return new Date(ms + (IST_MIN - 360) * 60_000).toISOString().slice(0, 10);
+}
+
+/** Who claimed each slab: slab -> the "<anchor><shift>" keys whose MIS ranges
+ *  cover it, in-range shifts first in the order given, then edge shifts. A slab
+ *  with two or more keys is contested and scores for nobody until an admin
+ *  rules (scoreRange).
+ *
+ *  An EDGE shift (REP-1, see edgeShifts) is added only to a slab a shift
+ *  INSIDE the range also claimed. A slab only the edge shift claimed is not
+ *  this range's at all: it gets no entry, so it can neither be scored here nor
+ *  turn up as a one-claimant "dispute". With no edges this is exactly the map
+ *  scoreRange always built. Pure, so the review's own example is a test. */
+export function claimantsBySlab(
+  inRange: { key: string; slabs: number[] }[],
+  edges: { key: string; slabs: number[] }[] = [],
+): Map<number, string[]> {
+  const claimedBy = new Map<number, string[]>();
+  for (const c of inRange) {
+    for (const n of c.slabs) claimedBy.set(n, [...(claimedBy.get(n) ?? []), c.key]);
+  }
+  for (const c of edges) {
+    for (const n of c.slabs) {
+      const k = claimedBy.get(n);
+      if (k) claimedBy.set(n, [...k, c.key]);
+    }
+  }
+  return claimedBy;
+}
+
+/** Whether an edge shift's OWN range is scored on the OLD rules: its anchor is
+ *  before CORRECTED_PAY_RULES_FROM (REP-1 at the seam; the code review's
+ *  re-check, 20 Oct 2026). Only one edge ever is: Oct 31 C, read as the
+ *  leading edge of a range that starts on 1 Nov 2026. edgeShifts reads a
+ *  leading edge only when `from` is on or after the date, and a trailing edge
+ *  always lies after it. Takes the "<anchor><shift>" key the callers hold. */
+export function edgeOnOldRules(key: string): boolean {
+  return key.slice(0, 10) < CORRECTED_PAY_RULES_FROM;
+}
+
+/** The contested slabs that an edge shift ON THE OLD RULES also claimed:
+ *  slab -> that edge shift's key (REP-1 at the 1 Nov seam).
+ *
+ *  WHY. October 2026 is scored on the old rules and is closed. Its trailing
+ *  edge is not widened, so it counted every slab Oct 31 C claimed that no
+ *  other OCTOBER shift contested, including the ones Nov 1 A typed as well.
+ *  November does see the contest. Under the ordinary rule an admin could then
+ *  award those slabs, and an award to Nov 1 A paid them in November too: the
+ *  very double payment REP-1 removes. (An award to Oct 31 C, or none, already
+ *  kept them out.) So these slabs are out of every shift in the range
+ *  whatever any award says (excludedSlabs), their dispute card offers no
+ *  ruling, and the month's rebuilt claim leaves them off its table without
+ *  counting them as paid to nobody (incentiveMonth claimedByMonth).
+ *
+ *  Takes either caller's map (scoreRange's arrays, claimedByMonth's sets),
+ *  and only a slab with two or more claimants is contested. With no old-rules
+ *  edge, which is every range except one starting on CORRECTED_PAY_RULES_FROM,
+ *  the map is empty and nothing changes. Pure, so the case is a test. */
+export function paidBeforeBySlab(
+  claimedBy: ReadonlyMap<number, Iterable<string>>,
+  edgeKeys: Iterable<string>,
+): Map<number, string> {
+  const old = new Set([...edgeKeys].filter(edgeOnOldRules));
+  const out = new Map<number, string>();
+  if (!old.size) return out;
+  for (const [n, who] of claimedBy) {
+    const keys = [...who];
+    if (keys.length < 2) continue;
+    const settled = keys.find((k) => old.has(k));
+    if (settled) out.set(n, settled);
+  }
+  return out;
+}
+
+/** The contested slabs ONE shift inside the range may not score: scoreRange's
+ *  per-shift exclusion, lifted out here so it runs in a test. A contested slab
+ *  is out unless an admin awarded it to this shift. An unruled slab is
+ *  therefore out of every shift, and an awarded one only out of the shifts
+ *  that lost it; an award to an EDGE shift puts it out of every shift in the
+ *  range, because the range next door scores it. A slab in `paidBefore` (see
+ *  paidBeforeBySlab) is out whatever the award. With `paidBefore` empty this
+ *  is exactly the exclusion scoreRange always applied. */
+export function excludedSlabs(
+  key: string,
+  contested: readonly number[],
+  awardOf: ReadonlyMap<number, { key: string }>,
+  paidBefore: ReadonlyMap<number, string> = new Map(),
+): Set<number> {
+  const ex = new Set<number>();
+  for (const n of contested) if (paidBefore.has(n) || awardOf.get(n)?.key !== key) ex.add(n);
+  return ex;
+}

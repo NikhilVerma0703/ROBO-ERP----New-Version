@@ -1,0 +1,3962 @@
+From 5f2e14a6303c6d3d37f8a4ecf321d7562a0872f8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 2 Sep 2026 09:53:43 +0000
+Subject: [PATCH 1/2] robo: batch matching, date/batch filters, per-slab
+ production date, reports redesign, hourly chart, styled exports
+
+Nine related changes across Robo Reports, Downloads and Entry:
+
+- Batch numbers normalize so D1372 = d1372 = D-1372 = 1372, but A-1248 != D-1248,
+  across every search and filter.
+- Reports and Downloads gain a Date Range option (All / Date Wise / Date Range;
+  the old "Random Date" is now "Date Wise") and an independent Batch Number filter
+  that ANDs with the date.
+- Filters are reordered (Batch first, Production Date second) and the page opens on
+  the latest batch.
+- Per-slab Production Date for batches that run past midnight: a later slab can move
+  to the next day without renumbering earlier slabs; the new date carries forward.
+  Adds a nullable RoboProductionRecord.productionDate column
+  (scripts/0047-robo-slab-production-date.sql must run on Neon before deploy).
+- Batch dropdown (all batches + free-type) and export S.No. grouping: a date-only
+  export groups by batch with S.No. reset and a per-group total; a batch-only export
+  keeps one continuous S.No.
+- Reports redesign: the Machine Performance donut is removed and the Top-5 delay pie
+  becomes a full-width horizontal bar chart of every delay type plus a summary table.
+- A Production Rate per Hour line chart, batch-driven, hourly from batch start to
+  completion by Out Time, zero hours included, midnight-safe.
+- Professional Excel formatting on every Downloads sheet (bold highlighted headers,
+  highlighted total/summary rows); data, calculations and column order unchanged.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SPqDFZ7o6eq1utS7hzoQsF
+---
+ prisma/schema.prisma                          |  11 +
+ scripts/0047-robo-slab-production-date.sql    |  18 ++
+ src/app/api/robo/batch-numbers/route.ts       |  34 +++
+ src/app/api/robo/exports/delays/route.ts      |  40 +++-
+ src/app/api/robo/exports/production/route.ts  | 186 +++++++---------
+ src/app/api/robo/production/[id]/route.ts     |   3 +
+ src/app/api/robo/production/route.ts          |  16 +-
+ src/app/api/robo/reports/hourly/route.ts      |  45 ++++
+ src/app/api/robo/reports/summary/route.ts     |  80 +++----
+ src/app/api/robo/reports/trends/route.ts      |  35 +--
+ src/app/robo/slabs/[id]/edit/page.tsx         |   3 +
+ src/components/robo/DownloadsClient.tsx       |  56 +++--
+ src/components/robo/RoboEntryForm.tsx         |  66 +++++-
+ src/components/robo/RoboReportFilters.tsx     | 107 +++++++++
+ src/components/robo/SlabsBrowser.tsx          |   3 +
+ src/components/robo/reports/DelayAnalysis.tsx | 123 +++++++++++
+ src/components/robo/reports/ReportsClient.tsx | 203 ++++++++---------
+ src/components/robo/reports/chart-tokens.ts   |  12 +
+ src/components/robo/reports/report-charts.tsx |  62 +++---
+ src/lib/robo/batchFilter.ts                   |  35 +++
+ src/lib/robo/batchNo.ts                       |  85 ++++++++
+ src/lib/robo/delayAxis.ts                     |  29 +++
+ src/lib/robo/exportRowRoles.ts                |  33 +++
+ src/lib/robo/exportScope.ts                   |  34 +++
+ src/lib/robo/exportStyle.ts                   |  93 ++++++++
+ src/lib/robo/hourlyProduction.ts              | 114 ++++++++++
+ src/lib/robo/productionDate.ts                | 206 +++++++++++++++---
+ src/lib/robo/productionGrouping.ts            |  98 +++++++++
+ src/lib/robo/reportQuery.ts                   |  44 ++++
+ src/lib/robo/slabSearch.ts                    |  66 +++---
+ tests/roboBatchNo.test.ts                     | 108 +++++++++
+ tests/roboDelayAxis.test.ts                   |  41 ++++
+ tests/roboExportRowRoles.test.ts              |  30 +++
+ tests/roboExportScope.test.ts                 |  43 ++++
+ tests/roboHourlyProduction.test.ts            | 101 +++++++++
+ tests/roboProductionDate.test.ts              | 170 +++++++++++++--
+ tests/roboProductionGrouping.test.ts          | 120 ++++++++++
+ tests/roboReportQuery.test.ts                 |  52 +++++
+ tests/roboSlabSearch.test.ts                  |  62 ++++--
+ 39 files changed, 2240 insertions(+), 427 deletions(-)
+ create mode 100644 scripts/0047-robo-slab-production-date.sql
+ create mode 100644 src/app/api/robo/batch-numbers/route.ts
+ create mode 100644 src/app/api/robo/reports/hourly/route.ts
+ create mode 100644 src/components/robo/RoboReportFilters.tsx
+ create mode 100644 src/components/robo/reports/DelayAnalysis.tsx
+ create mode 100644 src/lib/robo/batchFilter.ts
+ create mode 100644 src/lib/robo/batchNo.ts
+ create mode 100644 src/lib/robo/delayAxis.ts
+ create mode 100644 src/lib/robo/exportRowRoles.ts
+ create mode 100644 src/lib/robo/exportScope.ts
+ create mode 100644 src/lib/robo/exportStyle.ts
+ create mode 100644 src/lib/robo/hourlyProduction.ts
+ create mode 100644 src/lib/robo/productionGrouping.ts
+ create mode 100644 src/lib/robo/reportQuery.ts
+ create mode 100644 tests/roboBatchNo.test.ts
+ create mode 100644 tests/roboDelayAxis.test.ts
+ create mode 100644 tests/roboExportRowRoles.test.ts
+ create mode 100644 tests/roboExportScope.test.ts
+ create mode 100644 tests/roboHourlyProduction.test.ts
+ create mode 100644 tests/roboProductionGrouping.test.ts
+ create mode 100644 tests/roboReportQuery.test.ts
+
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index e8bebab..3963917 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -3650,6 +3650,17 @@ model RoboProductionRecord {
+   shift            RoboShift        @relation(fields: [shiftId], references: [id])
+   batchRecipeId    String?
+   batchRecipe      RoboBatchRecipe? @relation(fields: [batchRecipeId], references: [id])
++  // The slab's OWN production date, when it differs from the batch's. A batch
++  // can run past midnight — slabs 1-80 on 1 Sep, slab 81 at 00:03 on 2 Sep —
++  // and the operator sets this per slab so slab 81 reads 2 Sep while 1-80 stay
++  // 1 Sep, all on the same batch, same shift, same running S.No. Highest
++  // precedence in productionDate.ts: this, else the setup's date, else the
++  // shift's. INVARIANT: a real yyyy-mm-dd string or NULL, never "" — every
++  // writer stores `trim() || null`, so "no per-slab date" is exactly NULL and
++  // the where-builders can gate the fallback branches on `productionDate: null`
++  // alone. Nullable and added late, so existing and imported slabs are NULL and
++  // keep falling back to the setup exactly as before.
++  productionDate   String?
+   inTime           String?
+   outTime          String?
+   roymixCycleTime  Int? // RoyMix cycle time in seconds (varies per slab)
+diff --git a/scripts/0047-robo-slab-production-date.sql b/scripts/0047-robo-slab-production-date.sql
+new file mode 100644
+index 0000000..8ff8d24
+--- /dev/null
++++ b/scripts/0047-robo-slab-production-date.sql
+@@ -0,0 +1,18 @@
++-- 0047 — Per-slab Production Date for the Robo module.
++--
++-- A batch can run past midnight: slabs 1-80 on 1 Sep, slab 81 at 00:03 on
++-- 2 Sep. The operator now sets a production date per slab, so slab 81 reads
++-- 2 Sep while slabs 1-80 stay 1 Sep — same batch, same shift, same running
++-- S.No. This adds the column that holds that per-slab date.
++--
++-- Modelled in prisma/schema.prisma as `RoboProductionRecord.productionDate
++-- String?`. Nullable and additive: existing and imported slabs are NULL and
++-- keep falling back to the setup's date, then the shift's, exactly as before —
++-- so this is SAFE to run against the live database before the new code ships,
++-- and the currently-deployed code, which does not reference the column, is
++-- unaffected.
++--
++-- RUN THIS ON NEON BEFORE DEPLOYING the round with the per-slab date. The app
++-- writes a real yyyy-mm-dd string or NULL, never "".
++
++ALTER TABLE "RoboProductionRecord" ADD COLUMN IF NOT EXISTS "productionDate" TEXT;
+diff --git a/src/app/api/robo/batch-numbers/route.ts b/src/app/api/robo/batch-numbers/route.ts
+new file mode 100644
+index 0000000..20351b4
+--- /dev/null
++++ b/src/app/api/robo/batch-numbers/route.ts
+@@ -0,0 +1,34 @@
++import { NextResponse } from "next/server";
++import { prisma } from "@/lib/prisma";
++import { canonBatchNo } from "@/lib/robo/batchNo";
++
++/**
++ * GET /api/robo/batch-numbers — every batch number on record, most-recent
++ * first, deduped so the dozen spellings of one batch ("D-1372", "d1372",
++ * "1372") appear once (the canonical rule from batchNo.ts, keeping the newest
++ * spelling as the label).
++ *
++ * Feeds the Batch Number box on Reports and Downloads two ways at once: the
++ * whole list is the dropdown, and the FIRST element is the latest batch, which
++ * both screens select by default when they open.
++ */
++export async function GET() {
++  const recipes = await prisma.roboBatchRecipe.findMany({
++    where: { batchNo: { not: null } },
++    select: { batchNo: true },
++    orderBy: { createdAt: "desc" },
++  });
++
++  const seen = new Set<string>();
++  const batchNumbers: string[] = [];
++  for (const r of recipes) {
++    const display = (r.batchNo ?? "").trim();
++    if (!display) continue; // a stored "" is not a batch number
++    const key = canonBatchNo(display);
++    if (!key || seen.has(key)) continue; // one entry per real batch
++    seen.add(key);
++    batchNumbers.push(display);
++  }
++
++  return NextResponse.json({ batchNumbers });
++}
+diff --git a/src/app/api/robo/exports/delays/route.ts b/src/app/api/robo/exports/delays/route.ts
+index 1e62b04..74703d5 100644
+--- a/src/app/api/robo/exports/delays/route.ts
++++ b/src/app/api/robo/exports/delays/route.ts
+@@ -1,9 +1,13 @@
+ import { NextRequest, NextResponse } from "next/server";
+-import * as XLSX from "xlsx";
++import * as XLSX from "xlsx-js-style";
+ import { prisma } from "@/lib/prisma";
++import { resolveBatchRecipeIds } from "@/lib/robo/batchFilter";
+ import { fmtDurationLong, machineLabel } from "@/lib/robo/utils";
+ import { delayGrandTotal, delayTotalsByDate } from "@/lib/robo/delayTotals";
+-import { delayProductionDateOf, delayProductionDateWhere } from "@/lib/robo/productionDate";
++import { delayProductionDateOf, delayProductionDateSelectWhere } from "@/lib/robo/productionDate";
++import { exportScopeTag } from "@/lib/robo/exportScope";
++import { styleRoboSheet } from "@/lib/robo/exportStyle";
++import { byDateRowRole, delayRowRole } from "@/lib/robo/exportRowRoles";
+ 
+ // Shift is gone — an internal grouping the register does not show. Design Name,
+ // Thickness and Batch No. come off the slab the delay held up, so a delay reads
+@@ -28,16 +32,32 @@ const delayTotalRows = (mins: number, events: number): DelayRow[] => [
+   { "Description": "Delay Events", "Duration": events },
+ ];
+ 
+-/** GET /api/robo/exports/delays?date=YYYY-MM-DD — omit date for every delay to date. */
++/**
++ * GET /api/robo/exports/delays?date=&from=&to=&batch=
++ * Omit everything for every delay to date. `date` is one day, `from`/`to` an
++ * inclusive window (a range beats a single date), `batch` a loosely-matched
++ * Batch Number — the same filters the Downloads screen shows.
++ */
+ export async function GET(req: NextRequest) {
+-  const date = req.nextUrl.searchParams.get("date")?.trim() || "";
+-  // "All" (no date) groups the list date-wise; a single date is one block.
++  const sp = req.nextUrl.searchParams;
++  const date = sp.get("date")?.trim() || "";
++  const from = sp.get("from")?.trim() || "";
++  const to = sp.get("to")?.trim() || "";
++  const batchIds = await resolveBatchRecipeIds(sp.get("batch"));
++
++  // "All dates" groups the list date-wise; a single day is one block. A range
++  // keeps the grouping (bounded All); a batch is a filter, not a date scope.
+   const grouped = date === "";
+ 
+   const fetched = await prisma.roboDelayLog.findMany({
+     // Dated by the slab the delay held up, so a delay and its slab never land
+-    // on two different days in the same workbook — see productionDate.ts.
+-    where: delayProductionDateWhere(date) ?? {},
++    // on two different days in the same workbook — see productionDate.ts — and
++    // filtered to that slab's batch when one is typed (through the slab, since a
++    // delay carries no batch of its own; a batch filter drops slab-less delays).
++    where: {
++      ...(delayProductionDateSelectWhere({ date, from, to }) ?? {}),
++      ...(batchIds !== null ? { productionRecord: { batchRecipeId: { in: batchIds } } } : {}),
++    },
+     include: {
+       shift: true,
+       delayCode: true,
+@@ -121,6 +141,8 @@ export async function GET(req: NextRequest) {
+     { wch: 12 }, { wch: 38 }, { wch: 15 }, { wch: 13 }, { wch: 11 }, { wch: 11 },
+     { wch: 12 }, { wch: 28 },
+   ];
++  // Highlight the header and every "TOTAL DELAY DURATION" / "Delay Events" line.
++  styleRoboSheet(ws, { columnCount: COLUMNS.length, rowRoles: rows.map(delayRowRole) });
+ 
+   /* Second sheet: the same delays totalled per production date. Downloading
+      "All" used to give one figure for the whole period, which is the least
+@@ -142,13 +164,15 @@ export async function GET(req: NextRequest) {
+ 
+   const wsByDate = XLSX.utils.json_to_sheet(byDateRows, { header: BY_DATE_COLUMNS });
+   wsByDate["!cols"] = [{ wch: 18 }, { wch: 14 }, { wch: 18 }, { wch: 18 }];
++  // Header plus the closing TOTAL line.
++  styleRoboSheet(wsByDate, { columnCount: BY_DATE_COLUMNS.length, rowRoles: byDateRows.map(byDateRowRole) });
+ 
+   const wb = XLSX.utils.book_new();
+   XLSX.utils.book_append_sheet(wb, ws, `Delay List`.slice(0, 31));
+   XLSX.utils.book_append_sheet(wb, wsByDate, "Date-wise Totals");
+ 
+   const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+-  const filename = `Delay_List_${date || "All"}.xlsx`;
++  const filename = `Delay_List_${exportScopeTag({ date, from, to, hasBatch: batchIds !== null })}.xlsx`;
+ 
+   return new NextResponse(buf, {
+     status: 200,
+diff --git a/src/app/api/robo/exports/production/route.ts b/src/app/api/robo/exports/production/route.ts
+index 43a8a4d..23831a0 100644
+--- a/src/app/api/robo/exports/production/route.ts
++++ b/src/app/api/robo/exports/production/route.ts
+@@ -1,14 +1,14 @@
+ import { NextRequest, NextResponse } from "next/server";
+-import * as XLSX from "xlsx";
++import * as XLSX from "xlsx-js-style";
+ import { prisma } from "@/lib/prisma";
++import { resolveBatchRecipeIds } from "@/lib/robo/batchFilter";
+ import { formatSlabRemarks, machineLabel } from "@/lib/robo/utils";
+-import { productionDateOf, productionDateWhere, setupProductionDate, setupProductionDateWhere } from "@/lib/robo/productionDate";
+-import {
+-  PRODUCTION_RECORD_COLUMNS,
+-  PRODUCTION_RECORD_WIDTHS,
+-  productionRecordRow,
+-  type ProductionRecordRow,
+-} from "@/lib/robo/productionExport";
++import { productionDateOf, productionDateSelectWhere, setupProductionDate } from "@/lib/robo/productionDate";
++import { exportScopeTag } from "@/lib/robo/exportScope";
++import { assembleByBatch, assembleContinuous, type ExportRecord } from "@/lib/robo/productionGrouping";
++import { PRODUCTION_RECORD_COLUMNS, PRODUCTION_RECORD_WIDTHS } from "@/lib/robo/productionExport";
++import { styleRoboSheet } from "@/lib/robo/exportStyle";
++import { productionRowRole } from "@/lib/robo/exportRowRoles";
+ 
+ const MACHINE_ORDER = ["Roycut-1", "Roymix", "Roycut-2", "Roycut-3"];
+ 
+@@ -23,26 +23,34 @@ const SETUP_COLUMNS = [
+ const dash = (v: string | number | null | undefined) =>
+   v === null || v === undefined || v === "" ? "-" : v;
+ 
+-/** Two blank spacer rows between one production date and the next. */
+-const SPACER: ProductionRecordRow[] = [{}, {}];
+-
+-/** The "Total → X records" line that closes a date group and the whole sheet. */
+-const recordsTotalRow = (label: string, count: number): ProductionRecordRow => ({
+-  "Slab No.": label,
+-  "Remarks": `${count} record${count === 1 ? "" : "s"}`,
+-});
+-
+-/** GET /api/robo/exports/production?date=YYYY-MM-DD — omit date for every record to date. */
++/**
++ * GET /api/robo/exports/production?date=&from=&to=&batch=
++ * Omit everything for every record to date. `date` is one day, `from`/`to` an
++ * inclusive window (a range beats a single date), `batch` a loosely-matched
++ * Batch Number — the same filters the Downloads screen shows.
++ */
+ export async function GET(req: NextRequest) {
+-  const date = req.nextUrl.searchParams.get("date")?.trim() || "";
+-  // "All" (no date) is the scope that groups the sheets date-wise. A single
+-  // chosen date is one group, so it is left as a flat list with one total.
+-  const grouped = date === "";
++  const sp = req.nextUrl.searchParams;
++  const date = sp.get("date")?.trim() || "";
++  const from = sp.get("from")?.trim() || "";
++  const to = sp.get("to")?.trim() || "";
++  const batchIds = await resolveBatchRecipeIds(sp.get("batch"));
++
++  // The layout follows the ACTIVE FILTER, not the date scope — see change (6)
++  // and lib/robo/productionGrouping.ts. A batch chosen → one continuous list,
++  // stored S.No. preserved. No batch (only a date filter) → grouped by batch,
++  // S.No. restarting per group. The batch is the pivot, so this is exactly
++  // "was a batch selected?".
++  const byBatch = batchIds === null;
+ 
+   const fetched = await prisma.roboProductionRecord.findMany({
+     // Filtered on the date the operator entered, matching what the sheet
+-    // prints and what Slabs Records searches — see productionDate.ts.
+-    where: productionDateWhere(date) ?? {},
++    // prints and what Slabs Records searches — see productionDate.ts — and on
++    // the batch the operator typed, resolved to setup ids (batchFilter.ts).
++    where: {
++      ...(productionDateSelectWhere({ date, from, to }) ?? {}),
++      ...(batchIds !== null ? { batchRecipeId: { in: batchIds } } : {}),
++    },
+     include: {
+       shift: true,
+       batchRecipe: true,
+@@ -51,87 +59,48 @@ export async function GET(req: NextRequest) {
+     orderBy: { createdAt: "asc" },
+   });
+ 
+-  /* Sorted by the Production Date the sheet PRINTS, not by the shift's own
+-     date. It used to be `orderBy: [{ shift: { date } }, ...]`, which was the
+-     same thing back when the column read off the shift — and became a sheet
+-     whose first column jumps about the moment it stopped. Sorted here rather
+-     than in the query because the value is a fallback across two relations and
+-     Postgres cannot order by it; every row is already in memory to be shaped.
+-     yyyy-mm-dd sorts as text exactly as it sorts as a date. */
+-  const records = [...fetched].sort(
+-    (a, b) =>
+-      productionDateOf(a).localeCompare(productionDateOf(b)) ||
+-      a.createdAt.getTime() - b.createdAt.getTime(),
+-  );
+-
+-  /* Columns and row shaping live in lib/robo/productionExport.ts, together and
+-     under test: json_to_sheet appends any row key its header does not mention,
+-     so the two drifting apart is a silent blank column plus a stray one past
+-     the end — which is what this sheet used to do with the Robo2 pair.
+-
+-     Each record is shaped once, carrying the production date it belongs to so
+-     the grouping below never has to resolve it a second time. The S.No.
+-     fallback is the row's position across the WHOLE sheet, so it stays unique
+-     even when the rows are split into date groups. */
+-  const shaped = records.map((r, i) => ({
+-    date: productionDateOf(r),
+-    row: productionRecordRow(
+-      {
+-        serialNumber:     r.serialNumber,
+-        productionDate:   productionDateOf(r),
+-        designName:       r.batchRecipe?.designName ?? null,
+-        thickness:        r.batchRecipe?.thickness ?? null,
+-        batchNo:          r.batchRecipe?.batchNo ?? null,
+-        slabNumber:       r.slabNumber,
+-        roymixBodyWeight: r.roymixBodyWeight,
+-        roymixCycleTime:  r.roymixCycleTime,
+-        inTime:           r.inTime,
+-        outTime:          r.outTime,
+-        // The exact string Slabs Records shows: the slab's own note AND its
+-        // delays, e.g. "C5 Robo1 15m [22:40-22:55]".
+-        remarks:          formatSlabRemarks(r.remarks, r.delayLogs),
+-      },
+-      i + 1,
+-    ),
++  /* Each fetched row reduced to what the sheet carries, its production date
++     resolved once (productionDateOf now honours the slab's own per-slab date —
++     a batch past midnight). The grouping module sorts and lays these out; it
++     does NOT touch the stored serialNumber, so preserving vs resetting S.No. is
++     purely how it numbers the rows it shows. Remarks is resolved here because
++     formatSlabRemarks pulls in enough of the app that node --test can't. */
++  const exportRecords: ExportRecord[] = fetched.map((r) => ({
++    serialNumber:     r.serialNumber,
++    productionDate:   productionDateOf(r),
++    designName:       r.batchRecipe?.designName ?? null,
++    thickness:        r.batchRecipe?.thickness ?? null,
++    batchNo:          r.batchRecipe?.batchNo ?? null,
++    slabNumber:       r.slabNumber,
++    roymixBodyWeight: r.roymixBodyWeight,
++    roymixCycleTime:  r.roymixCycleTime,
++    inTime:           r.inTime,
++    outTime:          r.outTime,
++    remarks:          formatSlabRemarks(r.remarks, r.delayLogs),
++    createdAtMs:      r.createdAt.getTime(),
+   }));
+ 
+-  const rows: ProductionRecordRow[] = [];
+-  if (grouped) {
+-    // One group per production date, its own "Total → X records" at the end,
+-    // then two blank rows before the next date.
+-    let cursor = 0;
+-    while (cursor < shaped.length) {
+-      const day = shaped[cursor].date;
+-      let end = cursor;
+-      while (end < shaped.length && shaped[end].date === day) end++;
+-      const group = shaped.slice(cursor, end);
+-      for (const s of group) rows.push(s.row);
+-      rows.push(recordsTotalRow("Total", group.length));
+-      if (end < shaped.length) rows.push(...SPACER);
+-      cursor = end;
+-    }
+-    // The final overall total, kept as it was — one line for the whole sheet.
+-    if (shaped.length > 0) rows.push(...SPACER);
+-    rows.push(recordsTotalRow("GRAND TOTAL", shaped.length));
+-  } else {
+-    for (const s of shaped) rows.push(s.row);
+-    rows.push({});
+-    rows.push(recordsTotalRow("TOTAL", shaped.length));
+-  }
++  const rows = byBatch ? assembleByBatch(exportRecords) : assembleContinuous(exportRecords);
+ 
+   const wsRecords = XLSX.utils.json_to_sheet(rows, { header: [...PRODUCTION_RECORD_COLUMNS] });
+   wsRecords["!cols"] = PRODUCTION_RECORD_WIDTHS.map((wch) => ({ wch }));
+-
+-  /* Second sheet: the production setup each slab was produced under. Grouped
+-     by date the same way, with two blank rows between dates — but no total
+-     rows, because a setup count is not a figure anyone reads off this sheet. */
+-  const fetchedSetups = await prisma.roboBatchRecipe.findMany({
+-    // Through the same module as everything else, rather than a second
+-    // hand-written copy of the fallback that could drift from it.
+-    where: setupProductionDateWhere(date) ?? {},
+-    include: { shift: true, entries: { include: { machine: true } } },
+-    orderBy: { createdAt: "asc" },
+-  });
++  // Highlight the header and every batch section / total row — rows.map lines up
++  // with json_to_sheet, so the roles land on exactly the right rows.
++  styleRoboSheet(wsRecords, { columnCount: PRODUCTION_RECORD_COLUMNS.length, rowRoles: rows.map(productionRowRole) });
++
++  /* Second sheet: the production setup each shown slab ran under. DERIVED from
++     the records above — their distinct batch setups — rather than filtered by
++     the setup's own date, so it stays in lock-step with the Records sheet. That
++     matters now that a batch can run past midnight: its setup keeps the start
++     date, but its later-day slabs are in scope, and this way the setup behind
++     them is shown regardless. One block per batch, blank-row separated. */
++  const setupIds = [...new Set(fetched.map((r) => r.batchRecipeId).filter((id): id is string => Boolean(id)))];
++  const fetchedSetups = setupIds.length
++    ? await prisma.roboBatchRecipe.findMany({
++        where: { id: { in: setupIds } },
++        include: { shift: true, entries: { include: { machine: true } } },
++      })
++    : [];
+   const setups = [...fetchedSetups].sort(
+     (a, b) =>
+       setupProductionDate(a).localeCompare(setupProductionDate(b)) ||
+@@ -139,15 +108,10 @@ export async function GET(req: NextRequest) {
+   );
+ 
+   const setupRows: Record<string, string | number>[] = [];
+-  let prevSetupDate: string | null = null;
+-  for (const s of setups) {
++  setups.forEach((s, si) => {
++    // A blank-row separator between batches.
++    if (si > 0) setupRows.push({}, {});
+     const setupDate = setupProductionDate(s);
+-    // A blank-row separator each time the date changes — but only when the
+-    // sheet is grouped (the "All" scope). A single chosen date is one block.
+-    if (grouped && prevSetupDate !== null && setupDate !== prevSetupDate) {
+-      setupRows.push({}, {});
+-    }
+-    prevSetupDate = setupDate;
+ 
+     const entries = [...s.entries].sort(
+       (a, b) => MACHINE_ORDER.indexOf(a.machine.name) - MACHINE_ORDER.indexOf(b.machine.name)
+@@ -171,20 +135,22 @@ export async function GET(req: NextRequest) {
+         "Notes":                    String(dash(s.notes)),
+       });
+     }
+-  }
++  });
+ 
+   const wsSetup = XLSX.utils.json_to_sheet(setupRows, { header: SETUP_COLUMNS });
+   wsSetup["!cols"] = [
+     { wch: 15 }, { wch: 22 }, { wch: 13 }, { wch: 12 }, { wch: 12 },
+     { wch: 26 }, { wch: 16 }, { wch: 21 }, { wch: 16 }, { wch: 16 }, { wch: 18 }, { wch: 24 },
+   ];
++  // Header only — the Setup sheet has no total rows, just per-machine data.
++  styleRoboSheet(wsSetup, { columnCount: SETUP_COLUMNS.length });
+ 
+   const wb = XLSX.utils.book_new();
+   XLSX.utils.book_append_sheet(wb, wsRecords, "Production Records");
+   XLSX.utils.book_append_sheet(wb, wsSetup, "Production Setup");
+ 
+   const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+-  const filename = `Complete_Production_${date || "All"}.xlsx`;
++  const filename = `Complete_Production_${exportScopeTag({ date, from, to, hasBatch: batchIds !== null })}.xlsx`;
+ 
+   return new NextResponse(buf, {
+     status: 200,
+diff --git a/src/app/api/robo/production/[id]/route.ts b/src/app/api/robo/production/[id]/route.ts
+index 9dcc651..31818ee 100644
+--- a/src/app/api/robo/production/[id]/route.ts
++++ b/src/app/api/robo/production/[id]/route.ts
+@@ -120,6 +120,9 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
+   if (body.outTime !== undefined)          data.outTime = body.outTime || null;
+   if (body.roymixCycleTime !== undefined)  data.roymixCycleTime = body.roymixCycleTime ? Number(body.roymixCycleTime) : null;
+   if (body.roymixBodyWeight !== undefined) data.roymixBodyWeight = body.roymixBodyWeight ? Number(body.roymixBodyWeight) : null;
++  // The slab's own production date, editable when correcting a cross-midnight
++  // slab. Real yyyy-mm-dd or NULL, never "" — the where-builders' invariant.
++  if (body.productionDate !== undefined)   data.productionDate = (typeof body.productionDate === "string" && body.productionDate.trim()) || null;
+ 
+   if (body.status !== undefined) {
+     data.status = body.status;
+diff --git a/src/app/api/robo/production/route.ts b/src/app/api/robo/production/route.ts
+index 583c128..3736969 100644
+--- a/src/app/api/robo/production/route.ts
++++ b/src/app/api/robo/production/route.ts
+@@ -1,5 +1,6 @@
+ import { NextRequest, NextResponse } from "next/server";
+ import { prisma } from "@/lib/prisma";
++import { resolveBatchRecipeIds } from "@/lib/robo/batchFilter";
+ import { latestSerialNumber, nextSerialNumber } from "@/lib/robo/nextNumbers";
+ import { REGISTER_ORDER } from "@/lib/robo/registerOrderDb";
+ import { slabSearchWhere } from "@/lib/robo/slabSearch";
+@@ -13,20 +14,22 @@ import { SLAB_COMPLETED, SLAB_IN_PROCESSING } from "@/lib/robo/utils";
+  *   batchNo (the batch number on the setup the slab was logged against)
+  * With no filters the latest 25 records are returned.
+  *
+- * The where clause is built in lib/robo/slabSearch.ts rather than here, because
+- * designName and batchNo both narrow the same related setup and an inline
+- * second assignment would silently drop the first — see that file.
++ * `batchNo` matches loosely: "D-1372", "d1372" and a bare "1372" all find the
++ * batch stored as "D1372", while "A-1248" stays distinct from "D-1248". The
++ * typed number is resolved to the matching setup ids here (batchFilter.ts) and
++ * the where itself is built in lib/robo/slabSearch.ts — see those files.
+  */
+ export async function GET(req: NextRequest) {
+   const sp = req.nextUrl.searchParams;
+   const limitParam = Number(sp.get("limit"));
+ 
++  const batchRecipeIds = await resolveBatchRecipeIds(sp.get("batchNo"));
+   const { where, hasFilters } = slabSearchWhere({
+     shiftId: sp.get("shiftId"),
+     date: sp.get("date"),
+     slabNumber: sp.get("slabNumber"),
+     designName: sp.get("designName"),
+-    batchNo: sp.get("batchNo"),
++    batchRecipeIds,
+   });
+ 
+   const take = limitParam > 0 ? Math.min(limitParam, 500) : hasFilters ? 200 : 25;
+@@ -119,6 +122,11 @@ export async function POST(req: Request) {
+         slabNumber,
+         shiftId:          body.shiftId,
+         batchRecipeId:    body.batchRecipeId || null,
++        // The slab's own production date, when the operator set one for it — a
++        // batch running past midnight has later slabs on a later day. Stored as
++        // a real yyyy-mm-dd or NULL, never "" (the where-builders' invariant):
++        // an untouched field falls back to the setup/shift exactly as before.
++        productionDate:   (typeof body.productionDate === "string" && body.productionDate.trim()) || null,
+         inTime:           body.inTime || null,
+         outTime:          body.outTime || null,
+         roymixCycleTime:  body.roymixCycleTime ? Number(body.roymixCycleTime) : null,
+diff --git a/src/app/api/robo/reports/hourly/route.ts b/src/app/api/robo/reports/hourly/route.ts
+new file mode 100644
+index 0000000..a93d3b4
+--- /dev/null
++++ b/src/app/api/robo/reports/hourly/route.ts
+@@ -0,0 +1,45 @@
++import { NextRequest, NextResponse } from "next/server";
++import { prisma } from "@/lib/prisma";
++import { resolveBatchRecipeIds } from "@/lib/robo/batchFilter";
++import { productionDateOf } from "@/lib/robo/productionDate";
++import { hourlyProduction } from "@/lib/robo/hourlyProduction";
++
++/**
++ * GET /api/robo/reports/hourly?batch=<batch number>
++ *
++ * The "Production Rate per Hour" line chart: slabs completed each hour across
++ * the SELECTED BATCH's own run. Driven by the batch alone, NOT the date filter —
++ * the timeline is the batch's actual duration (see hourlyProduction.ts), which a
++ * date filter would cut short for a batch that ran past midnight.
++ *
++ * A blank batch is no chart: without a batch there is no single run whose start
++ * and end define a timeline, so the series is empty and the screen says so.
++ */
++export async function GET(req: NextRequest) {
++  const batchIds = await resolveBatchRecipeIds(req.nextUrl.searchParams.get("batch"));
++  // null = no batch typed; [] = a batch typed that matches nothing. Either way
++  // there is no run to chart.
++  if (batchIds === null || batchIds.length === 0) {
++    return NextResponse.json({ series: [] });
++  }
++
++  const slabs = await prisma.roboProductionRecord.findMany({
++    where: { batchRecipeId: { in: batchIds } },
++    select: {
++      inTime: true,
++      outTime: true,
++      // Everything productionDateOf needs to resolve the slab's effective day —
++      // its own per-slab date first (a batch past midnight), else the setup's,
++      // else the shift's.
++      productionDate: true,
++      batchRecipe: { select: { productionDate: true } },
++      shift: { select: { date: true } },
++    },
++  });
++
++  const series = hourlyProduction(
++    slabs.map((s) => ({ productionDate: productionDateOf(s), inTime: s.inTime, outTime: s.outTime })),
++  );
++
++  return NextResponse.json({ series });
++}
+diff --git a/src/app/api/robo/reports/summary/route.ts b/src/app/api/robo/reports/summary/route.ts
+index 50435a0..a45334b 100644
+--- a/src/app/api/robo/reports/summary/route.ts
++++ b/src/app/api/robo/reports/summary/route.ts
+@@ -1,15 +1,8 @@
+ import { NextRequest, NextResponse } from "next/server";
+ import { Prisma } from "@prisma/client";
+ import { prisma } from "@/lib/prisma";
+-import { delayProductionDateWhere, productionDateWhere } from "@/lib/robo/productionDate";
+-
+-/** The four robots on the line, in physical order. */
+-const ROBOTS = [
+-  { db: "Roycut-1", label: "Robo1", short: "R1" },
+-  { db: "Roymix",   label: "Robo2", short: "R2" },
+-  { db: "Roycut-2", label: "Robo3", short: "R3" },
+-  { db: "Roycut-3", label: "Robo4", short: "R4" },
+-];
++import { resolveBatchRecipeIds } from "@/lib/robo/batchFilter";
++import { delayProductionDateSelectWhere, productionDateSelectWhere } from "@/lib/robo/productionDate";
+ 
+ function toMins(t: string): number {
+   const [h, m] = (t || "").split(":").map(Number);
+@@ -28,13 +21,16 @@ function shiftMinutes(startTime: string, endTime: string | null, status: string,
+ }
+ 
+ /**
+- * GET /api/robo/reports/summary?date=YYYY-MM-DD
+- * No date  → every production record to date.
+- * With date → only what was PRODUCED on that date.
++ * GET /api/robo/reports/summary?date=&from=&to=&batch=
++ * All optional and combinable:
++ *   date         → one production day ("Date Wise")
++ *   from, to     → an inclusive production-date window ("Date Range")
++ *   batch        → a Batch Number, matched loosely (see batchFilter.ts)
++ * A range beats a single date; with none of the three, every record to date.
+  *
+- * "That date" is the production date the operator entered on the batch setup,
+- * falling back to the shift's own date — the same rule Slabs Records, Complete
+- * Details and both Excel downloads use. See lib/robo/productionDate.ts.
++ * "Production date" is the date the operator entered on the batch setup, falling
++ * back to the shift's own date — the same rule Slabs Records, Complete Details
++ * and both Excel downloads use. See lib/robo/productionDate.ts.
+  *
+  * It used to be `where: { shift: { date } }`, and that is not a small
+  * difference: a shift row is created silently with the day the tablet was
+@@ -45,12 +41,29 @@ function shiftMinutes(startTime: string, endTime: string | null, status: string,
+  * off and picking the typing date offered an empty workbook.
+  */
+ export async function GET(req: NextRequest) {
+-  const date = req.nextUrl.searchParams.get("date")?.trim() || "";
++  const sp = req.nextUrl.searchParams;
++  const date = sp.get("date")?.trim() || "";
++  const from = sp.get("from")?.trim() || "";
++  const to = sp.get("to")?.trim() || "";
+   const now = new Date();
+   const nowMins = now.getHours() * 60 + now.getMinutes();
+ 
+-  const recordWhere: Prisma.RoboProductionRecordWhereInput = productionDateWhere(date) ?? {};
+-  const delayWhere: Prisma.RoboDelayLogWhereInput = delayProductionDateWhere(date) ?? {};
++  const batchIds = await resolveBatchRecipeIds(sp.get("batch"));
++  // A null is "no batch filter"; an array (even empty) narrows — the delay
++  // form nests through the slab the delay held up.
++  const batchRecord: Prisma.RoboProductionRecordWhereInput =
++    batchIds !== null ? { batchRecipeId: { in: batchIds } } : {};
++  const batchDelay: Prisma.RoboDelayLogWhereInput =
++    batchIds !== null ? { productionRecord: { batchRecipeId: { in: batchIds } } } : {};
++
++  const recordWhere: Prisma.RoboProductionRecordWhereInput = {
++    ...(productionDateSelectWhere({ date, from, to }) ?? {}),
++    ...batchRecord,
++  };
++  const delayWhere: Prisma.RoboDelayLogWhereInput = {
++    ...(delayProductionDateSelectWhere({ date, from, to }) ?? {}),
++    ...batchDelay,
++  };
+ 
+   const totalSlabs = await prisma.roboProductionRecord.count({ where: recordWhere });
+ 
+@@ -61,8 +74,11 @@ export async function GET(req: NextRequest) {
+      would divide this date's slab count by another date's minutes.
+ 
+      A shift is counted once however many of its slabs matched; a distinct
+-     select over the matched records gives exactly that set. */
+-  const shiftIds = date
++     select over the matched records gives exactly that set. Restricted whenever
++     ANY filter is applied — a date, a range, or a batch — so the minutes always
++     match the slabs they are divided into. */
++  const anyFilter = Boolean(date || from || to || batchIds !== null);
++  const shiftIds = anyFilter
+     ? (await prisma.roboProductionRecord.findMany({
+         where: recordWhere,
+         select: { shiftId: true },
+@@ -82,28 +98,15 @@ export async function GET(req: NextRequest) {
+     where: delayWhere,
+     select: {
+       durationMinutes: true,
+-      machineName: true,
+-      machine: { select: { name: true } },
+       delayCode: { select: { code: true, description: true, category: true } },
+     },
+   });
+ 
+   const totalDelayMins = delays.reduce((s, d) => s + d.durationMinutes, 0);
+ 
+-  // Downtime attributed to each robot
+-  const byMachine: Record<string, number> = {};
+-  for (const d of delays) {
+-    const name = d.machineName || d.machine?.name;
+-    if (!name) continue;
+-    byMachine[name] = (byMachine[name] || 0) + d.durationMinutes;
+-  }
+-  const machinePerformance = ROBOTS.map(r => ({
+-    name: r.label,
+-    short: r.short,
+-    minutes: byMachine[r.db] || 0,
+-  }));
+-
+-  // Top 5 delay types by total duration
++  // EVERY delay type by total duration, highest first — the Delay Analysis bar
++  // chart and its table show the whole list, not a Top 5. Percentages are the
++  // client's job (against totalDelayMins), so the shape carries only the totals.
+   const byCode: Record<string, { code: string; description: string; category: string; minutes: number; events: number }> = {};
+   for (const d of delays) {
+     const key = d.delayCode.code;
+@@ -113,7 +116,7 @@ export async function GET(req: NextRequest) {
+     byCode[key].minutes += d.durationMinutes;
+     byCode[key].events += 1;
+   }
+-  const topDelayTypes = Object.values(byCode).sort((a, b) => b.minutes - a.minutes).slice(0, 5);
++  const delayTypes = Object.values(byCode).sort((a, b) => b.minutes - a.minutes);
+ 
+   return NextResponse.json({
+     date: date || null,
+@@ -122,7 +125,6 @@ export async function GET(req: NextRequest) {
+     slabsPerHour: productionMinutes > 0 ? Math.round((totalSlabs / (productionMinutes / 60)) * 10) / 10 : null,
+     totalDelayMins,
+     delayEvents: delays.length,
+-    machinePerformance,
+-    topDelayTypes,
++    delayTypes,
+   });
+ }
+diff --git a/src/app/api/robo/reports/trends/route.ts b/src/app/api/robo/reports/trends/route.ts
+index 1623eab..aa6a3f5 100644
+--- a/src/app/api/robo/reports/trends/route.ts
++++ b/src/app/api/robo/reports/trends/route.ts
+@@ -23,8 +23,9 @@ function shiftMinutes(startTime: string, endTime: string | null, status: string,
+  * GET /api/robo/reports/trends?days=7|15|30
+  * One row per calendar day (including days with no production) so gaps stay visible.
+  *
+- * Bucketed by PRODUCTION DATE — the date on the batch setup, falling back to
+- * the shift's own — the same rule every other Robo screen uses. See
++ * Bucketed by PRODUCTION DATE — the slab's own per-slab date if it has one (a
++ * batch past midnight), else the date on the batch setup, else the shift's own
++ * — the same precedence every other Robo screen uses. See
+  * lib/robo/productionDate.ts. It used to group by the shift's date, which put a
+  * run entered three days late on the day it was typed, so this chart and the
+  * KPI cards above it on the same page could show one slab under two days.
+@@ -50,34 +51,38 @@ export async function GET(req: NextRequest) {
+ 
+   const window = { in: dates };
+   /* Every slab and delay whose production date falls in the window, by the
+-     same fallback the rest of the module uses. The `in` form of each branch is
+-     the multi-date version of productionDateWhere — kept here rather than in
+-     that module because only this route asks about a range. */
++     same precedence the rest of the module uses. The `in` form of each branch
++     is the multi-date version of productionDateWhere — kept here rather than in
++     that module because only this route asks about a set of days — and it leads
++     with the slab's OWN per-slab date so a batch past midnight lands on the
++     right day, with the fallback branches pinned to `productionDate: null`. */
+   const [records, delays] = await Promise.all([
+     prisma.roboProductionRecord.findMany({
+       where: {
+         OR: [
+-          { batchRecipe: { productionDate: window } },
+-          { batchRecipe: { productionDate: null }, shift: { date: window } },
+-          { batchRecipe: { productionDate: "" }, shift: { date: window } },
+-          { batchRecipe: null, shift: { date: window } },
++          { productionDate: window },
++          { productionDate: null, batchRecipe: { productionDate: window } },
++          { productionDate: null, batchRecipe: { productionDate: null }, shift: { date: window } },
++          { productionDate: null, batchRecipe: { productionDate: "" }, shift: { date: window } },
++          { productionDate: null, batchRecipe: null, shift: { date: window } },
+         ],
+       },
+-      select: { shiftId: true, batchRecipe: { select: { productionDate: true } }, shift: { select: { date: true } } },
++      select: { shiftId: true, productionDate: true, batchRecipe: { select: { productionDate: true } }, shift: { select: { date: true } } },
+     }),
+     prisma.roboDelayLog.findMany({
+       where: {
+         OR: [
+-          { productionRecord: { batchRecipe: { productionDate: window } } },
+-          { productionRecord: { batchRecipe: { productionDate: null } }, shift: { date: window } },
+-          { productionRecord: { batchRecipe: { productionDate: "" } }, shift: { date: window } },
+-          { productionRecord: { batchRecipe: null }, shift: { date: window } },
++          { productionRecord: { productionDate: window } },
++          { productionRecord: { productionDate: null, batchRecipe: { productionDate: window } } },
++          { productionRecord: { productionDate: null, batchRecipe: { productionDate: null } }, shift: { date: window } },
++          { productionRecord: { productionDate: null, batchRecipe: { productionDate: "" } }, shift: { date: window } },
++          { productionRecord: { productionDate: null, batchRecipe: null }, shift: { date: window } },
+           { productionRecord: null, shift: { date: window } },
+         ],
+       },
+       select: {
+         durationMinutes: true,
+-        productionRecord: { select: { batchRecipe: { select: { productionDate: true } }, shift: { select: { date: true } } } },
++        productionRecord: { select: { productionDate: true, batchRecipe: { select: { productionDate: true } }, shift: { select: { date: true } } } },
+         shift: { select: { date: true } },
+       },
+     }),
+diff --git a/src/app/robo/slabs/[id]/edit/page.tsx b/src/app/robo/slabs/[id]/edit/page.tsx
+index 3c0cc85..d40bd5e 100644
+--- a/src/app/robo/slabs/[id]/edit/page.tsx
++++ b/src/app/robo/slabs/[id]/edit/page.tsx
+@@ -59,6 +59,9 @@ export default async function EditRoboSlabPage({
+     where: { id },
+     select: {
+       slabNumber: true,
++      // The slab's own production date (a batch past midnight) — highest
++      // precedence in productionDateOf, so the header shows the slab's real day.
++      productionDate: true,
+       batchRecipeId: true,
+       shift: { select: { date: true, status: true } },
+       batchRecipe: {
+diff --git a/src/components/robo/DownloadsClient.tsx b/src/components/robo/DownloadsClient.tsx
+index 9c86dbd..eb53f0d 100644
+--- a/src/components/robo/DownloadsClient.tsx
++++ b/src/components/robo/DownloadsClient.tsx
+@@ -2,8 +2,8 @@
+ import { useState, useEffect, useCallback } from "react";
+ import { Card } from "@/components/ui";
+ import { fmtDurationLong, formatDate, todayStr } from "@/lib/robo/utils";
+-
+-type Mode = "ALL" | "DATE";
++import { reportQuery, type ReportMode } from "@/lib/robo/reportQuery";
++import { RoboReportFilters, useRoboBatchOptions } from "@/components/robo/RoboReportFilters";
+ 
+ interface Preview {
+   totalSlabs: number;
+@@ -19,44 +19,58 @@ function download(url: string) {
+ }
+ 
+ export function DownloadsClient() {
+-  const [mode, setMode] = useState<Mode>("ALL");
++  const [mode, setMode] = useState<ReportMode>("ALL");
+   const [date, setDate] = useState<string>(todayStr());
++  const [from, setFrom] = useState<string>("");
++  const [to, setTo] = useState<string>("");
++  const [batch, setBatch] = useState<string>("");
++  // Batch dropdown options; also defaults `batch` to the latest batch on open.
++  const batchOptions = useRoboBatchOptions(setBatch);
+   const [preview, setPreview] = useState<Preview | null>(null);
+   const [loading, setLoading] = useState(true);
+ 
+-  const loadPreview = useCallback(async (m: Mode, d: string) => {
++  const loadPreview = useCallback(async (qs: string) => {
+     setLoading(true);
+-    const qs = m === "DATE" && d ? `?date=${encodeURIComponent(d)}` : "";
+     const res = await fetch(`/api/robo/reports/summary${qs}`);
+     const data: Preview | null = res.ok ? await res.json() : null;
+     setPreview(data);
+     setLoading(false);
+   }, []);
+ 
+-  useEffect(() => { loadPreview(mode, date); }, [mode, date, loadPreview]);
++  // The one query string for BOTH the preview and the two downloads, built in
++  // the shared module the Reports screen uses, so the counts shown and the file
++  // saved can never be a different filter. See lib/robo/reportQuery.ts.
++  const query = reportQuery({ mode, date, from, to, batch });
++  // Debounced, because the Batch box fires per keystroke — one request for a
++  // burst of typing rather than one per character.
++  useEffect(() => {
++    const t = setTimeout(() => loadPreview(query), 250);
++    return () => clearTimeout(t);
++  }, [query, loadPreview]);
+ 
+-  const query = mode === "DATE" && date ? `?date=${encodeURIComponent(date)}` : "";
+-  const scopeLabel = mode === "ALL" ? "All production records to date" : `Records for ${formatDate(date)}`;
+-  const select = "rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20";
++  const dateScope =
++    mode === "ALL" ? "All production records to date"
++    : mode === "DATE" ? `Records for ${formatDate(date)}`
++    : `Records from ${from ? formatDate(from) : "the start"} to ${to ? formatDate(to) : "now"}`;
++  const scopeLabel = batch.trim() ? `${dateScope} · Batch ${batch.trim()}` : dateScope;
+ 
+   const hasProduction = (preview?.totalSlabs ?? 0) > 0;
+   const hasDelays = (preview?.delayEvents ?? 0) > 0;
+ 
+   return (
+     <div className="max-w-3xl space-y-6">
+-      {/* ── Date filter ── */}
++      {/* ── Filters: Batch Number, then Production Date ── */}
+       <Card>
+-        <h2 className="mb-4 font-semibold text-gray-800">Date Filter</h2>
+-        <div className="flex flex-wrap items-center gap-3">
+-          <select value={mode} onChange={e => setMode(e.target.value as Mode)} className={select}>
+-            <option value="ALL">All</option>
+-            <option value="DATE">Random Date</option>
+-          </select>
+-          {mode === "DATE" && (
+-            <input type="date" value={date} onChange={e => setDate(e.target.value)} className={select} />
+-          )}
+-          <span className="text-xs text-gray-500">{scopeLabel}</span>
+-        </div>
++        <h2 className="mb-4 font-semibold text-gray-800">Filters</h2>
++        <RoboReportFilters
++          mode={mode} setMode={setMode}
++          date={date} setDate={setDate}
++          from={from} setFrom={setFrom}
++          to={to} setTo={setTo}
++          batch={batch} setBatch={setBatch}
++          batchOptions={batchOptions}
++        />
++        <p className="mt-2 text-xs text-gray-500">{scopeLabel}</p>
+ 
+         {/* What the current filter covers */}
+         <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
+diff --git a/src/components/robo/RoboEntryForm.tsx b/src/components/robo/RoboEntryForm.tsx
+index 6775fee..327517a 100644
+--- a/src/components/robo/RoboEntryForm.tsx
++++ b/src/components/robo/RoboEntryForm.tsx
+@@ -47,6 +47,8 @@ interface BatchEntry {
+ interface BatchRecipe { id: string; productionDate: string | null; batchNo: string | null; designName: string; thickness: number | null; targetSlabs: number | null; notes: string | null; entries: BatchEntry[] }
+ interface ProdRecord {
+   id: string; serialNumber: number | null; slabNumber: string;
++  /** The slab's own production date, when it has one (a batch past midnight). */
++  productionDate?: string | null;
+   inTime: string | null; outTime: string | null; roymixCycleTime: number | null;
+   roymixBodyWeight: number | null; status: string; remarks: string | null; createdAt: string;
+   /** The delays logged against this slab. Present so the Recent slabs table
+@@ -156,7 +158,7 @@ const btnGhost = "rounded-lg border border-gray-300 px-4 py-2 text-sm font-mediu
+ type MachineEntry = { programName: string; toolName: string; liquidName: string; powderName: string; rollerHeight: string; targetCycleTime: string };
+ const emptyEntry = (): MachineEntry => ({ programName: "", toolName: "", liquidName: "", powderName: "", rollerHeight: "", targetCycleTime: "" });
+ 
+-const emptySlab = () => ({ serialNumber: "", slabNumber: "", inTime: "", outTime: "", roymixCycleTime: "", roymixBodyWeight: "", remarks: "" });
++const emptySlab = () => ({ serialNumber: "", slabNumber: "", productionDate: "", inTime: "", outTime: "", roymixCycleTime: "", roymixBodyWeight: "", remarks: "" });
+ const emptyDelayForm = () => ({ selectedCodeId: "", machineId: "", machineName: "", startTime: "", endTime: "", remarks: "" });
+ 
+ /** What the Recent slabs table prints under Remarks: the slab's own note AND
+@@ -330,6 +332,10 @@ export function RoboEntryForm({ recordId, setupEdit, canDelete = false }: {
+       setSlab({
+         serialNumber: rec.serialNumber != null ? String(rec.serialNumber) : "",
+         slabNumber: rec.slabNumber ?? "",
++        // The slab's effective production date, editable — its own if it has
++        // one, else the setup's, else the shift's. Correcting it here changes
++        // only this slab, never the batch or its other slabs.
++        productionDate: productionDateOf(rec),
+         inTime: rec.inTime ?? "",
+         outTime: rec.outTime ?? "",
+         roymixCycleTime: rec.roymixCycleTime != null ? String(rec.roymixCycleTime) : "",
+@@ -530,6 +536,32 @@ export function RoboEntryForm({ recordId, setupEdit, canDelete = false }: {
+    * `suggested` remembers what this effect last put there; anything else in the
+    * box was typed by a person and is left alone.
+    */
++  /**
++   * The production date NEW slabs default to for the running batch.
++   *
++   * A batch can run past midnight: slabs 1-80 on the 1st, slab 81 at 00:03 on
++   * the 2nd. The operator changes the Production Date field ONCE for slab 81 and
++   * every slab after it carries the new day — that persistence lives here, in a
++   * ref, so it survives a save (which clears the rest of the row) and even an
++   * edit interlude (correcting an earlier slab does not move it). It re-seeds to
++   * the batch's own setup date only when the RUNNING BATCH itself changes,
++   * tracked by seededBatchId so an ordinary re-render never resets the day the
++   * operator has moved on to.
++   */
++  const workingDate = useRef<string>("");
++  const seededBatchId = useRef<string | null>(null);
++  useEffect(() => {
++    if (loading || isPageEdit || isSetupEdit) return;
++    const bid = latestBatch?.id ?? null;
++    if (bid === seededBatchId.current) return; // same batch — keep the working day
++    seededBatchId.current = bid;
++    const seed = latestBatch?.productionDate?.trim() || localDate();
++    workingDate.current = seed;
++    // Don't stomp a slab loaded for editing — its own date is on screen.
++    if (!editingId) setSlab((p) => ({ ...p, productionDate: seed }));
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [latestBatch?.id, loading, editingId]);
++
+   const suggested = useRef<string>("");
+   useEffect(() => {
+     if (loading || editingId || isSetupEdit) return;
+@@ -906,7 +938,9 @@ export function RoboEntryForm({ recordId, setupEdit, canDelete = false }: {
+     setDelays([]);
+     resetDelayEntry();
+     setSlabTaken(false);
+-    setSlab(emptySlab());
++    // Back to a blank NEW slab, on the day the operator is logging under — not
++    // the edited slab's own date, and not empty.
++    setSlab({ ...emptySlab(), productionDate: workingDate.current });
+   };
+ 
+   /**
+@@ -956,6 +990,7 @@ export function RoboEntryForm({ recordId, setupEdit, canDelete = false }: {
+           body: JSON.stringify({
+             serialNumber: slab.serialNumber ? Number(slab.serialNumber) : null,
+             slabNumber: slab.slabNumber.trim(),
++            productionDate: slab.productionDate.trim() || null,
+             inTime: slab.inTime || null,
+             outTime: slab.outTime || null,
+             roymixCycleTime: slab.roymixCycleTime ? Number(slab.roymixCycleTime) : null,
+@@ -971,6 +1006,9 @@ export function RoboEntryForm({ recordId, setupEdit, canDelete = false }: {
+             slabNumber: slab.slabNumber.trim(),
+             shiftId: shift!.id,
+             batchRecipeId: latestBatch?.id || null,
++            // The slab's own day. Falls back to the setup/shift when blank, so an
++            // untouched field behaves exactly as before this existed.
++            productionDate: slab.productionDate.trim() || null,
+             inTime: slab.inTime || null,
+             outTime: slab.outTime || null,
+             roymixCycleTime: slab.roymixCycleTime ? Number(slab.roymixCycleTime) : null,
+@@ -1038,11 +1076,14 @@ export function RoboEntryForm({ recordId, setupEdit, canDelete = false }: {
+          Both fields are emptied and the effect below fetches the real end of
+          the register. */
+       suggested.current = "";
+-      setSlab((p) => ({ ...p, serialNumber: "", slabNumber: "", inTime: "", outTime: "", roymixCycleTime: "", roymixBodyWeight: "", remarks: "" }));
++      setSlab((p) => ({ ...p, serialNumber: "", slabNumber: "", productionDate: workingDate.current, inTime: "", outTime: "", roymixCycleTime: "", roymixBodyWeight: "", remarks: "" }));
+       setRegisterVersion((v) => v + 1);
+     } else {
+       suggested.current = nextSerial;
+-      setSlab((p) => ({ ...p, serialNumber: nextSerial, slabNumber: nextSlab, inTime: "", outTime: "", roymixCycleTime: "", roymixBodyWeight: "", remarks: "" }));
++      // Production date carries forward on the working day — the whole point of
++      // the per-slab date: once the operator moves to the next day, every slab
++      // after it stays there until they move again.
++      setSlab((p) => ({ ...p, serialNumber: nextSerial, slabNumber: nextSlab, productionDate: workingDate.current, inTime: "", outTime: "", roymixCycleTime: "", roymixBodyWeight: "", remarks: "" }));
+       // Only when this could not work it out. Asking every time would let the
+       // server's answer overwrite a pair we know is right.
+       if (!nextSerial || !nextSlab) setRegisterVersion((v) => v + 1);
+@@ -1401,6 +1442,23 @@ export function RoboEntryForm({ recordId, setupEdit, canDelete = false }: {
+                   placeholder="e.g. 140748" className={inp} required {...advanceProps("slab")} />
+                 {slabTaken && <p className="mt-1 text-xs font-medium text-red-600">Duplicate Slab No. — this slab number already exists.</p>}
+               </div>
++              <div>
++                {/* The slab's own production date. Defaults to the batch's day
++                    and carries forward slab after slab; the operator changes it
++                    only when a run crosses midnight, and from then on every new
++                    slab in the batch takes the new day. Changing it here never
++                    touches slabs already saved. */}
++                <span className={label}>Production Date</span>
++                <input type="date" value={slab.productionDate}
++                  onChange={(e) => {
++                    const v = e.target.value;
++                    setSlab((p) => ({ ...p, productionDate: v }));
++                    // A new slab moves the working day for the ones after it; an
++                    // edit changes only the slab being corrected.
++                    if (!editingId) workingDate.current = v;
++                  }}
++                  className={inp} />
++              </div>
+               <div>
+                 {/* Plain "In time" / "Out time". The machine names used to be
+                     appended (In time (Robo3)) to say which robot the clock was
+diff --git a/src/components/robo/RoboReportFilters.tsx b/src/components/robo/RoboReportFilters.tsx
+new file mode 100644
+index 0000000..d4085ed
+--- /dev/null
++++ b/src/components/robo/RoboReportFilters.tsx
+@@ -0,0 +1,107 @@
++"use client";
++// The filter bar shared by Reports and Downloads: Batch Number first, then
++// Production Date (All / Date Wise / Date Range). One component so the two
++// screens can never drift in order, wording, or behaviour — change (4)/(6).
++import { useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
++import type { ReportMode } from "@/lib/robo/reportQuery";
++
++const input =
++  "rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm shadow-sm transition focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20";
++
++/**
++ * Load every batch number on record (for the dropdown) and, on first load,
++ * select the LATEST one — the batch at the top of the list — unless the operator
++ * has already typed something. Returns the options for the datalist.
++ *
++ * The default is applied exactly once (a ref, not the options length), so it
++ * seeds the screen without ever fighting a value the operator sets afterwards.
++ */
++export function useRoboBatchOptions(setBatch: Dispatch<SetStateAction<string>>): string[] {
++  const [options, setOptions] = useState<string[]>([]);
++  const didDefault = useRef(false);
++  useEffect(() => {
++    let ignore = false;
++    fetch("/api/robo/batch-numbers")
++      .then((r) => (r.ok ? r.json() : { batchNumbers: [] }))
++      .then((d: { batchNumbers?: string[] }) => {
++        if (ignore) return;
++        const list = d.batchNumbers ?? [];
++        setOptions(list);
++        if (!didDefault.current && list.length > 0) {
++          didDefault.current = true;
++          setBatch((cur) => (cur.trim() ? cur : list[0]));
++        }
++      })
++      .catch(() => {});
++    return () => { ignore = true; };
++  }, [setBatch]);
++  return options;
++}
++
++interface Props {
++  mode: ReportMode;
++  setMode: Dispatch<SetStateAction<ReportMode>>;
++  date: string;
++  setDate: Dispatch<SetStateAction<string>>;
++  from: string;
++  setFrom: Dispatch<SetStateAction<string>>;
++  to: string;
++  setTo: Dispatch<SetStateAction<string>>;
++  batch: string;
++  setBatch: Dispatch<SetStateAction<string>>;
++  /** Every batch number on record, for the dropdown; free typing is allowed. */
++  batchOptions: string[];
++}
++
++export function RoboReportFilters({
++  mode, setMode, date, setDate, from, setFrom, to, setTo, batch, setBatch, batchOptions,
++}: Props) {
++  return (
++    <div className="flex flex-col gap-3">
++      {/* 1 ── Batch Number (a dropdown of every batch, plus free typing) ── */}
++      <div className="flex flex-wrap items-center gap-3">
++        <label className="w-32 text-sm font-medium text-gray-700">Batch Number</label>
++        <input
++          list="robo-batch-options"
++          value={batch}
++          onChange={(e) => setBatch(e.target.value)}
++          placeholder="All batches — pick or type"
++          aria-label="Batch number"
++          className={input}
++        />
++        <datalist id="robo-batch-options">
++          {batchOptions.map((b) => <option key={b} value={b} />)}
++        </datalist>
++        {batch.trim() && (
++          <button
++            type="button"
++            onClick={() => setBatch("")}
++            className="text-xs font-medium text-gray-500 underline hover:text-gray-700"
++          >
++            Clear
++          </button>
++        )}
++      </div>
++
++      {/* 2 ── Production Date (All / Date Wise / Date Range) ── */}
++      <div className="flex flex-wrap items-center gap-3">
++        <label className="w-32 text-sm font-medium text-gray-700">Production Date</label>
++        <select value={mode} onChange={(e) => setMode(e.target.value as ReportMode)} className={input}>
++          <option value="ALL">All</option>
++          <option value="DATE">Date Wise</option>
++          <option value="RANGE">Date Range</option>
++        </select>
++        {mode === "DATE" && (
++          <input type="date" value={date} onChange={(e) => setDate(e.target.value)} className={input} />
++        )}
++        {mode === "RANGE" && (
++          <>
++            <input type="date" aria-label="From date" value={from} onChange={(e) => setFrom(e.target.value)} className={input} />
++            <span className="text-sm text-gray-400">to</span>
++            <input type="date" aria-label="To date" value={to} onChange={(e) => setTo(e.target.value)} className={input} />
++          </>
++        )}
++      </div>
++    </div>
++  );
++}
+diff --git a/src/components/robo/SlabsBrowser.tsx b/src/components/robo/SlabsBrowser.tsx
+index 7333860..20745cc 100644
+--- a/src/components/robo/SlabsBrowser.tsx
++++ b/src/components/robo/SlabsBrowser.tsx
+@@ -10,6 +10,9 @@ interface SlabRecord {
+   id: string;
+   serialNumber: number | null;
+   slabNumber: string;
++  /** The slab's own production date, when it has one (a batch past midnight).
++   *  Highest precedence in productionDateOf — see productionDate.ts. */
++  productionDate: string | null;
+   inTime: string | null;
+   outTime: string | null;
+   status: string;
+diff --git a/src/components/robo/reports/DelayAnalysis.tsx b/src/components/robo/reports/DelayAnalysis.tsx
+new file mode 100644
+index 0000000..40f1fdc
+--- /dev/null
++++ b/src/components/robo/reports/DelayAnalysis.tsx
+@@ -0,0 +1,123 @@
++"use client";
++/**
++ * Delay Analysis — every delay type, by total duration.
++ *
++ * A horizontal bar chart (one bar per delay code, longest first) above a
++ * summary table, both driven by the SAME `data`/`total` so a code's colour,
++ * minutes and share read identically in the bar, its end label, and its table
++ * row. Plain CSS, not Recharts: it is the main content of the page now, so it
++ * paints immediately, and a horizontal bar with an end label and a long
++ * "Code — Description" axis label is cleaner drawn directly than bent out of a
++ * chart library.
++ *
++ * `total` is the WHOLE period's delay minutes (every code summed), so the
++ * percentages are a share of all downtime and add to 100% — the table's total
++ * row states it. The reference mock's own numbers don't add up; the maths here
++ * does.
++ */
++import { niceDelayScale } from "@/lib/robo/delayAxis";
++import { DELAY_SERIES, pct as pctOf } from "./chart-tokens";
++import type { DelaySlice } from "./chart-tokens";
++
++export function DelayAnalysis({ data, total }: { data: DelaySlice[]; total: number }) {
++  const max = data.reduce((m, d) => Math.max(m, d.minutes), 0);
++  const { axisMax, ticks } = niceDelayScale(max);
++  const color = (i: number) => DELAY_SERIES[i % DELAY_SERIES.length];
++
++  return (
++    <div className="space-y-6">
++      {/* ── Horizontal bar chart ── */}
++      <div className="overflow-x-auto">
++        <div className="flex min-w-[560px]">
++          {/* Y-axis: Delay Code + Description */}
++          <div className="w-44 shrink-0 pr-3 sm:w-64">
++            {data.map((d) => (
++              <div key={d.code} className="flex h-9 items-center justify-end">
++                <span className="truncate text-right text-xs text-gray-600" title={`${d.code} — ${d.description}`}>
++                  <span className="font-semibold text-gray-900">{d.code}</span> — {d.description}
++                </span>
++              </div>
++            ))}
++            <div className="h-6" /> {/* aligns the label column with the axis row */}
++          </div>
++
++          {/* Plot: gridlines behind, bars, x-axis below */}
++          <div className="relative min-w-0 flex-1">
++            {/* vertical gridlines, spanning the bars but not the axis labels */}
++            <div className="pointer-events-none absolute inset-x-0 top-0 bottom-6">
++              {ticks.map((t) => (
++                <div key={t} className="absolute top-0 bottom-0 border-l border-gray-100" style={{ left: `${(t / axisMax) * 100}%` }} />
++              ))}
++            </div>
++
++            {/* one bar per delay type, with its exact minutes and % at the end */}
++            {data.map((d, i) => {
++              const w = axisMax > 0 ? (d.minutes / axisMax) * 100 : 0;
++              return (
++                <div key={d.code} className="relative flex h-9 items-center">
++                  <div
++                    className="h-5 rounded-r-sm"
++                    style={{ width: `${w}%`, minWidth: d.minutes > 0 ? 3 : 0, backgroundColor: color(i) }}
++                  />
++                  <span className="whitespace-nowrap pl-2 text-xs font-semibold tabular-nums text-gray-800">
++                    {d.minutes} min <span className="font-normal text-gray-400">({pctOf(d.minutes, total)})</span>
++                  </span>
++                </div>
++              );
++            })}
++
++            {/* x-axis: Total Delay Duration (min) */}
++            <div className="relative h-6">
++              {ticks.map((t) => (
++                <span
++                  key={t}
++                  className="absolute top-1 -translate-x-1/2 text-[10px] tabular-nums text-gray-400"
++                  style={{ left: `${(t / axisMax) * 100}%` }}
++                >
++                  {t}
++                </span>
++              ))}
++            </div>
++            <p className="mt-1 text-center text-[11px] text-gray-400">Total Delay Duration (min)</p>
++          </div>
++        </div>
++      </div>
++
++      {/* ── Summary table ── */}
++      <div className="overflow-x-auto">
++        <table className="w-full text-sm">
++          <thead className="border-b border-gray-200 bg-slate-50">
++            <tr>
++              <th className="px-4 py-2.5 text-left text-xs font-semibold uppercase tracking-wide text-gray-500">Delay Code</th>
++              <th className="px-4 py-2.5 text-left text-xs font-semibold uppercase tracking-wide text-gray-500">Delay Type</th>
++              <th className="px-4 py-2.5 text-right text-xs font-semibold uppercase tracking-wide text-gray-500">Total Duration (min)</th>
++              <th className="px-4 py-2.5 text-right text-xs font-semibold uppercase tracking-wide text-gray-500">% of Total</th>
++            </tr>
++          </thead>
++          <tbody>
++            {data.map((d, i) => (
++              <tr key={d.code} className="border-b border-gray-50">
++                <td className="px-4 py-2.5">
++                  <span className="inline-flex items-center gap-2 font-semibold text-gray-900">
++                    <span className="h-2.5 w-2.5 shrink-0 rounded-sm" style={{ backgroundColor: color(i) }} />
++                    {d.code}
++                  </span>
++                </td>
++                <td className="px-4 py-2.5 text-gray-600">{d.description}</td>
++                <td className="px-4 py-2.5 text-right tabular-nums text-gray-800">{d.minutes} min</td>
++                <td className="px-4 py-2.5 text-right font-semibold tabular-nums text-gray-700">{pctOf(d.minutes, total)}</td>
++              </tr>
++            ))}
++          </tbody>
++          <tfoot>
++            <tr className="border-t-2 border-gray-200 bg-slate-50">
++              <td className="px-4 py-3 font-semibold text-gray-700" colSpan={2}>Total Delay Duration</td>
++              <td className="px-4 py-3 text-right font-semibold tabular-nums text-brand">{total} min</td>
++              <td className="px-4 py-3 text-right font-semibold tabular-nums text-gray-700">{total > 0 ? "100%" : "0%"}</td>
++            </tr>
++          </tfoot>
++        </table>
++      </div>
++    </div>
++  );
++}
+diff --git a/src/components/robo/reports/ReportsClient.tsx b/src/components/robo/reports/ReportsClient.tsx
+index aa1893d..c5c06ae 100644
+--- a/src/components/robo/reports/ReportsClient.tsx
++++ b/src/components/robo/reports/ReportsClient.tsx
+@@ -7,10 +7,11 @@ import type { ReactNode } from "react";
+ import dynamic from "next/dynamic";
+ import { Card } from "@/components/ui";
+ import { fmtDurationLong, formatDate, todayStr } from "@/lib/robo/utils";
+-import {
+-  SERIES, ROBOT_INDEX, pct,
+-  type MachineSlice, type DelaySlice, type TrendPoint,
+-} from "@/components/robo/reports/chart-tokens";
++import { reportQuery, type ReportMode } from "@/lib/robo/reportQuery";
++import { RoboReportFilters, useRoboBatchOptions } from "@/components/robo/RoboReportFilters";
++import { DelayAnalysis } from "@/components/robo/reports/DelayAnalysis";
++import type { HourBucket } from "@/lib/robo/hourlyProduction";
++import type { DelaySlice, TrendPoint } from "@/components/robo/reports/chart-tokens";
+ 
+ /* A grey block the exact height of the figure it stands in for, so nothing
+    shifts when the chart arrives. */
+@@ -18,20 +19,12 @@ function ChartSkeleton({ height }: { height: number }) {
+   return <div className="animate-pulse rounded bg-slate-100" style={{ height }} />;
+ }
+ 
+-/* Recharts is ~5 MB of module graph. Loading it after the page frame has
+-   painted is what stops Reports hanging on a blank screen when it opens.
+-   All five figures share one chunk, so it is fetched once. */
+-/* next/dynamic is compiled by SWC, which requires the import call and the
+-   options object to be written out inline at each call site — a shared helper
+-   fails the build. All five still resolve to one shared chunk. */
+-const MachinePie = dynamic(
+-  () => import("@/components/robo/reports/report-charts").then(m => m.MachinePie),
+-  { ssr: false, loading: () => <ChartSkeleton height={230} /> },
+-);
+-const DelayPie = dynamic(
+-  () => import("@/components/robo/reports/report-charts").then(m => m.DelayPie),
+-  { ssr: false, loading: () => <ChartSkeleton height={230} /> },
+-);
++/* Recharts is ~5 MB of module graph — kept out of the first load and pulled in
++   after the frame paints. Only the Trend Analysis figures use it now; the Delay
++   Analysis chart is plain CSS (see DelayAnalysis) and renders immediately.
++   next/dynamic is compiled by SWC, which requires the import call and the
++   options object inline at each call site — a shared helper fails the build.
++   All three still resolve to one shared chunk. */
+ const DelayByDayBar = dynamic(
+   () => import("@/components/robo/reports/report-charts").then(m => m.DelayByDayBar),
+   { ssr: false, loading: () => <ChartSkeleton height={260} /> },
+@@ -44,6 +37,10 @@ const DailyProductionArea = dynamic(
+   () => import("@/components/robo/reports/report-charts").then(m => m.DailyProductionArea),
+   { ssr: false, loading: () => <ChartSkeleton height={240} /> },
+ );
++const HourlyProductionLine = dynamic(
++  () => import("@/components/robo/reports/report-charts").then(m => m.HourlyProductionLine),
++  { ssr: false, loading: () => <ChartSkeleton height={340} /> },
++);
+ 
+ interface Summary {
+   date: string | null;
+@@ -52,10 +49,9 @@ interface Summary {
+   slabsPerHour: number | null;
+   totalDelayMins: number;
+   delayEvents: number;
+-  machinePerformance: MachineSlice[];
+-  topDelayTypes: DelaySlice[];
++  /** Every delay type, highest duration first — see the summary route. */
++  delayTypes: DelaySlice[];
+ }
+-type Mode = "ALL" | "DATE";
+ 
+ function StatCard({ label, value, tone = "default" }: { label: string; value: string; tone?: "default" | "brand" | "red" }) {
+   const valueTone = tone === "brand" ? "text-brand" : tone === "red" ? "text-red-600" : "text-gray-900";
+@@ -83,23 +79,43 @@ function EmptyFigure({ children }: { children: ReactNode }) {
+ }
+ 
+ export function ReportsClient() {
+-  const [mode, setMode] = useState<Mode>("ALL");
++  const [mode, setMode] = useState<ReportMode>("ALL");
+   const [date, setDate] = useState<string>(todayStr());
++  const [from, setFrom] = useState<string>("");
++  const [to, setTo] = useState<string>("");
++  const [batch, setBatch] = useState<string>("");
++  // Every batch on record for the dropdown; also defaults `batch` to the latest
++  // one on first open (change 4), which the operator can clear or change.
++  const batchOptions = useRoboBatchOptions(setBatch);
+   const [summary, setSummary] = useState<Summary | null>(null);
+   const [loadingSummary, setLoadingSummary] = useState(true);
+ 
++  // Production Rate per Hour — driven by the BATCH alone (its own run's hours),
++  // not the date filter, so a batch that ran past midnight keeps its full
++  // timeline. See /api/robo/reports/hourly.
++  const [hourly, setHourly] = useState<HourBucket[]>([]);
++  const [loadingHourly, setLoadingHourly] = useState(true);
++
+   const [rangeDays, setRangeDays] = useState<number>(7);
+   const [trends, setTrends] = useState<TrendPoint[]>([]);
+   const [loadingTrends, setLoadingTrends] = useState(true);
+ 
+-  const loadSummary = useCallback(async (m: Mode, d: string) => {
++  const loadSummary = useCallback(async (qs: string) => {
+     setLoadingSummary(true);
+-    const qs = m === "DATE" && d ? `?date=${encodeURIComponent(d)}` : "";
+     const res = await fetch(`/api/robo/reports/summary${qs}`);
+     setSummary(res.ok ? await res.json() : null);
+     setLoadingSummary(false);
+   }, []);
+ 
++  const loadHourly = useCallback(async (b: string) => {
++    setLoadingHourly(true);
++    const qs = b.trim() ? `?batch=${encodeURIComponent(b.trim())}` : "";
++    const res = await fetch(`/api/robo/reports/hourly${qs}`);
++    const data = res.ok ? await res.json() : { series: [] };
++    setHourly(data.series ?? []);
++    setLoadingHourly(false);
++  }, []);
++
+   const loadTrends = useCallback(async (days: number) => {
+     setLoadingTrends(true);
+     const res = await fetch(`/api/robo/reports/trends?days=${days}`);
+@@ -108,31 +124,48 @@ export function ReportsClient() {
+     setLoadingTrends(false);
+   }, []);
+ 
+-  useEffect(() => { loadSummary(mode, date); }, [mode, date, loadSummary]);
++  // Built once, in the shared module the Downloads screen uses, so preview and
++  // download can never send a different filter — and depended on as a string so
++  // this only refetches when the effective query changes.
++  const query = reportQuery({ mode, date, from, to, batch });
++  // Debounced: the Batch box fires on every keystroke, so coalesce a burst of
++  // typing into one request rather than one per character. Date/mode changes
++  // are single events and this 250ms is imperceptible on them.
++  useEffect(() => {
++    const t = setTimeout(() => loadSummary(query), 250);
++    return () => clearTimeout(t);
++  }, [query, loadSummary]);
++  // Only the batch drives the hourly chart, and it is debounced against typing.
++  useEffect(() => {
++    const t = setTimeout(() => loadHourly(batch), 250);
++    return () => clearTimeout(t);
++  }, [batch, loadHourly]);
+   useEffect(() => { loadTrends(rangeDays); }, [rangeDays, loadTrends]);
+ 
+-  const machineTotal = (summary?.machinePerformance ?? []).reduce((s, m) => s + m.minutes, 0);
+-  const machineData = (summary?.machinePerformance ?? []).filter(m => m.minutes > 0);
+-  const delayTotal = (summary?.topDelayTypes ?? []).reduce((s, d) => s + d.minutes, 0);
+-  const delayData = summary?.topDelayTypes ?? [];
++  // Every delay type, and the whole period's delay minutes as the % base — so
++  // each type's share is of ALL downtime and the shares add to 100%.
++  const delayData = summary?.delayTypes ?? [];
++  const delayTotal = summary?.totalDelayMins ?? 0;
+ 
+-  const scopeLabel = mode === "ALL" ? "All production records to date" : `Production on ${formatDate(date)}`;
++  const dateScope =
++    mode === "ALL" ? "All production records to date"
++    : mode === "DATE" ? `Production on ${formatDate(date)}`
++    : `Production from ${from ? formatDate(from) : "the start"} to ${to ? formatDate(to) : "now"}`;
++  const scopeLabel = batch.trim() ? `${dateScope} · Batch ${batch.trim()}` : dateScope;
+   const select = "rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm shadow-sm transition focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20";
+ 
+   return (
+     <div className="space-y-8">
+-      {/* ── Top date filter ── */}
++      {/* ── Filters: Batch Number, then Production Date ── */}
+       <div className="flex flex-col gap-2">
+-        <div className="flex flex-wrap items-center gap-3">
+-          <label className="text-sm font-medium text-gray-700">Date Filter</label>
+-          <select value={mode} onChange={e => setMode(e.target.value as Mode)} className={select}>
+-            <option value="ALL">All</option>
+-            <option value="DATE">Random Date</option>
+-          </select>
+-          {mode === "DATE" && (
+-            <input type="date" value={date} onChange={e => setDate(e.target.value)} className={select} />
+-          )}
+-        </div>
++        <RoboReportFilters
++          mode={mode} setMode={setMode}
++          date={date} setDate={setDate}
++          from={from} setFrom={setFrom}
++          to={to} setTo={setTo}
++          batch={batch} setBatch={setBatch}
++          batchOptions={batchOptions}
++        />
+         <p className="text-xs text-gray-500">{scopeLabel}</p>
+       </div>
+ 
+@@ -147,14 +180,10 @@ export function ReportsClient() {
+               </Card>
+             ))}
+           </div>
+-          <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
+-            {[0, 1].map(i => (
+-              <Card key={i}>
+-                <div className="h-4 w-44 animate-pulse rounded bg-slate-100" />
+-                <div className="mt-4"><ChartSkeleton height={230} /></div>
+-              </Card>
+-            ))}
+-          </div>
++          <Card>
++            <div className="h-4 w-52 animate-pulse rounded bg-slate-100" />
++            <div className="mt-4"><ChartSkeleton height={320} /></div>
++          </Card>
+         </div>
+       ) : (
+         <>
+@@ -164,59 +193,35 @@ export function ReportsClient() {
+             <StatCard label="Total Delays" value={fmtDurationLong(summary?.totalDelayMins ?? 0)} tone="red" />
+           </div>
+ 
+-          {/* ── Filter-based visualizations ── */}
+-          <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
+-            {/* Machine Performance */}
+-            <ChartCard title="Machine Performance" subtitle="Share of downtime attributed to each robot">
+-              {machineTotal <= 0 ? (
+-                <EmptyFigure>No machine-attributed delays for this selection</EmptyFigure>
+-              ) : (
+-                <>
+-                  <MachinePie data={machineData} total={machineTotal} />
+-                  <div className="mt-3 space-y-1.5">
+-                    {(summary?.machinePerformance ?? []).map((m, i) => (
+-                      <div key={m.short} className="flex items-center gap-2 text-sm">
+-                        <span className="h-2.5 w-2.5 shrink-0 rounded-sm"
+-                          style={{ backgroundColor: SERIES[ROBOT_INDEX[m.short] ?? i] }} />
+-                        <span className="flex-1 text-gray-600">{m.name}</span>
+-                        <span className="tabular-nums text-gray-500">{m.minutes} min</span>
+-                        <span className="w-14 text-right font-semibold tabular-nums text-gray-800">
+-                          {pct(m.minutes, machineTotal)}
+-                        </span>
+-                      </div>
+-                    ))}
+-                  </div>
+-                </>
+-              )}
+-            </ChartCard>
+-
+-            {/* Delay Analysis */}
+-            <ChartCard title="Delay Analysis" subtitle="Top 5 delay types by total duration">
+-              {delayTotal <= 0 ? (
+-                <EmptyFigure>No delays recorded for this selection</EmptyFigure>
+-              ) : (
+-                <>
+-                  <DelayPie data={delayData} total={delayTotal} />
+-                  <div className="mt-3 space-y-1.5">
+-                    {delayData.map((d, i) => (
+-                      <div key={d.code} className="flex items-center gap-2 text-sm">
+-                        <span className="h-2.5 w-2.5 shrink-0 rounded-sm" style={{ backgroundColor: SERIES[i % SERIES.length] }} />
+-                        <span className="w-10 shrink-0 font-semibold text-gray-700">{d.code}</span>
+-                        <span className="flex-1 truncate text-gray-500" title={d.description}>{d.description}</span>
+-                        <span className="tabular-nums text-gray-500">{d.minutes} min</span>
+-                        <span className="w-14 text-right font-semibold tabular-nums text-gray-800">
+-                          {pct(d.minutes, delayTotal)}
+-                        </span>
+-                      </div>
+-                    ))}
+-                  </div>
+-                </>
+-              )}
+-            </ChartCard>
+-          </div>
++          {/* ── Delay Analysis — every delay type, full width ── */}
++          <ChartCard title="Delay Analysis — All Delay Types" subtitle="Every delay type by total duration, longest first">
++            {delayData.length === 0 || delayTotal <= 0 ? (
++              <EmptyFigure>No delays recorded for this selection</EmptyFigure>
++            ) : (
++              <DelayAnalysis data={delayData} total={delayTotal} />
++            )}
++          </ChartCard>
+         </>
+       )}
+ 
++      {/* ── Production Rate per Hour (the selected batch's own run) ── */}
++      <ChartCard
++        title="Production Rate per Hour"
++        subtitle={batch.trim()
++          ? `Batch ${batch.trim()} — slabs completed each hour, by Out Time, across the batch's run`
++          : "Slabs completed each hour, by Out Time"}
++      >
++        {!batch.trim() ? (
++          <EmptyFigure>Select a batch number above to see its hourly production rate.</EmptyFigure>
++        ) : loadingHourly ? (
++          <ChartSkeleton height={340} />
++        ) : hourly.length === 0 ? (
++          <EmptyFigure>No completed slabs with times for this batch.</EmptyFigure>
++        ) : (
++          <HourlyProductionLine data={hourly} />
++        )}
++      </ChartCard>
++
+       {/* ── Trend Analysis (independent range filter) ── */}
+       <section className="mt-12 space-y-5 border-t-2 border-gray-200 pt-8">
+         <div className="flex flex-wrap items-center gap-4">
+diff --git a/src/components/robo/reports/chart-tokens.ts b/src/components/robo/reports/chart-tokens.ts
+index 0397ab7..24a668a 100644
+--- a/src/components/robo/reports/chart-tokens.ts
++++ b/src/components/robo/reports/chart-tokens.ts
+@@ -8,6 +8,18 @@
+ /** Categorical slots, fixed order (validated for CVD separation on white). */
+ export const SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"];
+ export const ROBOT_INDEX: Record<string, number> = { R1: 0, R2: 1, R3: 2, R4: 3 };
++
++/**
++ * A longer categorical ramp for the all-delay-types bar chart, which shows one
++ * bar per delay code — a dozen or more. Extends SERIES with distinct hues and
++ * cycles (`% length`) if a plant ever runs past the end. The bar and its table
++ * row read the SAME index, so a code's colour is the same in both.
++ */
++export const DELAY_SERIES = [
++  "#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4",
++  "#7c5cd0", "#22b3c9", "#d1512e", "#4b5b6b", "#8a5a2b",
++  "#9a9a92", "#3fa34d",
++];
+ export const DELAY_HUE = "#eb6834";
+ export const PRODUCTION_HUE = "#2a78d6";
+ 
+diff --git a/src/components/robo/reports/report-charts.tsx b/src/components/robo/reports/report-charts.tsx
+index 9cc97d6..9416f0c 100644
+--- a/src/components/robo/reports/report-charts.tsx
++++ b/src/components/robo/reports/report-charts.tsx
+@@ -7,50 +7,46 @@
+  * after the page frame has painted is what makes Reports open immediately.
+  */
+ import {
+-  PieChart, Pie, Cell, Tooltip, ResponsiveContainer,
++  Tooltip, ResponsiveContainer, LabelList,
+   BarChart, Bar, XAxis, YAxis, CartesianGrid, LineChart, Line, AreaChart, Area,
+ } from "recharts";
+ import { fmtDurationLong } from "@/lib/robo/utils";
++import type { HourBucket } from "@/lib/robo/hourlyProduction";
+ import {
+-  SERIES, ROBOT_INDEX, DELAY_HUE, PRODUCTION_HUE, GRID, AXIS, MUTED, TOOLTIP_STYLE, pct,
+-  type MachineSlice, type DelaySlice, type TrendPoint,
++  DELAY_HUE, PRODUCTION_HUE, GRID, AXIS, MUTED, TOOLTIP_STYLE,
++  type TrendPoint,
+ } from "./chart-tokens";
+ 
+-const sliceLabel = ({ name, percent }: { name?: string; percent?: number }) =>
+-  `${name} ${Math.round((percent ?? 0) * 1000) / 10}%`;
+-
+-export function MachinePie({ data, total }: { data: MachineSlice[]; total: number }) {
++/**
++ * Production Rate per Hour — slabs completed in each hour of the selected
++ * batch's run. One point per hour across the batch's own timeline (see
++ * hourlyProduction.ts), the exact count printed above each point, and the
++ * 24-hour interval on the x-axis. Angled x-labels so a full run's worth of
++ * hours stays readable.
++ */
++export function HourlyProductionLine({ data }: { data: HourBucket[] }) {
+   return (
+-    <ResponsiveContainer width="100%" height={230}>
+-      <PieChart>
+-        <Pie data={data} dataKey="minutes" nameKey="short"
+-          cx="50%" cy="50%" innerRadius={45} outerRadius={85} paddingAngle={2}
+-          stroke="#ffffff" strokeWidth={2} label={sliceLabel} labelLine={false}>
+-          {data.map((m, i) => <Cell key={m.short} fill={SERIES[ROBOT_INDEX[m.short] ?? i]} />)}
+-        </Pie>
+-        <Tooltip contentStyle={TOOLTIP_STYLE}
+-          formatter={(v: number) => [`${v} min · ${pct(v, total)}`, "Downtime"]} />
+-      </PieChart>
++    <ResponsiveContainer width="100%" height={340}>
++      <LineChart data={data} margin={{ top: 24, right: 20, left: -6, bottom: 44 }}>
++        <CartesianGrid stroke={GRID} strokeDasharray="3 3" vertical={false} />
++        <XAxis dataKey="label" tick={{ fontSize: 10, fill: MUTED }} axisLine={{ stroke: AXIS }} tickLine={false}
++          interval={0} angle={-40} textAnchor="end" height={62} />
++        <YAxis tick={{ fontSize: 11, fill: MUTED }} axisLine={false} tickLine={false} allowDecimals={false} />
++        <Tooltip contentStyle={TOOLTIP_STYLE} cursor={{ stroke: AXIS, strokeDasharray: "3 3" }}
++          formatter={(v: number) => [`${v} slab${v === 1 ? "" : "s"}`, "Completed"]} />
++        <Line type="monotone" dataKey="slabs" stroke={PRODUCTION_HUE} strokeWidth={2}
++          dot={{ r: 3, strokeWidth: 0, fill: PRODUCTION_HUE }} activeDot={{ r: 5 }} name="Slabs">
++          <LabelList dataKey="slabs" position="top" style={{ fontSize: 10, fontWeight: 600, fill: "#555" }} />
++        </Line>
++      </LineChart>
+     </ResponsiveContainer>
+   );
+ }
+ 
+-export function DelayPie({ data, total }: { data: DelaySlice[]; total: number }) {
+-  return (
+-    <ResponsiveContainer width="100%" height={230}>
+-      <PieChart>
+-        <Pie data={data} dataKey="minutes" nameKey="code"
+-          cx="50%" cy="50%" innerRadius={45} outerRadius={85} paddingAngle={2}
+-          stroke="#ffffff" strokeWidth={2} label={sliceLabel} labelLine={false}>
+-          {data.map((d, i) => <Cell key={d.code} fill={SERIES[i % SERIES.length]} />)}
+-        </Pie>
+-        <Tooltip contentStyle={TOOLTIP_STYLE}
+-          formatter={(v: number, _n: string, p: { payload?: DelaySlice }) =>
+-            [`${v} min · ${pct(v, total)}`, p?.payload?.description ?? "Delay"]} />
+-      </PieChart>
+-    </ResponsiveContainer>
+-  );
+-}
++// The Machine Performance and Delay Analysis pies were removed: Machine
++// Performance is gone from the page, and Delay Analysis is now the all-types
++// horizontal bar chart in DelayAnalysis.tsx (plain CSS). Only the Trend
++// Analysis figures below still use Recharts.
+ 
+ export function DelayByDayBar({ data }: { data: TrendPoint[] }) {
+   return (
+diff --git a/src/lib/robo/batchFilter.ts b/src/lib/robo/batchFilter.ts
+new file mode 100644
+index 0000000..6e2ebd7
+--- /dev/null
++++ b/src/lib/robo/batchFilter.ts
+@@ -0,0 +1,35 @@
++/**
++ * The server half of the Batch Number filter: turn what the operator typed into
++ * the set of setup ids it names.
++ *
++ * Kept apart from the pure batchNo.ts so that module stays reachable by
++ * `node --test` without a database, while this — which reads the setups —
++ * imports prisma and is reached only through the routes.
++ *
++ * Returns `null` for a blank query (no batch filter) and an array otherwise,
++ * empty when nothing matched (a real filter that finds no rows). The caller ANDs
++ * it into its own query in whatever shape fits:
++ *
++ *   production record → `batchRecipeId: { in }`
++ *   delay log         → `productionRecord: { batchRecipeId: { in } }`
++ *   the setup itself  → `id: { in }`
++ *
++ * It reads the whole setup table (two short columns) and matches in memory
++ * because the rule — fold case and hyphens, keep a meaningful prefix, treat a
++ * bare number as the series-less form — is not something a SQL `contains` can
++ * express. The setups number in the hundreds; this is a tiny projection, not a
++ * scan anyone will feel.
++ */
++import { prisma } from "@/lib/prisma";
++import { matchingBatchRecipeIds } from "./batchNo";
++
++export async function resolveBatchRecipeIds(
++  query: string | null | undefined,
++): Promise<string[] | null> {
++  const q = (query ?? "").trim();
++  if (!q) return null;
++  const recipes = await prisma.roboBatchRecipe.findMany({
++    select: { id: true, batchNo: true },
++  });
++  return matchingBatchRecipeIds(q, recipes);
++}
+diff --git a/src/lib/robo/batchNo.ts b/src/lib/robo/batchNo.ts
+new file mode 100644
+index 0000000..fa496fc
+--- /dev/null
++++ b/src/lib/robo/batchNo.ts
+@@ -0,0 +1,85 @@
++/**
++ * Batch-number matching, in one place.
++ *
++ * Pure and alias-free so `node --test` can reach it — the same split
++ * productionDate.ts and slabSearch.ts use.
++ *
++ * ── THE RULE ──────────────────────────────────────────────────────────────
++ * The register writes the same batch a dozen ways: "D1372", "d1372", "D-1372",
++ * "d-1372", and often just "1372". Those are ONE batch and a search for any of
++ * them must return all of them. But a prefix that carries meaning must not be
++ * thrown away with the noise: "A-1248" and "D-1248" are two different batches
++ * and may never be merged.
++ *
++ * So matching folds away exactly two things — case, and non-alphanumeric
++ * formatting (hyphens, spaces, dots) — and nothing else. A leading letter
++ * prefix is kept and compared. The one deliberate exception is a bare number:
++ * "1372" is taken to be the same batch as "D1372", because the register drops
++ * the series letter as often as it writes it. A bare number therefore matches a
++ * prefixed one with the same number — but two DIFFERENT prefixes never match
++ * each other, so "1248" finding both "A-1248" and "D-1248" never makes those
++ * two the same as one another.
++ *
++ *   canon("D-1372") === canon("d1372") === "D1372"
++ *   batchNosMatch("1372", "D1372")   → true   (bare = prefixed, same number)
++ *   batchNosMatch("D-1372", "d1372") → true   (case + hyphen only)
++ *   batchNosMatch("A-1248", "D-1248")→ false  (different meaningful prefixes)
++ */
++
++/** Fold case and formatting away: uppercase, then drop everything that is not a
++ *  letter or digit. This is the comparison key, not a value to store. */
++export function canonBatchNo(raw: string | null | undefined): string {
++  return (raw ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "");
++}
++
++/** The leading letters of a canonical batch — its series prefix, or "" for a
++ *  bare number. */
++function prefixOf(canon: string): string {
++  const m = /^[A-Z]+/.exec(canon);
++  return m ? m[0] : "";
++}
++
++/** Everything after the leading letters — the number (and any trailing part). */
++function stemOf(canon: string): string {
++  return canon.slice(prefixOf(canon).length);
++}
++
++/**
++ * Do two batch numbers name the same batch?
++ *
++ * True when their canonical forms are identical (case/formatting only), OR when
++ * their numbers are identical and at least one of them carries no prefix (the
++ * bare-number-equals-prefixed rule). Two different prefixes never match.
++ */
++export function batchNosMatch(a: string | null | undefined, b: string | null | undefined): boolean {
++  const ca = canonBatchNo(a);
++  const cb = canonBatchNo(b);
++  if (!ca || !cb) return false;
++  if (ca === cb) return true;
++
++  const stemA = stemOf(ca);
++  const stemB = stemOf(cb);
++  if (!stemA || stemA !== stemB) return false;
++
++  // Same number, but only the same batch if one side is the bare number. Two
++  // real prefixes that differ (A vs D) are two batches — never merge them.
++  return prefixOf(ca) === "" || prefixOf(cb) === "";
++}
++
++/**
++ * Given a search string and the batch recipes on file, the ids whose batch
++ * number matches it — the bridge from a typed batch number to a Prisma
++ * `batchRecipeId: { in: [...] }` filter.
++ *
++ * Returns [] for a search that matches nothing (a real filter that finds no
++ * rows), and [] for a blank search only if the caller passes one — callers
++ * should treat a blank search as "no batch filter" before calling.
++ */
++export function matchingBatchRecipeIds(
++  query: string | null | undefined,
++  recipes: readonly { id: string; batchNo: string | null }[],
++): string[] {
++  const q = (query ?? "").trim();
++  if (!q) return [];
++  return recipes.filter((r) => batchNosMatch(q, r.batchNo)).map((r) => r.id);
++}
+diff --git a/src/lib/robo/delayAxis.ts b/src/lib/robo/delayAxis.ts
+new file mode 100644
+index 0000000..934bed1
+--- /dev/null
++++ b/src/lib/robo/delayAxis.ts
+@@ -0,0 +1,29 @@
++/**
++ * A "nice" axis for the Delay Analysis bar chart: a round maximum at or above
++ * the data, with evenly spaced ticks and a little headroom so the longest bar's
++ * end label ("2003 min (62.3%)") clears its bar.
++ *
++ * Pure and alias-free so `node --test` can reach it, kept out of the client
++ * component for the same reason.
++ *
++ * e.g. a max of 2003 → axisMax 2500, ticks 0,500,…,2500 — five clean intervals,
++ * the way the reference layout reads.
++ */
++export function niceDelayScale(max: number, target = 5): { axisMax: number; ticks: number[] } {
++  if (!Number.isFinite(max) || max <= 0) return { axisMax: 1, ticks: [0, 1] };
++
++  const rawStep = max / target;
++  const mag = Math.pow(10, Math.floor(Math.log10(rawStep)));
++  const norm = rawStep / mag;
++  // Snap the step to a 1/2/2.5/5/10 × 10^k grid — the steps that read cleanly.
++  const step = (norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 2.5 ? 2.5 : norm <= 5 ? 5 : 10) * mag;
++
++  let axisMax = Math.ceil(max / step) * step;
++  // Headroom: when the data reaches the top tick the end label has nowhere to
++  // go, so lift the axis one more step.
++  if (max > 0.92 * axisMax) axisMax += step;
++
++  const ticks: number[] = [];
++  for (let t = 0; t <= axisMax + 1e-9; t += step) ticks.push(Math.round(t));
++  return { axisMax, ticks };
++}
+diff --git a/src/lib/robo/exportRowRoles.ts b/src/lib/robo/exportRowRoles.ts
+new file mode 100644
+index 0000000..672404e
+--- /dev/null
++++ b/src/lib/robo/exportRowRoles.ts
+@@ -0,0 +1,33 @@
++/**
++ * Which rows in a Robo download are structural — section headers and totals —
++ * as opposed to plain data or blank spacers. The styling pass (exportStyle.ts)
++ * reads this to highlight them; kept pure and alias-free so `node --test` can
++ * pin the classification without loading the spreadsheet library.
++ *
++ * The markers are the exact literals the export builders write (see
++ * productionGrouping.ts and the two export routes), so a total row is known by
++ * the label it already carries — nothing new is added to the data.
++ */
++
++export type RoboRowRole = "section" | "summary" | "grandTotal";
++
++/** Production Records sheet: batch section headers and the total lines. */
++export function productionRowRole(row: Record<string, unknown>): RoboRowRole | null {
++  if (row["S.No."] === "BATCH") return "section";
++  const slab = row["Slab No."];
++  if (slab === "TOTAL" || slab === "GRAND TOTAL") return "grandTotal"; // the whole-list total
++  if (slab === "Total") return "summary"; // a batch group's total
++  return null;
++}
++
++/** Delay List sheet: the "TOTAL DELAY DURATION" / "Delay Events" total lines. */
++export function delayRowRole(row: Record<string, unknown>): RoboRowRole | null {
++  const desc = row["Description"];
++  if (desc === "TOTAL DELAY DURATION" || desc === "Delay Events") return "summary";
++  return null;
++}
++
++/** Date-wise Totals sheet: the single closing TOTAL line. */
++export function byDateRowRole(row: Record<string, unknown>): RoboRowRole | null {
++  return row["Production Date"] === "TOTAL" ? "grandTotal" : null;
++}
+diff --git a/src/lib/robo/exportScope.ts b/src/lib/robo/exportScope.ts
+new file mode 100644
+index 0000000..bed4d73
+--- /dev/null
++++ b/src/lib/robo/exportScope.ts
+@@ -0,0 +1,34 @@
++/**
++ * The scope tag that names a downloaded workbook — `Complete_Production_<tag>`
++ * and `Delay_List_<tag>` — so a file on disk says what filter produced it.
++ *
++ * Pure and alias-free so `node --test` can reach it, and shared by both export
++ * routes so the two never name the same scope differently.
++ *
++ * The date half mirrors the screen's three modes: a single day is the day, a
++ * range is `<from>_to_<to>` (an open end reads "start"/"end"), and no date is
++ * "All". A batch filter appends "_batch" rather than the raw number — a typed
++ * batch can carry spaces and hyphens that have no business in a filename, and
++ * the workbook's own Batch No. column already says which batch it is.
++ */
++
++export interface ExportScope {
++  date: string;
++  from: string;
++  to: string;
++  hasBatch: boolean;
++}
++
++export function exportScopeTag(scope: ExportScope): string {
++  const date = scope.date.trim();
++  const from = scope.from.trim();
++  const to = scope.to.trim();
++
++  const dateTag = date
++    ? date
++    : from || to
++      ? `${from || "start"}_to_${to || "end"}`
++      : "All";
++
++  return scope.hasBatch ? `${dateTag}_batch` : dateTag;
++}
+diff --git a/src/lib/robo/exportStyle.ts b/src/lib/robo/exportStyle.ts
+new file mode 100644
+index 0000000..e25995e
+--- /dev/null
++++ b/src/lib/robo/exportStyle.ts
+@@ -0,0 +1,93 @@
++/**
++ * Professional cell styling for the Robo download workbooks — a highlighted,
++ * bold header on every sheet and clearly-marked total/section rows, using
++ * xlsx-js-style (the community `xlsx` build silently drops all styles).
++ *
++ * The palette is Office-standard: a dark-blue header, a mid-blue batch section
++ * band, a light-blue wash on group totals and a slightly stronger one on the
++ * grand total. Data cells are left to Excel's own gridlines, so the highlights
++ * are what the eye lands on.
++ *
++ * Only formatting is added here — the values, columns and row order the routes
++ * build are untouched.
++ */
++import * as XLSX from "xlsx-js-style";
++import { type RoboRowRole } from "./exportRowRoles";
++
++const HAIRLINE = { style: "thin", color: { rgb: "B7C4D6" } } as const;
++const BORDER = { top: HAIRLINE, bottom: HAIRLINE, left: HAIRLINE, right: HAIRLINE } as const;
++
++/** The column-header band: dark blue, bold white, on every sheet. */
++export const HEADER_STYLE = {
++  fill: { patternType: "solid", fgColor: { rgb: "1F4E79" } },
++  font: { bold: true, sz: 11, color: { rgb: "FFFFFF" } },
++  alignment: { horizontal: "center", vertical: "center", wrapText: true },
++  border: BORDER,
++} as const;
++
++/** A batch section header inside the grouped Production Records sheet. */
++export const SECTION_STYLE = {
++  fill: { patternType: "solid", fgColor: { rgb: "4472C4" } },
++  font: { bold: true, sz: 11, color: { rgb: "FFFFFF" } },
++  alignment: { horizontal: "left", vertical: "center" },
++  border: BORDER,
++} as const;
++
++/** A group's "Total → X records" line. */
++export const SUMMARY_STYLE = {
++  fill: { patternType: "solid", fgColor: { rgb: "DDEBF7" } },
++  font: { bold: true, sz: 10, color: { rgb: "1F4E79" } },
++  alignment: { horizontal: "left", vertical: "center" },
++  border: { top: HAIRLINE, bottom: HAIRLINE },
++} as const;
++
++/** The whole-sheet grand total — the bottom line, one shade stronger. */
++export const GRAND_TOTAL_STYLE = {
++  fill: { patternType: "solid", fgColor: { rgb: "BDD7EE" } },
++  font: { bold: true, sz: 11, color: { rgb: "1F4E79" } },
++  alignment: { horizontal: "left", vertical: "center" },
++  border: {
++    top: { style: "medium", color: { rgb: "8EAADB" } },
++    bottom: { style: "medium", color: { rgb: "8EAADB" } },
++  },
++} as const;
++
++const ROLE_STYLE = {
++  section: SECTION_STYLE,
++  summary: SUMMARY_STYLE,
++  grandTotal: GRAND_TOTAL_STYLE,
++} as const;
++
++/** Paint one whole row (every column) with a style, creating empty cells where
++ *  the row's data left gaps so the fill spans the full width. */
++function styleRow(ws: XLSX.WorkSheet, r: number, columnCount: number, style: unknown): void {
++  for (let c = 0; c < columnCount; c += 1) {
++    const address = XLSX.utils.encode_cell({ r, c });
++    const cell = ws[address] ?? { t: "s", v: "" };
++    cell.s = style;
++    ws[address] = cell;
++  }
++}
++
++/**
++ * Style a Robo download sheet in place: the header row always, plus each data
++ * row the caller flags with a role. `rowRoles[i]` is the row json_to_sheet put
++ * at sheet row i+1 (row 0 being the header), so it lines up with the very array
++ * the route handed to json_to_sheet. The header row is also given a little extra
++ * height so the bold band reads as a header.
++ */
++export function styleRoboSheet(
++  ws: XLSX.WorkSheet,
++  opts: { columnCount: number; rowRoles?: readonly (RoboRowRole | null)[]; headerHeightPt?: number },
++): void {
++  const n = opts.columnCount;
++  styleRow(ws, 0, n, HEADER_STYLE);
++
++  (opts.rowRoles ?? []).forEach((role, i) => {
++    if (role) styleRow(ws, i + 1, n, ROLE_STYLE[role]);
++  });
++
++  const rows = (ws["!rows"] ?? []) as XLSX.RowInfo[];
++  rows[0] = { hpt: opts.headerHeightPt ?? 26 };
++  ws["!rows"] = rows;
++}
+diff --git a/src/lib/robo/hourlyProduction.ts b/src/lib/robo/hourlyProduction.ts
+new file mode 100644
+index 0000000..95befa8
+--- /dev/null
++++ b/src/lib/robo/hourlyProduction.ts
+@@ -0,0 +1,114 @@
++/**
++ * "Production Rate per Hour" — slabs completed each hour across a batch's own
++ * run, for the Reports line chart.
++ *
++ * Pure and alias-free so `node --test` can reach it.
++ *
++ * ── WHAT IT COUNTS ─────────────────────────────────────────────────────────
++ * A slab is counted in the hour its Out Time falls in — the hour it left the
++ * line. The timeline runs from the hour the batch STARTED (its first slab's In
++ * Time, or Out Time if it has no In Time) to the hour it COMPLETED (its last
++ * Out Time), one bucket per hour, and every hour in between shows even when no
++ * slab finished in it. Nothing before the start or after the end is shown.
++ *
++ * ── CROSSING MIDNIGHT ──────────────────────────────────────────────────────
++ * Times are HH:MM with no date, so a bare "00:30" cannot say which day it is on.
++ * The slab's production date does (that is the whole point of the per-slab date
++ * — a batch past midnight has its later slabs on the next day). So each slab is
++ * placed on an absolute timeline of `productionDate × 24h + time`, and a run
++ * that starts at 22:00 and ends at 03:00 the next morning reads
++ * 22:00–23:00 → 23:00–00:00 → 00:00–01:00 → … in order, its labels wrapping
++ * past midnight. One further guard, independent of the date: a single slab whose
++ * Out Time is before its In Time crossed midnight on its own, so its completion
++ * is the next day.
++ */
++
++export interface HourlySlab {
++  /** yyyy-mm-dd — the slab's effective production date (productionDateOf). */
++  productionDate: string | null;
++  inTime: string | null;  // HH:MM
++  outTime: string | null; // HH:MM
++}
++
++export interface HourBucket {
++  /** "11:00–12:00", "23:00–00:00" — the interval, 24-hour. */
++  label: string;
++  /** Hour of day 0-23, for anyone who needs the number rather than the label. */
++  hour: number;
++  /** Slabs whose Out Time fell in this hour. */
++  slabs: number;
++}
++
++/** Minutes since midnight for an HH:MM string, or null if unusable. */
++function toMins(t: string | null | undefined): number | null {
++  if (!t) return null;
++  const [h, m] = t.split(":").map(Number);
++  if (!Number.isFinite(h) || !Number.isFinite(m)) return null;
++  return h * 60 + m;
++}
++
++/** Whole days since the epoch for a yyyy-mm-dd string, or null. UTC, so no
++ *  timezone shifts the day. */
++function dayNum(d: string | null | undefined): number | null {
++  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec((d ?? "").trim());
++  if (!m) return null;
++  return Math.floor(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])) / 86_400_000);
++}
++
++const pad = (n: number) => String(n).padStart(2, "0");
++
++/** "HH:00–HH:00" for an absolute hour index, wrapping the labels at midnight. */
++function hourLabel(absHour: number): string {
++  const a = ((absHour % 24) + 24) % 24;
++  const b = (a + 1) % 24;
++  return `${pad(a)}:00–${pad(b)}:00`;
++}
++
++/** A run this long is a data error (a stray date), not a real batch — cap the
++ *  timeline so one bad row can't ask for thousands of empty hours. */
++const MAX_HOURS = 48;
++
++export function hourlyProduction(slabs: readonly HourlySlab[]): HourBucket[] {
++  let winStart = Infinity; // absolute minute the batch first started
++  let winEnd = -Infinity;  // absolute minute of its last completion
++  const completions: number[] = []; // absolute minute of each Out Time
++
++  for (const s of slabs) {
++    const day = dayNum(s.productionDate);
++    if (day === null) continue; // no day → cannot place it on the timeline
++    const base = day * 1440;
++    const inM = toMins(s.inTime);
++    const outM = toMins(s.outTime);
++
++    // The batch's start is the earliest slab activity — In Time, else Out Time.
++    const startBase = inM ?? outM;
++    if (startBase !== null) winStart = Math.min(winStart, base + startBase);
++
++    if (outM !== null) {
++      let endAbs = base + outM;
++      if (inM !== null && outM < inM) endAbs += 1440; // slab crossed midnight itself
++      winEnd = Math.max(winEnd, endAbs);
++      completions.push(endAbs);
++    }
++  }
++
++  if (!Number.isFinite(winStart) && !Number.isFinite(winEnd)) return [];
++  if (!Number.isFinite(winStart)) winStart = winEnd; // nothing started, only completions
++  if (!Number.isFinite(winEnd)) winEnd = winStart;   // started but nothing completed yet
++
++  let startHour = Math.floor(winStart / 60);
++  const endHour = Math.floor(winEnd / 60);
++  if (endHour - startHour > MAX_HOURS - 1) startHour = endHour - (MAX_HOURS - 1);
++
++  const counts = new Map<number, number>();
++  for (const c of completions) {
++    const h = Math.floor(c / 60);
++    if (h >= startHour && h <= endHour) counts.set(h, (counts.get(h) ?? 0) + 1);
++  }
++
++  const out: HourBucket[] = [];
++  for (let h = startHour; h <= endHour; h++) {
++    out.push({ label: hourLabel(h), hour: ((h % 24) + 24) % 24, slabs: counts.get(h) ?? 0 });
++  }
++  return out;
++}
+diff --git a/src/lib/robo/productionDate.ts b/src/lib/robo/productionDate.ts
+index 6a38413..efb3072 100644
+--- a/src/lib/robo/productionDate.ts
++++ b/src/lib/robo/productionDate.ts
+@@ -25,6 +25,12 @@
+ export interface DatedSetup { productionDate?: string | null }
+ export interface DatedShift { date?: string | null }
+ export interface DatedRecord {
++  /** The slab's OWN production date, when it has one. Highest precedence: a
++   *  batch that runs past midnight has later slabs carrying their own day while
++   *  the setup keeps the batch's start date. INVARIANT: a real yyyy-mm-dd or
++   *  NULL, never "" (every writer stores `trim() || null`) — so the where
++   *  fallback can gate on `productionDate: null` alone. See the model note. */
++  productionDate?: string | null;
+   batchRecipe?: DatedSetup | null;
+   shift?: DatedShift | null;
+ }
+@@ -51,11 +57,16 @@ const clean = (v: string | null | undefined): string => (v ?? "").trim();
+    nothing. NULL and "" both have to be their own branch.                     */
+ 
+ /**
+- * The production date to SHOW for a slab (or a setup row): what the operator
+- * entered, else the shift's own date, else "".
++ * The production date to SHOW for a slab: its own per-slab date if it has one,
++ * else what the operator entered on the setup, else the shift's own date, else
++ * "". The per-slab date is what lets one batch span midnight — see DatedRecord.
+  */
+ export function productionDateOf(record: DatedRecord | null | undefined): string {
+-  return clean(record?.batchRecipe?.productionDate) || clean(record?.shift?.date);
++  return (
++    clean(record?.productionDate) ||
++    clean(record?.batchRecipe?.productionDate) ||
++    clean(record?.shift?.date)
++  );
+ }
+ 
+ /** The same rule for a setup row, which carries its own shift. */
+@@ -70,19 +81,21 @@ export function setupProductionDate(
+  * productionDateOf() displays — otherwise a search would return rows whose
+  * Production Date column says something else, which is worse than no search.
+  *
+- * Three cases, because the fallback has to be expressed in SQL:
+- *   1. the setup carries the date        → match it
+- *   2. the setup carries none            → match the shift's date
+- *   3. there is no setup at all          → match the shift's date
++ * The slab's own per-slab date comes first, then the setup/shift fallback:
++ *   0. the slab carries its own date       → match it
++ *   1. no slab date, the setup has one      → match it
++ *   2. no slab date, the setup carries none → match the shift's date
++ *   3. no slab date, there is no setup      → match the shift's date
+  *
+- * Case 2 has to say `productionDate` is unset EXPLICITLY. Without it a slab
+- * whose setup is dated the 3rd would also come back when searching the 5th,
+- * because its shift row happens to say the 5th — the very confusion this
+- * replaces. And "unset" has to mean NULL or "", one branch each:
+- * productionDateOf() treats a blank string as no date and falls back to the
+- * shift, so a filter that only matched NULL would print a date on a row nothing
+- * could find. The app's own writes blank-to-null (setupScalarData), but rows
+- * arrive from the upstream standalone app and from direct API calls too.
++ * Branch 0 gates the rest: the four fallback branches all require
++ * `productionDate: null`, so a slab with its own date is matched ONLY by that
++ * date and never leaks into a setup/shift search for a different day. The
++ * per-slab column is null-or-real (never "" — see DatedRecord), so `null` alone
++ * is "no per-slab date"; no `""` branch is needed for it.
++ *
++ * The setup level still needs both NULL and "" spelled out — productionDateOf()
++ * treats a blank setup date as absent and falls back to the shift, and setups
++ * arrive from the upstream app and direct API calls that may have left "".
+  *
+  * Returns undefined for a blank date so callers can spread it unconditionally.
+  */
+@@ -91,10 +104,11 @@ export function productionDateWhere(date: string | null | undefined) {
+   if (!d) return undefined;
+   return {
+     OR: [
+-      { batchRecipe: { productionDate: d } },
+-      { batchRecipe: { productionDate: null }, shift: { date: d } },
+-      { batchRecipe: { productionDate: "" }, shift: { date: d } },
+-      { batchRecipe: null, shift: { date: d } },
++      { productionDate: d },
++      { productionDate: null, batchRecipe: { productionDate: d } },
++      { productionDate: null, batchRecipe: { productionDate: null }, shift: { date: d } },
++      { productionDate: null, batchRecipe: { productionDate: "" }, shift: { date: d } },
++      { productionDate: null, batchRecipe: null, shift: { date: d } },
+     ],
+   };
+ }
+@@ -131,22 +145,162 @@ export interface DatedDelay {
+   shift?: DatedShift | null;
+ }
+ 
+-/** The production date to show for a delay log. */
++/** The production date to show for a delay log: its slab's own per-slab date,
++ *  else that slab's setup date, else the shift's. Same precedence as a slab. */
+ export function delayProductionDateOf(delay: DatedDelay | null | undefined): string {
+-  return clean(delay?.productionRecord?.batchRecipe?.productionDate) || clean(delay?.shift?.date);
++  return (
++    clean(delay?.productionRecord?.productionDate) ||
++    clean(delay?.productionRecord?.batchRecipe?.productionDate) ||
++    clean(delay?.shift?.date)
++  );
+ }
+ 
+-/** The Prisma `where` matching what delayProductionDateOf() displays. */
++/** The Prisma `where` matching what delayProductionDateOf() displays. Same
++ *  per-slab-date-first shape as productionDateWhere, one relation deeper, plus
++ *  the slab-less delay that only the shift can date. */
+ export function delayProductionDateWhere(date: string | null | undefined) {
+   const d = clean(date);
+   if (!d) return undefined;
+   return {
+     OR: [
+-      { productionRecord: { batchRecipe: { productionDate: d } } },
+-      { productionRecord: { batchRecipe: { productionDate: null } }, shift: { date: d } },
+-      { productionRecord: { batchRecipe: { productionDate: "" } }, shift: { date: d } },
+-      { productionRecord: { batchRecipe: null }, shift: { date: d } },
++      { productionRecord: { productionDate: d } },
++      { productionRecord: { productionDate: null, batchRecipe: { productionDate: d } } },
++      { productionRecord: { productionDate: null, batchRecipe: { productionDate: null } }, shift: { date: d } },
++      { productionRecord: { productionDate: null, batchRecipe: { productionDate: "" } }, shift: { date: d } },
++      { productionRecord: { productionDate: null, batchRecipe: null }, shift: { date: d } },
+       { productionRecord: null, shift: { date: d } },
+     ],
+   };
+ }
++
++/* ── ranges ──────────────────────────────────────────────────────────────
++   The "Date Range" filter on Reports and Downloads: every slab whose Production
++   Date falls between From and To, both ends included. Exactly the cases the
++   single-date builders above have — the date is the setup's, else the shift's —
++   with the one exact match swapped for a bounded one on whichever field is the
++   date source.
++
++   Both bounds are optional: a From alone means "from that day onward", a To
++   alone means "up to that day", and neither is no filter at all, so the builder
++   returns undefined and the caller spreads nothing. yyyy-mm-dd compares as text
++   exactly as it compares as a date, so gte/lte draw a real window with no
++   timezone in sight. */
++
++/** The gte/lte pair for a [from, to] window, either bound omittable; undefined
++ *  when neither is set, so a range with both fields blank is simply no filter. */
++function dateRange(from: string | null | undefined, to: string | null | undefined) {
++  const lo = clean(from);
++  const hi = clean(to);
++  if (!lo && !hi) return undefined;
++  const r: { gte?: string; lte?: string } = {};
++  if (lo) r.gte = lo;
++  if (hi) r.lte = hi;
++  return r;
++}
++
++/**
++ * "Slabs produced between From and To", written to match productionDateOf() the
++ * same way productionDateWhere() does — the four cases, ranged.
++ *
++ * The setup-dated branch carries `not: ""` so the no-date marker stays out of
++ * it even when the low bound is open: an empty productionDate means "fall back
++ * to the shift", and it is the shift-fallback branches that own it. With a real
++ * From the guard is redundant (an empty string is already below any date) but
++ * harmless, and with an open low bound it is what stops a `{ lte: to }` from
++ * quietly matching every date-less row.
++ */
++export function productionDateRangeWhere(
++  from: string | null | undefined,
++  to: string | null | undefined,
++) {
++  const range = dateRange(from, to);
++  if (!range) return undefined;
++  return {
++    OR: [
++      // The slab's own date, in range. Null is excluded by SQL comparison, and
++      // the per-slab column never holds "" (see DatedRecord), so this needs no
++      // `not: ""`; the fallback branches below take over when it is null.
++      { productionDate: range },
++      { productionDate: null, batchRecipe: { productionDate: { ...range, not: "" } } },
++      { productionDate: null, batchRecipe: { productionDate: null }, shift: { date: range } },
++      { productionDate: null, batchRecipe: { productionDate: "" }, shift: { date: range } },
++      { productionDate: null, batchRecipe: null, shift: { date: range } },
++    ],
++  };
++}
++
++/** The setups themselves, ranged — same as setupProductionDateWhere minus the
++ *  "no setup" branch, because this IS the setup and its shift is required. */
++export function setupProductionDateRangeWhere(
++  from: string | null | undefined,
++  to: string | null | undefined,
++) {
++  const range = dateRange(from, to);
++  if (!range) return undefined;
++  return {
++    OR: [
++      { productionDate: { ...range, not: "" } },
++      { productionDate: null, shift: { date: range } },
++      { productionDate: "", shift: { date: range } },
++    ],
++  };
++}
++
++/** Delays, ranged — the six cases of delayProductionDateWhere, windowed. */
++export function delayProductionDateRangeWhere(
++  from: string | null | undefined,
++  to: string | null | undefined,
++) {
++  const range = dateRange(from, to);
++  if (!range) return undefined;
++  return {
++    OR: [
++      { productionRecord: { productionDate: range } },
++      { productionRecord: { productionDate: null, batchRecipe: { productionDate: { ...range, not: "" } } } },
++      { productionRecord: { productionDate: null, batchRecipe: { productionDate: null } }, shift: { date: range } },
++      { productionRecord: { productionDate: null, batchRecipe: { productionDate: "" } }, shift: { date: range } },
++      { productionRecord: { productionDate: null, batchRecipe: null }, shift: { date: range } },
++      { productionRecord: null, shift: { date: range } },
++    ],
++  };
++}
++
++/* ── one filter from a screen's selection ──────────────────────────────────
++   Reports and Downloads offer All / Date Wise / Date Range. Range beats a
++   single date: if a From or To is present it wins, so a stale `date` left in
++   state never leaks into a range query. Each combinator returns exactly what
++   its single-date and range builders return — an OR block, or undefined for
++   "no date filter" — so the routes go on spreading it unconditionally. */
++
++export interface DateSelection {
++  /** The single "Date Wise" day. */
++  date?: string | null;
++  /** The "Date Range" bounds, either omittable. */
++  from?: string | null;
++  to?: string | null;
++}
++
++function isRange(sel: DateSelection): boolean {
++  return Boolean(clean(sel.from) || clean(sel.to));
++}
++
++/** The production-record where for a screen's date selection. */
++export function productionDateSelectWhere(sel: DateSelection) {
++  return isRange(sel)
++    ? productionDateRangeWhere(sel.from, sel.to)
++    : productionDateWhere(sel.date);
++}
++
++/** The setup where for a screen's date selection. */
++export function setupProductionDateSelectWhere(sel: DateSelection) {
++  return isRange(sel)
++    ? setupProductionDateRangeWhere(sel.from, sel.to)
++    : setupProductionDateWhere(sel.date);
++}
++
++/** The delay-log where for a screen's date selection. */
++export function delayProductionDateSelectWhere(sel: DateSelection) {
++  return isRange(sel)
++    ? delayProductionDateRangeWhere(sel.from, sel.to)
++    : delayProductionDateWhere(sel.date);
++}
+diff --git a/src/lib/robo/productionGrouping.ts b/src/lib/robo/productionGrouping.ts
+new file mode 100644
+index 0000000..f1563d3
+--- /dev/null
++++ b/src/lib/robo/productionGrouping.ts
+@@ -0,0 +1,98 @@
++/**
++ * How the Complete Production sheet lays its rows out — the two shapes change
++ * (6) asks for, kept here (pure) so `node --test` can pin them.
++ *
++ * The download is read one of two ways, and the layout follows which filter is
++ * active:
++ *
++ *  • A BATCH is chosen → one continuous list. The stored S.No. is shown as-is
++ *    and the batch's days flow one into the next with no blank rows and no
++ *    reset, because it is one batch being read start to finish (S.No. 121 on 18
++ *    Jul, 122 on 19 Jul, straight on).
++ *
++ *  • Only a DATE filter (no batch) → records from several batches can share the
++ *    scope, so they are GROUPED BY BATCH. Inside each group the S.No. restarts
++ *    at 1, and the group is closed by blank rows and a "Total: X records" line
++ *    before the next batch begins.
++ *
++ * The S.No. reset is DISPLAY ONLY. The stored serialNumber and the register's
++ * running sequence are never touched — the reset is just this sheet numbering
++ * the rows it chose to show for one batch.
++ */
++import { canonBatchNo } from "./batchNo.ts";
++import {
++  productionRecordRow,
++  type ProductionRecordRow,
++  type ProductionRowInput,
++} from "./productionExport.ts";
++
++/** What each record contributes, plus a stable tiebreak for ordering. */
++export interface ExportRecord extends ProductionRowInput {
++  /** createdAt as epoch ms — the within-a-day order, so a batch's slabs stay in
++   *  entry order and S.No. runs the way the register does. */
++  createdAtMs: number;
++}
++
++/** Chronological within any set: by the date the sheet PRINTS, then entry
++ *  order. yyyy-mm-dd sorts as text exactly as it sorts as a date. */
++function chrono(a: ExportRecord, b: ExportRecord): number {
++  return a.productionDate.localeCompare(b.productionDate) || a.createdAtMs - b.createdAtMs;
++}
++
++/** A row naming the batch a group belongs to. */
++function batchHeaderRow(batchNo: string, designName: string): ProductionRecordRow {
++  return { "S.No.": "BATCH", "Batch No.": batchNo || "(no batch)", "Design Name": designName || "" };
++}
++
++/** The "Total → X records" line, the same shape the rest of the sheet uses. */
++function totalRow(label: string, count: number): ProductionRecordRow {
++  return { "Slab No.": label, "Remarks": `${count} record${count === 1 ? "" : "s"}` };
++}
++
++/**
++ * Batch mode: one continuous list, stored S.No. preserved, no per-date breaks.
++ */
++export function assembleContinuous(records: readonly ExportRecord[]): ProductionRecordRow[] {
++  const sorted = [...records].sort(chrono);
++  // fallbackSerial (i+1) is used ONLY when a row carries no stored S.No.; a real
++  // serialNumber wins, so the register's own numbers show through unchanged.
++  const rows: ProductionRecordRow[] = sorted.map((r, i) => productionRecordRow(r, i + 1));
++  rows.push({});
++  rows.push(totalRow("TOTAL", sorted.length));
++  return rows;
++}
++
++/**
++ * Date mode: group by batch, restart S.No. at 1 per group (display only), and
++ * close each group with blank rows + a total before the next.
++ */
++export function assembleByBatch(records: readonly ExportRecord[]): ProductionRecordRow[] {
++  const sorted = [...records].sort(chrono);
++
++  // Partition by canonical batch — "D-1372" and "d1372" are one batch — keeping
++  // groups in the order their first (earliest) record appears.
++  const groups = new Map<string, { label: string; design: string; items: ExportRecord[] }>();
++  for (const r of sorted) {
++    const key = canonBatchNo(r.batchNo) || "(no-batch)"; // canonBatchNo yields only [A-Z0-9] or "", so this never collides; no-batch slabs share one group
++    let g = groups.get(key);
++    if (!g) {
++      g = { label: (r.batchNo ?? "").trim(), design: r.designName ?? "", items: [] };
++      groups.set(key, g);
++    }
++    g.items.push(r);
++  }
++
++  const rows: ProductionRecordRow[] = [];
++  const groupList = [...groups.values()];
++  groupList.forEach((g, gi) => {
++    rows.push(batchHeaderRow(g.label, g.design));
++    // S.No. restarts at 1 for the group: drop the stored serial so
++    // productionRecordRow falls back to the group-local position. The stored
++    // value is untouched in the database — this is the sheet's own numbering.
++    g.items.forEach((r, i) => rows.push(productionRecordRow({ ...r, serialNumber: null }, i + 1)));
++    rows.push({}, {}); // 2 blank rows after the batch's records
++    rows.push(totalRow("Total", g.items.length));
++    if (gi < groupList.length - 1) rows.push({}, {}); // spacing before the next batch
++  });
++  return rows;
++}
+diff --git a/src/lib/robo/reportQuery.ts b/src/lib/robo/reportQuery.ts
+new file mode 100644
+index 0000000..386681f
+--- /dev/null
++++ b/src/lib/robo/reportQuery.ts
+@@ -0,0 +1,44 @@
++/**
++ * The query string the Reports and Downloads screens send — built once, here,
++ * so the preview (summary) and the download (exports) can never disagree about
++ * what the current filter is, and so the two screens stay identical.
++ *
++ * Pure and alias-free so `node --test` can reach it.
++ *
++ * Two independent filters, matching the screens:
++ *   Production Date — All | Date Wise (one day) | Date Range (From/To, inclusive)
++ *   Batch Number    — a typed number, matched loosely server-side (see batchNo.ts)
++ *
++ * They compose: a batch is sent whatever the date mode is, so "this batch, on
++ * this date", "this batch, any date" and "this date, any batch" are all just
++ * whichever fields are filled. An empty result is "?", i.e. no filter at all.
++ */
++
++export type ReportMode = "ALL" | "DATE" | "RANGE";
++
++export interface ReportFilter {
++  mode: ReportMode;
++  /** The "Date Wise" day; used only when mode is DATE. */
++  date: string;
++  /** The "Date Range" bounds; used only when mode is RANGE, either omittable. */
++  from: string;
++  to: string;
++  /** The Batch Number box; sent in every mode, independent of the date. */
++  batch: string;
++}
++
++export function reportQuery(f: ReportFilter): string {
++  const qs = new URLSearchParams();
++
++  if (f.mode === "DATE" && f.date.trim()) {
++    qs.set("date", f.date.trim());
++  } else if (f.mode === "RANGE") {
++    if (f.from.trim()) qs.set("from", f.from.trim());
++    if (f.to.trim()) qs.set("to", f.to.trim());
++  }
++
++  if (f.batch.trim()) qs.set("batch", f.batch.trim());
++
++  const s = qs.toString();
++  return s ? `?${s}` : "";
++}
+diff --git a/src/lib/robo/slabSearch.ts b/src/lib/robo/slabSearch.ts
+index aee3fb5..1aa9dc4 100644
+--- a/src/lib/robo/slabSearch.ts
++++ b/src/lib/robo/slabSearch.ts
+@@ -3,12 +3,17 @@
+  * Records.
+  *
+  * Pure and alias-free so `node --test` can reach it, the same split
+- * setupMasters.ts uses. It exists as a module rather than a few lines in the
+- * route for one reason: two of the filters live on the SAME relation. Written
+- * inline, the second `where.batchRecipe = {...}` silently replaces the first,
+- * so searching a batch number AND a design would quietly ignore one of them and
+- * return rows that match only the other. Building the relation filter once, and
+- * pinning it in tests/roboSlabSearch.test.ts, is what stops that coming back.
++ * setupMasters.ts uses.
++ *
++ * Batch Number is matched by the ROUTE, not here. "D-1372", "d1372" and a bare
++ * "1372" are the same batch and "A-1248" is not "D-1248" — a rule no Prisma
++ * `contains` can express (see batchNo.ts). So the route folds the typed number
++ * to the set of setup ids it names (batchFilter.ts) and hands them in as
++ * `batchRecipeIds`; this narrows on the scalar `batchRecipeId` FK. That also
++ * retires the old hazard this module was written around — batch and design both
++ * writing `where.batchRecipe`, the second silently clobbering the first — since
++ * only Design Name lives on that relation now. It stays a module, and stays
++ * pinned in tests/roboSlabSearch.test.ts, so the composition can't quietly rot.
+  */
+ 
+ // The .ts is deliberate: this module is reached by `node --test`, whose ESM
+@@ -28,8 +33,15 @@ export interface SlabSearchInput {
+   date?: string | null;
+   slabNumber?: string | null;
+   designName?: string | null;
+-  /** The batch number written on the setup this slab was logged against. */
+-  batchNo?: string | null;
++  /**
++   * The setups whose batch number matches what the operator typed, already
++   * resolved to ids by the route (matchingBatchRecipeIds over batchNo.ts).
++   *
++   * `null` means no batch filter. An empty array means a batch WAS searched and
++   * nothing matched — a real filter that returns no rows, which is different
++   * from no filter and must narrow to zero, not be ignored.
++   */
++  batchRecipeIds?: string[] | null;
+ }
+ 
+ /** What the route hands Prisma, and whether the caller filtered at all. */
+@@ -37,14 +49,16 @@ export interface SlabSearchWhere {
+   where: {
+     shiftId?: string;
+     slabNumber?: { contains: string };
+-    batchRecipe?: { designName?: { contains: string }; batchNo?: { contains: string } };
++    /** The setup this slab was logged against, matched by resolved id. */
++    batchRecipeId?: { in: string[] };
++    /** Design Name is the only filter left on the related setup. */
++    batchRecipe?: { designName: { contains: string } };
+     /**
+      * The production-date match, which spans two relations — see
+-     * productionDateWhere. It sits alongside `batchRecipe` rather than inside
+-     * it: Prisma ANDs the top-level keys, so a date and a design narrow each
+-     * other instead of one replacing the other.
++     * productionDateWhere. It sits alongside the other keys rather than inside
++     * `batchRecipe`: Prisma ANDs the top-level keys, so a date and a design
++     * narrow each other instead of one replacing the other.
+      */
+-    /** The production-date branches, as productionDateWhere builds them. */
+     OR?: NonNullable<ReturnType<typeof productionDateWhere>>["OR"];
+   };
+   hasFilters: boolean;
+@@ -57,25 +71,25 @@ export function slabSearchWhere(input: SlabSearchInput): SlabSearchWhere {
+   const date = clean(input.date);
+   const slabNumber = clean(input.slabNumber);
+   const designName = clean(input.designName);
+-  const batchNo = clean(input.batchNo);
++  const batchRecipeIds = input.batchRecipeIds ?? null;
+ 
+   const where: SlabSearchWhere["where"] = {};
+   if (shiftId) where.shiftId = shiftId;
+-  // Assigned field by field, NOT Object.assign: that helper's signature is
+-  // `(target: T, source: U) => T & U`, so it never checks the source against
+-  // the target and a productionDateWhere that changed shape would slip through
+-  // unnoticed — in the one module written to stop two things drifting apart.
+   const dateWhere = productionDateWhere(date);
+   if (dateWhere) where.OR = dateWhere.OR;
+   if (slabNumber) where.slabNumber = { contains: slabNumber };
+ 
+-  // Both of these narrow the SAME related setup, so they are collected into one
+-  // object and applied together — that is the AND the operator expects when
+-  // they type a batch number and a design.
+-  const recipe: NonNullable<SlabSearchWhere["where"]["batchRecipe"]> = {};
+-  if (designName) recipe.designName = { contains: designName };
+-  if (batchNo) recipe.batchNo = { contains: batchNo };
+-  if (Object.keys(recipe).length > 0) where.batchRecipe = recipe;
++  // A null is "no batch filter"; an array — even an empty one — is a filter.
++  // `{ in: [] }` matches nothing, which is exactly right for a batch number the
++  // operator typed that names no setup: an empty table, not the whole register.
++  if (batchRecipeIds !== null) where.batchRecipeId = { in: batchRecipeIds };
+ 
+-  return { where, hasFilters: Boolean(shiftId || date || slabNumber || designName || batchNo) };
++  // Design Name is the lone remaining filter on the related setup, so it is set
++  // directly — no second writer to clobber it now that batch matches by id.
++  if (designName) where.batchRecipe = { designName: { contains: designName } };
++
++  return {
++    where,
++    hasFilters: Boolean(shiftId || date || slabNumber || designName || batchRecipeIds !== null),
++  };
+ }
+diff --git a/tests/roboBatchNo.test.ts b/tests/roboBatchNo.test.ts
+new file mode 100644
+index 0000000..18cfc95
+--- /dev/null
++++ b/tests/roboBatchNo.test.ts
+@@ -0,0 +1,108 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++
++import { canonBatchNo, batchNosMatch, matchingBatchRecipeIds } from "../src/lib/robo/batchNo.ts";
++
++/* The register writes one batch a dozen ways — "D1372", "d1372", "D-1372",
++   "d-1372", and often the bare "1372" — and a search for any of them has to
++   return all of them. But a prefix that means something must survive: "A-1248"
++   and "D-1248" are two different batches and may never be merged. batchNo.ts
++   folds away exactly case and non-alphanumeric formatting, keeps the prefix,
++   and treats a bare number as the series-less form of a prefixed one. */
++
++test("canon folds case and strips hyphens, spaces and dots — nothing else", () => {
++  assert.equal(canonBatchNo("D-1372"), "D1372");
++  assert.equal(canonBatchNo("d1372"), "D1372");
++  assert.equal(canonBatchNo("d-1372"), "D1372");
++  assert.equal(canonBatchNo("  D 1372 "), "D1372");
++  assert.equal(canonBatchNo("d.1372"), "D1372");
++  assert.equal(canonBatchNo("1372"), "1372");
++  assert.equal(canonBatchNo(null), "");
++  assert.equal(canonBatchNo(undefined), "");
++  assert.equal(canonBatchNo("   "), "");
++});
++
++test("case and hyphen differences are the same batch", () => {
++  assert.ok(batchNosMatch("D-1372", "d1372"));
++  assert.ok(batchNosMatch("d-1372", "D1372"));
++  assert.ok(batchNosMatch("D1372", "D1372"));
++});
++
++test("a bare number is the same batch as the same number with a prefix", () => {
++  assert.ok(batchNosMatch("1372", "D1372"));
++  assert.ok(batchNosMatch("D1372", "1372"));
++  assert.ok(batchNosMatch("1372", "d-1372"));
++});
++
++test("two DIFFERENT meaningful prefixes are never the same batch", () => {
++  assert.ok(!batchNosMatch("A-1248", "D-1248"));
++  assert.ok(!batchNosMatch("A1248", "D1248"));
++  // The whole point: a bare number matches either series, but that never makes
++  // the two series match each other.
++  assert.ok(batchNosMatch("1248", "A-1248"));
++  assert.ok(batchNosMatch("1248", "D-1248"));
++  assert.ok(!batchNosMatch("A-1248", "D-1248"));
++});
++
++test("different numbers never match, prefix or not", () => {
++  assert.ok(!batchNosMatch("D1372", "D1373"));
++  assert.ok(!batchNosMatch("1372", "1373"));
++  assert.ok(!batchNosMatch("D-1372", "1373"));
++});
++
++test("a search for a bare number returns a stem match even against a longer prefix", () => {
++  // "B" and "BX" are different prefixes, so BX-1372 is not D-1372's batch...
++  assert.ok(!batchNosMatch("B-1372", "BX-1372"));
++  // ...but a bare 1372 still reaches BX-1372, because it carries no series to
++  // disagree with.
++  assert.ok(batchNosMatch("1372", "BX-1372"));
++});
++
++test("a blank on either side matches nothing — an empty box is not a filter", () => {
++  assert.ok(!batchNosMatch("", "D1372"));
++  assert.ok(!batchNosMatch("D1372", ""));
++  assert.ok(!batchNosMatch(null, "D1372"));
++  assert.ok(!batchNosMatch("   ", "D1372"));
++});
++
++/* matchingBatchRecipeIds is the bridge to a Prisma `batchRecipeId: { in: [...] }`
++   filter: which setups on file does the typed number name? */
++
++const RECIPES = [
++  { id: "r_d1372", batchNo: "D1372" },
++  { id: "r_d1372_dash", batchNo: "d-1372" },
++  { id: "r_bare1372", batchNo: "1372" },
++  { id: "r_a1248", batchNo: "A-1248" },
++  { id: "r_d1248", batchNo: "D-1248" },
++  { id: "r_nobatch", batchNo: null },
++];
++
++test("resolving a prefixed number gathers every spelling of that batch, plus the bare form", () => {
++  assert.deepEqual(
++    matchingBatchRecipeIds("D-1372", RECIPES).sort(),
++    ["r_bare1372", "r_d1372", "r_d1372_dash"].sort(),
++  );
++});
++
++test("resolving a bare number reaches the prefixed spellings too", () => {
++  assert.deepEqual(
++    matchingBatchRecipeIds("1372", RECIPES).sort(),
++    ["r_bare1372", "r_d1372", "r_d1372_dash"].sort(),
++  );
++});
++
++test("resolving one series never pulls in another", () => {
++  assert.deepEqual(matchingBatchRecipeIds("A-1248", RECIPES), ["r_a1248"]);
++  assert.deepEqual(matchingBatchRecipeIds("d1248", RECIPES), ["r_d1248"]);
++  // A bare 1248 names both series — the ambiguity the operator typed.
++  assert.deepEqual(matchingBatchRecipeIds("1248", RECIPES).sort(), ["r_a1248", "r_d1248"].sort());
++});
++
++test("a blank query resolves to no filter, a hit-less query to an empty filter", () => {
++  assert.deepEqual(matchingBatchRecipeIds("", RECIPES), []);
++  assert.deepEqual(matchingBatchRecipeIds("   ", RECIPES), []);
++  assert.deepEqual(matchingBatchRecipeIds(null, RECIPES), []);
++  // A real batch number that names nothing on file — an empty set, which the
++  // caller turns into `{ in: [] }`, i.e. zero rows, not "no filter".
++  assert.deepEqual(matchingBatchRecipeIds("Z-9999", RECIPES), []);
++});
+diff --git a/tests/roboDelayAxis.test.ts b/tests/roboDelayAxis.test.ts
+new file mode 100644
+index 0000000..40fbce2
+--- /dev/null
++++ b/tests/roboDelayAxis.test.ts
+@@ -0,0 +1,41 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++
++import { niceDelayScale } from "../src/lib/robo/delayAxis.ts";
++
++/* The Delay Analysis bar chart's x-axis: a round max with even ticks and a
++   little headroom so the longest bar's end label clears its bar. */
++
++test("the reference case: 2003 → 0..2500 in five clean steps", () => {
++  const { axisMax, ticks } = niceDelayScale(2003);
++  assert.equal(axisMax, 2500);
++  assert.deepEqual(ticks, [0, 500, 1000, 1500, 2000, 2500]);
++});
++
++test("a max that lands exactly on a tick is lifted one step for headroom", () => {
++  // 2000 would put the longest bar flush at 100% with nowhere for its label.
++  const { axisMax } = niceDelayScale(2000);
++  assert.ok(axisMax > 2000);
++  assert.equal(axisMax, 2500);
++});
++
++test("ticks start at 0, rise by a constant step, and end at axisMax", () => {
++  const { axisMax, ticks } = niceDelayScale(437);
++  assert.equal(ticks[0], 0);
++  assert.equal(ticks[ticks.length - 1], axisMax);
++  const step = ticks[1] - ticks[0];
++  for (let i = 1; i < ticks.length; i++) assert.equal(ticks[i] - ticks[i - 1], step);
++});
++
++test("small values still get a sane axis", () => {
++  const { axisMax, ticks } = niceDelayScale(10);
++  assert.ok(axisMax >= 10);
++  assert.equal(ticks[0], 0);
++  assert.ok(ticks.length >= 2);
++});
++
++test("no delays at all is a 0..1 axis, never NaN or a divide-by-zero", () => {
++  assert.deepEqual(niceDelayScale(0), { axisMax: 1, ticks: [0, 1] });
++  assert.deepEqual(niceDelayScale(-5), { axisMax: 1, ticks: [0, 1] });
++  assert.deepEqual(niceDelayScale(NaN), { axisMax: 1, ticks: [0, 1] });
++});
+diff --git a/tests/roboExportRowRoles.test.ts b/tests/roboExportRowRoles.test.ts
+new file mode 100644
+index 0000000..00d25eb
+--- /dev/null
++++ b/tests/roboExportRowRoles.test.ts
+@@ -0,0 +1,30 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++
++import { productionRowRole, delayRowRole, byDateRowRole } from "../src/lib/robo/exportRowRoles.ts";
++
++/* The styling pass highlights header, section and total rows. These pin which
++   rows are which, by the exact labels the export builders write — so a data row
++   is never mistaken for a total, and vice versa. */
++
++test("production: batch header vs group total vs grand total vs plain data", () => {
++  assert.equal(productionRowRole({ "S.No.": "BATCH", "Batch No.": "D-1372" }), "section");
++  assert.equal(productionRowRole({ "Slab No.": "Total", "Remarks": "3 records" }), "summary");
++  assert.equal(productionRowRole({ "Slab No.": "TOTAL", "Remarks": "9 records" }), "grandTotal");
++  assert.equal(productionRowRole({ "Slab No.": "GRAND TOTAL", "Remarks": "20 records" }), "grandTotal");
++  assert.equal(productionRowRole({ "S.No.": 12, "Slab No.": "140748" }), null); // a real slab
++  assert.equal(productionRowRole({}), null); // a blank spacer
++});
++
++test("delay list: the two total lines are summaries, real delays are not", () => {
++  assert.equal(delayRowRole({ "Description": "TOTAL DELAY DURATION", "Duration": 120 }), "summary");
++  assert.equal(delayRowRole({ "Description": "Delay Events", "Duration": 4 }), "summary");
++  assert.equal(delayRowRole({ "Description": "Distributor jam", "Duration": 30 }), null);
++  assert.equal(delayRowRole({}), null);
++});
++
++test("date-wise totals: only the closing TOTAL line", () => {
++  assert.equal(byDateRowRole({ "Production Date": "TOTAL", "Delay Events": 10 }), "grandTotal");
++  assert.equal(byDateRowRole({ "Production Date": "2026-09-01", "Delay Events": 3 }), null);
++  assert.equal(byDateRowRole({}), null);
++});
+diff --git a/tests/roboExportScope.test.ts b/tests/roboExportScope.test.ts
+new file mode 100644
+index 0000000..2e907e8
+--- /dev/null
++++ b/tests/roboExportScope.test.ts
+@@ -0,0 +1,43 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++
++import { exportScopeTag } from "../src/lib/robo/exportScope.ts";
++
++/* The scope tag in a downloaded workbook's name, shared by both export routes
++   so `Complete_Production_*` and `Delay_List_*` name the same filter the same
++   way. */
++
++const base = { date: "", from: "", to: "", hasBatch: false };
++
++test("no filter is All", () => {
++  assert.equal(exportScopeTag(base), "All");
++});
++
++test("a single day is the day", () => {
++  assert.equal(exportScopeTag({ ...base, date: "2026-08-13" }), "2026-08-13");
++});
++
++test("a range reads from_to, with open ends spelled out", () => {
++  assert.equal(exportScopeTag({ ...base, from: "2026-08-01", to: "2026-08-31" }), "2026-08-01_to_2026-08-31");
++  assert.equal(exportScopeTag({ ...base, from: "2026-08-01" }), "2026-08-01_to_end");
++  assert.equal(exportScopeTag({ ...base, to: "2026-08-31" }), "start_to_2026-08-31");
++});
++
++test("a batch appends _batch rather than the raw number, in any date scope", () => {
++  assert.equal(exportScopeTag({ ...base, hasBatch: true }), "All_batch");
++  assert.equal(exportScopeTag({ ...base, date: "2026-08-13", hasBatch: true }), "2026-08-13_batch");
++  assert.equal(
++    exportScopeTag({ ...base, from: "2026-08-01", to: "2026-08-31", hasBatch: true }),
++    "2026-08-01_to_2026-08-31_batch",
++  );
++});
++
++test("a single day beats a range if both are somehow present", () => {
++  // date is the more specific pick, so it wins the tag.
++  assert.equal(exportScopeTag({ ...base, date: "2026-08-13", from: "2026-08-01", to: "2026-08-31" }), "2026-08-13");
++});
++
++test("fields are trimmed", () => {
++  assert.equal(exportScopeTag({ ...base, date: " 2026-08-13 " }), "2026-08-13");
++  assert.equal(exportScopeTag({ ...base, from: " 2026-08-01 ", to: " 2026-08-31 " }), "2026-08-01_to_2026-08-31");
++});
+diff --git a/tests/roboHourlyProduction.test.ts b/tests/roboHourlyProduction.test.ts
+new file mode 100644
+index 0000000..91ac1e8
+--- /dev/null
++++ b/tests/roboHourlyProduction.test.ts
+@@ -0,0 +1,101 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++
++import { hourlyProduction } from "../src/lib/robo/hourlyProduction.ts";
++
++/* Slabs completed per hour across ONE batch's own run: from the hour it started
++   (first In Time) to the hour it completed (last Out Time), a bucket per hour,
++   counting each slab in the hour of its Out Time, zero hours included. */
++
++const sum = (s: { slabs: number }[]) => s.reduce((a, b) => a + b.slabs, 0);
++
++test("the reference case: starts 11:20, completes 23:55 → 11:00–12:00 … 23:00–00:00", () => {
++  const s = hourlyProduction([
++    { productionDate: "2026-09-01", inTime: "11:20", outTime: "12:10" }, // out in 12:00–13:00
++    { productionDate: "2026-09-01", inTime: "12:30", outTime: "23:55" }, // out in 23:00–00:00
++  ]);
++  assert.equal(s.length, 13); // hours 11..23
++  assert.equal(s[0].hour, 11);
++  assert.match(s[0].label, /^11:00.12:00$/); // dash-agnostic
++  assert.equal(s[s.length - 1].hour, 23);
++  assert.match(s[s.length - 1].label, /^23:00.00:00$/);
++  // Counted by Out Time hour; the start hour (11) has no completion → 0.
++  assert.equal(s.find((b) => b.hour === 11)!.slabs, 0);
++  assert.equal(s.find((b) => b.hour === 12)!.slabs, 1);
++  assert.equal(s.find((b) => b.hour === 23)!.slabs, 1);
++  assert.equal(sum(s), 2);
++});
++
++test("the batch's start hour opens the timeline even with no completion in it", () => {
++  const s = hourlyProduction([
++    { productionDate: "2026-09-01", inTime: "08:23", outTime: "10:05" },
++  ]);
++  assert.equal(s[0].hour, 8);
++  assert.match(s[0].label, /^08:00.09:00$/);
++  // 08 and 09 are empty, the completion lands in 10.
++  assert.deepEqual(s.map((b) => b.slabs), [0, 0, 1]);
++});
++
++test("every hour between start and end shows, even the empty ones", () => {
++  const s = hourlyProduction([
++    { productionDate: "2026-09-01", inTime: "09:00", outTime: "09:30" },
++    { productionDate: "2026-09-01", inTime: "09:40", outTime: "13:15" },
++  ]);
++  assert.deepEqual(s.map((b) => b.hour), [9, 10, 11, 12, 13]);
++  assert.deepEqual(s.map((b) => b.slabs), [1, 0, 0, 0, 1]);
++});
++
++test("a batch past midnight follows its real chronology, labels wrapping", () => {
++  // Later slabs carry the next day's production date (change 5) — that is how a
++  // bare 00:10 is known to be AFTER 23:50 rather than before it.
++  const s = hourlyProduction([
++    { productionDate: "2026-09-01", inTime: "22:05", outTime: "22:40" },
++    { productionDate: "2026-09-01", inTime: "23:00", outTime: "23:50" },
++    { productionDate: "2026-09-02", inTime: "00:10", outTime: "00:45" },
++    { productionDate: "2026-09-02", inTime: "01:00", outTime: "01:30" },
++  ]);
++  assert.deepEqual(s.map((b) => b.hour), [22, 23, 0, 1]);
++  assert.deepEqual(s.map((b) => b.slabs), [1, 1, 1, 1]);
++  assert.match(s[1].label, /^23:00.00:00$/);
++  assert.match(s[2].label, /^00:00.01:00$/);
++});
++
++test("a single slab whose Out Time is before its In Time crossed midnight itself", () => {
++  const s = hourlyProduction([
++    { productionDate: "2026-09-01", inTime: "23:50", outTime: "00:10" },
++  ]);
++  assert.deepEqual(s.map((b) => b.hour), [23, 0]); // 23:50 start → 00:10 completion next day
++  assert.deepEqual(s.map((b) => b.slabs), [0, 1]); // completion counts in 00:00–01:00
++});
++
++test("in-processing slabs (no Out Time) add no completion but can open the run", () => {
++  const s = hourlyProduction([
++    { productionDate: "2026-09-01", inTime: "10:00", outTime: "10:30" },
++    { productionDate: "2026-09-01", inTime: "10:40", outTime: null },
++  ]);
++  assert.equal(s.length, 1);
++  assert.equal(s[0].hour, 10);
++  assert.equal(s[0].slabs, 1); // only the completed one counts
++});
++
++test("a batch that has started but completed nothing is one empty hour, not a crash", () => {
++  const s = hourlyProduction([{ productionDate: "2026-09-01", inTime: "14:15", outTime: null }]);
++  assert.equal(s.length, 1);
++  assert.equal(s[0].hour, 14);
++  assert.equal(s[0].slabs, 0);
++});
++
++test("nothing usable is an empty series, never NaN hours", () => {
++  assert.deepEqual(hourlyProduction([]), []);
++  assert.deepEqual(hourlyProduction([{ productionDate: null, inTime: "10:00", outTime: "10:30" }]), []);
++  assert.deepEqual(hourlyProduction([{ productionDate: "not-a-date", inTime: "10:00", outTime: "10:30" }]), []);
++});
++
++test("a stray far-off date can't ask for thousands of empty hours", () => {
++  // One bad row years away must not blow the timeline up; it is capped.
++  const s = hourlyProduction([
++    { productionDate: "2020-01-01", inTime: "10:00", outTime: "10:30" },
++    { productionDate: "2026-09-01", inTime: "11:00", outTime: "11:30" },
++  ]);
++  assert.ok(s.length <= 48, `expected ≤ 48 buckets, got ${s.length}`);
++});
+diff --git a/tests/roboProductionDate.test.ts b/tests/roboProductionDate.test.ts
+index b1b9ee0..ac9f11d 100644
+--- a/tests/roboProductionDate.test.ts
++++ b/tests/roboProductionDate.test.ts
+@@ -4,9 +4,15 @@ import assert from "node:assert/strict";
+ import {
+   delayProductionDateOf,
+   delayProductionDateWhere,
++  delayProductionDateRangeWhere,
++  delayProductionDateSelectWhere,
+   productionDateOf,
+   productionDateWhere,
++  productionDateRangeWhere,
++  productionDateSelectWhere,
+   setupProductionDate,
++  setupProductionDateRangeWhere,
++  setupProductionDateSelectWhere,
+ } from "../src/lib/robo/productionDate.ts";
+ 
+ /* Production Date used to be read off RoboShift.date on every screen — and a
+@@ -21,6 +27,24 @@ test("the date the operator typed on the setup is the production date", () => {
+   );
+ });
+ 
++test("a slab's OWN date wins over the setup — a batch past midnight", () => {
++  // Slab 81 at 00:03: the setup still says the 1st, the slab says the 2nd, and
++  // the slab's own day is what shows. Slabs 1-80 (no own date) keep the setup's.
++  assert.equal(
++    productionDateOf({ productionDate: "2026-09-02", batchRecipe: { productionDate: "2026-09-01" }, shift: { date: "2026-09-01" } }),
++    "2026-09-02",
++  );
++  assert.equal(
++    productionDateOf({ productionDate: null, batchRecipe: { productionDate: "2026-09-01" }, shift: { date: "2026-09-01" } }),
++    "2026-09-01",
++  );
++  // A blank per-slab date is no date — falls straight through to the setup.
++  assert.equal(
++    productionDateOf({ productionDate: "  ", batchRecipe: { productionDate: "2026-09-01" } }),
++    "2026-09-01",
++  );
++});
++
+ test("a setup saved before that field existed falls back to its shift", () => {
+   assert.equal(productionDateOf({ batchRecipe: { productionDate: null }, shift: { date: "2026-08-17" } }), "2026-08-17");
+   assert.equal(productionDateOf({ batchRecipe: { productionDate: "  " }, shift: { date: "2026-08-17" } }), "2026-08-17");
+@@ -48,26 +72,32 @@ test("the search matches exactly what the column shows", () => {
+   const where = productionDateWhere("2026-08-13");
+   assert.deepEqual(where, {
+     OR: [
+-      { batchRecipe: { productionDate: "2026-08-13" } },
+-      { batchRecipe: { productionDate: null }, shift: { date: "2026-08-13" } },
+-      { batchRecipe: { productionDate: "" }, shift: { date: "2026-08-13" } },
+-      { batchRecipe: null, shift: { date: "2026-08-13" } },
++      // The slab's own date first — a batch past midnight.
++      { productionDate: "2026-08-13" },
++      // Then the setup/shift fallback, each branch pinned to "no slab date".
++      { productionDate: null, batchRecipe: { productionDate: "2026-08-13" } },
++      { productionDate: null, batchRecipe: { productionDate: null }, shift: { date: "2026-08-13" } },
++      { productionDate: null, batchRecipe: { productionDate: "" }, shift: { date: "2026-08-13" } },
++      { productionDate: null, batchRecipe: null, shift: { date: "2026-08-13" } },
+     ],
+   });
+ });
+ 
+-test("the fallback branch pins productionDate to null, or the search over-matches", () => {
+-  /* Without `productionDate: null` on the second branch, a slab whose setup is
+-     dated the 13th would ALSO come back when searching the 17th — because its
+-     shift row happens to say the 17th. That is the exact confusion this
+-     replaces, reappearing inside the search. */
++test("the fallback branches pin the slab date to null, or the search over-matches", () => {
++  /* Two ways this over-matches without the null pins. A slab with its OWN date
++     of the 2nd must not also come back for the 1st just because its setup says
++     the 1st — the four fallback branches require `productionDate: null`, so it
++     can't. And a slab whose setup is dated the 13th must not come back for the
++     17th because its shift says the 17th — the setup pins handle that, exactly
++     as before the per-slab date existed. */
+   const where = productionDateWhere("2026-08-17");
+-  // "Unset" is NULL *or* "", one branch each: productionDateOf() falls back to
+-  // the shift for a blank string too, so a filter that only matched NULL would
+-  // print a date on a row nothing could find. Prisma's `in` takes string[] and
+-  // cannot carry a null, so this cannot be collapsed into one branch.
+-  assert.deepEqual(where!.OR[1], { batchRecipe: { productionDate: null }, shift: { date: "2026-08-17" } });
+-  assert.deepEqual(where!.OR[2], { batchRecipe: { productionDate: "" }, shift: { date: "2026-08-17" } });
++  assert.deepEqual(where!.OR[0], { productionDate: "2026-08-17" });
++  assert.deepEqual(where!.OR[1], { productionDate: null, batchRecipe: { productionDate: "2026-08-17" } });
++  // "No setup date" is NULL *or* "", one branch each — productionDateOf() falls
++  // back to the shift for a blank setup date too. The per-slab column, by
++  // contrast, is null-or-real (never ""), so it needs only the one `null` pin.
++  assert.deepEqual(where!.OR[2], { productionDate: null, batchRecipe: { productionDate: null }, shift: { date: "2026-08-17" } });
++  assert.deepEqual(where!.OR[3], { productionDate: null, batchRecipe: { productionDate: "" }, shift: { date: "2026-08-17" } });
+ });
+ 
+ test("a blank date is no filter at all, so it can be spread unconditionally", () => {
+@@ -78,7 +108,7 @@ test("a blank date is no filter at all, so it can be spread unconditionally", ()
+ });
+ 
+ test("the date is trimmed before it is used", () => {
+-  assert.deepEqual(productionDateWhere(" 2026-08-13 ")!.OR[0], { batchRecipe: { productionDate: "2026-08-13" } });
++  assert.deepEqual(productionDateWhere(" 2026-08-13 ")!.OR[0], { productionDate: "2026-08-13" });
+ });
+ 
+ /* ── delays ────────────────────────────────────────────────────────────────
+@@ -114,14 +144,116 @@ test("a delay on a slab whose setup carries no date falls back to the shift", ()
+   );
+ });
+ 
++test("a delay takes its slab's OWN per-slab date when it has one", () => {
++  assert.equal(
++    delayProductionDateOf({
++      productionRecord: { productionDate: "2026-09-02", batchRecipe: { productionDate: "2026-09-01" } },
++      shift: { date: "2026-09-01" },
++    }),
++    "2026-09-02",
++  );
++});
++
+ test("the delay search covers the slab-less case the slab search does not need", () => {
+   const where = delayProductionDateWhere("2026-08-13");
+-  assert.equal(where!.OR.length, 5);
+-  assert.deepEqual(where!.OR[0], { productionRecord: { batchRecipe: { productionDate: "2026-08-13" } } });
+-  assert.deepEqual(where!.OR[4], { productionRecord: null, shift: { date: "2026-08-13" } });
++  assert.equal(where!.OR.length, 6);
++  assert.deepEqual(where!.OR[0], { productionRecord: { productionDate: "2026-08-13" } });
++  assert.deepEqual(where!.OR[1], { productionRecord: { productionDate: null, batchRecipe: { productionDate: "2026-08-13" } } });
++  assert.deepEqual(where!.OR[5], { productionRecord: null, shift: { date: "2026-08-13" } });
+ });
+ 
+ test("a blank delay date is no filter either", () => {
+   assert.equal(delayProductionDateWhere(""), undefined);
+   assert.equal(delayProductionDateWhere(null), undefined);
+ });
++
++/* ── ranges ──────────────────────────────────────────────────────────────
++   The "Date Range" filter: every slab whose Production Date falls between From
++   and To, both included. Same four cases as the single-date search, windowed,
++   with `not: ""` keeping the no-date marker out of the setup-dated branch so an
++   open low bound never sweeps in date-less rows. */
++
++test("a bounded window matches the cases, ranged, slab date first", () => {
++  assert.deepEqual(productionDateRangeWhere("2026-08-01", "2026-08-31"), {
++    OR: [
++      // The slab's own date, in window. Null is excluded by SQL comparison and
++      // the column never holds "", so no `not: ""` is needed on this branch.
++      { productionDate: { gte: "2026-08-01", lte: "2026-08-31" } },
++      { productionDate: null, batchRecipe: { productionDate: { gte: "2026-08-01", lte: "2026-08-31", not: "" } } },
++      { productionDate: null, batchRecipe: { productionDate: null }, shift: { date: { gte: "2026-08-01", lte: "2026-08-31" } } },
++      { productionDate: null, batchRecipe: { productionDate: "" }, shift: { date: { gte: "2026-08-01", lte: "2026-08-31" } } },
++      { productionDate: null, batchRecipe: null, shift: { date: { gte: "2026-08-01", lte: "2026-08-31" } } },
++    ],
++  });
++});
++
++test("an open bound is a one-sided window, and the no-date guard stays on the setup branch", () => {
++  // From only — the slab-date branch is a plain gte (null excluded by SQL), and
++  // the SETUP branch keeps `not: ""` because a blank setup date means "fall back
++  // to the shift", not "matches every open-low window".
++  const fromOnly = productionDateRangeWhere("2026-08-01", "")!;
++  assert.deepEqual(fromOnly.OR[0], { productionDate: { gte: "2026-08-01" } });
++  assert.deepEqual(fromOnly.OR[1], { productionDate: null, batchRecipe: { productionDate: { gte: "2026-08-01", not: "" } } });
++  // To only — "" <= any date is true, so without `not: ""` every date-less
++  // setup row would wrongly match; the guard keeps them on the shift branches.
++  const toOnly = productionDateRangeWhere("", "2026-08-31")!;
++  assert.deepEqual(toOnly.OR[0], { productionDate: { lte: "2026-08-31" } });
++  assert.deepEqual(toOnly.OR[1], { productionDate: null, batchRecipe: { productionDate: { lte: "2026-08-31", not: "" } } });
++});
++
++test("a range with both bounds blank is no filter", () => {
++  assert.equal(productionDateRangeWhere("", ""), undefined);
++  assert.equal(productionDateRangeWhere(null, undefined), undefined);
++  assert.equal(productionDateRangeWhere("  ", "  "), undefined);
++});
++
++test("the setup range drops the slab-less branch, the delay range keeps the extra one", () => {
++  // A setup always has its required shift, so three branches, not four. The
++  // setup has no per-slab date of its own, so its shape is unchanged.
++  assert.equal(setupProductionDateRangeWhere("2026-08-01", "2026-08-31")!.OR.length, 3);
++  assert.deepEqual(setupProductionDateRangeWhere("2026-08-01", "2026-08-31")!.OR[0], {
++    productionDate: { gte: "2026-08-01", lte: "2026-08-31", not: "" },
++  });
++  // A delay: slab date first, then the setup/shift fallback, then the slab-less
++  // case — six branches, windowed.
++  const delayRange = delayProductionDateRangeWhere("2026-08-01", "2026-08-31")!;
++  assert.equal(delayRange.OR.length, 6);
++  assert.deepEqual(delayRange.OR[0], {
++    productionRecord: { productionDate: { gte: "2026-08-01", lte: "2026-08-31" } },
++  });
++  assert.deepEqual(delayRange.OR[5], {
++    productionRecord: null, shift: { date: { gte: "2026-08-01", lte: "2026-08-31" } },
++  });
++});
++
++/* ── one filter from a screen's selection ──────────────────────────────────
++   All / Date Wise / Date Range collapses to a single where. A range beats a
++   single date, so a From or To present wins and a stale `date` cannot leak in. */
++
++test("a selection with neither date nor range is no filter", () => {
++  assert.equal(productionDateSelectWhere({ date: "", from: "", to: "" }), undefined);
++  assert.equal(productionDateSelectWhere({}), undefined);
++  assert.equal(setupProductionDateSelectWhere({}), undefined);
++  assert.equal(delayProductionDateSelectWhere({}), undefined);
++});
++
++test("a selection with only a date is the single-date search", () => {
++  assert.deepEqual(productionDateSelectWhere({ date: "2026-08-13" }), productionDateWhere("2026-08-13"));
++  assert.deepEqual(delayProductionDateSelectWhere({ date: "2026-08-13" }), delayProductionDateWhere("2026-08-13"));
++});
++
++test("a From or a To makes it a range, and the range wins over a stray date", () => {
++  assert.deepEqual(
++    productionDateSelectWhere({ from: "2026-08-01", to: "2026-08-31" }),
++    productionDateRangeWhere("2026-08-01", "2026-08-31"),
++  );
++  // date is present too, but the range takes precedence — no leak.
++  assert.deepEqual(
++    productionDateSelectWhere({ date: "2026-08-13", from: "2026-08-01", to: "" }),
++    productionDateRangeWhere("2026-08-01", ""),
++  );
++  assert.deepEqual(
++    setupProductionDateSelectWhere({ from: "", to: "2026-08-31" }),
++    setupProductionDateRangeWhere("", "2026-08-31"),
++  );
++});
+diff --git a/tests/roboProductionGrouping.test.ts b/tests/roboProductionGrouping.test.ts
+new file mode 100644
+index 0000000..b27eac9
+--- /dev/null
++++ b/tests/roboProductionGrouping.test.ts
+@@ -0,0 +1,120 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++
++import { assembleContinuous, assembleByBatch, type ExportRecord } from "../src/lib/robo/productionGrouping.ts";
++
++/* The Complete Production sheet's two layouts (change 6):
++   • a batch chosen → one continuous list, stored S.No. preserved;
++   • only a date filter → grouped by batch, S.No. restarting per group with
++     blank rows and a total between them.
++   The S.No. reset is display-only — nothing here touches the stored value. */
++
++const rec = (o: Partial<ExportRecord>): ExportRecord => ({
++  serialNumber: null,
++  productionDate: "2026-08-01",
++  designName: "BANYAN",
++  thickness: null,
++  batchNo: "D-1372",
++  slabNumber: "140000",
++  roymixBodyWeight: null,
++  roymixCycleTime: null,
++  inTime: null,
++  outTime: null,
++  remarks: "-",
++  createdAtMs: 0,
++  ...o,
++});
++
++/* ── continuous (a batch is selected) ─────────────────────────────────────── */
++
++test("continuous keeps the stored S.No. and flows dates together with no blanks", () => {
++  // One batch, 18 Jul then 19 Jul — the change (6) example: S.No. 121 → 18 Jul,
++  // 122 → 19 Jul, straight on.
++  const s121 = rec({ serialNumber: 121, slabNumber: "A121", productionDate: "2026-07-18", createdAtMs: 100 });
++  const s122 = rec({ serialNumber: 122, slabNumber: "A122", productionDate: "2026-07-19", createdAtMs: 200 });
++  const rows = assembleContinuous([s122, s121]); // deliberately out of order
++
++  assert.equal(rows.length, 4); // two records, a blank, a total
++  assert.equal(rows[0]["S.No."], 121);
++  assert.equal(rows[0]["Production Date"], "2026-07-18");
++  assert.equal(rows[1]["S.No."], 122);
++  assert.equal(rows[1]["Production Date"], "2026-07-19");
++  // No blank row BETWEEN the two records, and no S.No. reset — continuous.
++  assert.deepEqual(rows[2], {});
++  assert.equal(rows[3]["Slab No."], "TOTAL");
++  assert.equal(rows[3]["Remarks"], "2 records");
++});
++
++test("continuous shows a slab's own S.No. even when it carries none (position fallback)", () => {
++  const rows = assembleContinuous([rec({ serialNumber: null, slabNumber: "X", createdAtMs: 1 })]);
++  assert.equal(rows[0]["S.No."], 1); // fallback to position, never blank
++});
++
++/* ── grouped by batch (only a date filter) ─────────────────────────────────── */
++
++test("date-only groups by batch, restarts S.No. at 1, and totals each group", () => {
++  // Filter "31 Aug", no batch: Batch A continued past midnight (3 slabs on the
++  // 31st), Batch B is new (2 slabs). Group by batch; S.No. restarts per group.
++  const a = [1, 2, 3].map((i) =>
++    rec({ serialNumber: 200 + i, slabNumber: `A${i}`, batchNo: "A-1001", designName: "ALPHA", productionDate: "2026-08-31", createdAtMs: 100 + i }),
++  );
++  const b = [1, 2].map((i) =>
++    rec({ serialNumber: 300 + i, slabNumber: `B${i}`, batchNo: "B-2002", designName: "BETA", productionDate: "2026-08-31", createdAtMs: 500 + i }),
++  );
++  const rows = assembleByBatch([...b, ...a]); // out of order
++
++  assert.equal(rows.length, 15);
++
++  // Group A: header, three records with S.No. 1-3 (reset, NOT 201-203), 2 blanks, total.
++  assert.deepEqual(rows[0], { "S.No.": "BATCH", "Batch No.": "A-1001", "Design Name": "ALPHA" });
++  assert.equal(rows[1]["S.No."], 1);
++  assert.equal(rows[1]["Slab No."], "A1");
++  assert.equal(rows[2]["S.No."], 2);
++  assert.equal(rows[3]["S.No."], 3);
++  assert.deepEqual(rows[4], {});
++  assert.deepEqual(rows[5], {});
++  assert.equal(rows[6]["Slab No."], "Total");
++  assert.equal(rows[6]["Remarks"], "3 records");
++  assert.deepEqual(rows[7], {}); // spacing before the next batch
++  assert.deepEqual(rows[8], {});
++
++  // Group B: header, two records with S.No. 1-2, 2 blanks, total. No trailing spacing.
++  assert.deepEqual(rows[9], { "S.No.": "BATCH", "Batch No.": "B-2002", "Design Name": "BETA" });
++  assert.equal(rows[10]["S.No."], 1);
++  assert.equal(rows[10]["Slab No."], "B1");
++  assert.equal(rows[11]["S.No."], 2);
++  assert.deepEqual(rows[12], {});
++  assert.deepEqual(rows[13], {});
++  assert.equal(rows[14]["Remarks"], "2 records");
++});
++
++test("grouping folds case/format spellings of one batch together (canonical)", () => {
++  // "D-1372" and "d1372" are one batch — grouping uses canonBatchNo, a proper
++  // equivalence (fold case and hyphens), so they share a group. (A BARE "1372"
++  // is a different canonical key and its own group: the bare-number match rule
++  // is not transitive, so it cannot define groups — that is deliberate.)
++  const rows = assembleByBatch([
++    rec({ serialNumber: 5, slabNumber: "s1", batchNo: "D-1372", createdAtMs: 1 }),
++    rec({ serialNumber: 6, slabNumber: "s2", batchNo: "d1372", createdAtMs: 2 }),
++  ]);
++  // header + 2 records + 2 blanks + total = 6 rows, ONE group.
++  assert.equal(rows.length, 6);
++  assert.equal(rows[0]["S.No."], "BATCH");
++  assert.equal(rows[0]["Batch No."], "D-1372"); // the first (newest-sorted) spelling labels it
++  assert.equal(rows[1]["S.No."], 1);
++  assert.equal(rows[2]["S.No."], 2);
++  assert.equal(rows[5]["Remarks"], "2 records");
++});
++
++test("slabs with no batch fall into their own labelled group", () => {
++  const rows = assembleByBatch([rec({ serialNumber: 9, slabNumber: "n1", batchNo: null, createdAtMs: 1 })]);
++  assert.equal(rows[0]["Batch No."], "(no batch)");
++  assert.equal(rows[1]["S.No."], 1);
++});
++
++test("both layouts leave an empty set as an empty (or near-empty) sheet", () => {
++  assert.deepEqual(assembleByBatch([]), []);
++  // Continuous still closes with its total line, showing zero.
++  const rows = assembleContinuous([]);
++  assert.equal(rows[rows.length - 1]["Remarks"], "0 records");
++});
+diff --git a/tests/roboReportQuery.test.ts b/tests/roboReportQuery.test.ts
+new file mode 100644
+index 0000000..819a1ef
+--- /dev/null
++++ b/tests/roboReportQuery.test.ts
+@@ -0,0 +1,52 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++
++import { reportQuery } from "../src/lib/robo/reportQuery.ts";
++
++/* One query string for both the preview (summary) and the download (exports),
++   so the two screens and their two endpoints can never disagree about the
++   current filter. Two independent dimensions — Production Date and Batch No. —
++   that compose. */
++
++const base = { mode: "ALL" as const, date: "", from: "", to: "", batch: "" };
++
++test("no filter is an empty string, not a bare '?'", () => {
++  assert.equal(reportQuery(base), "");
++});
++
++test("Date Wise sends only the day", () => {
++  assert.equal(reportQuery({ ...base, mode: "DATE", date: "2026-08-13" }), "?date=2026-08-13");
++});
++
++test("Date Range sends from and to, either bound omittable", () => {
++  assert.equal(
++    reportQuery({ ...base, mode: "RANGE", from: "2026-08-01", to: "2026-08-31" }),
++    "?from=2026-08-01&to=2026-08-31",
++  );
++  assert.equal(reportQuery({ ...base, mode: "RANGE", from: "2026-08-01" }), "?from=2026-08-01");
++  assert.equal(reportQuery({ ...base, mode: "RANGE", to: "2026-08-31" }), "?to=2026-08-31");
++  // A range with neither bound filled is no date filter at all.
++  assert.equal(reportQuery({ ...base, mode: "RANGE" }), "");
++});
++
++test("the date fields of the OTHER modes are ignored", () => {
++  // A stale `date` while in RANGE, or stale range bounds while in DATE, never
++  // leak — only the active mode's fields are read.
++  assert.equal(reportQuery({ ...base, mode: "RANGE", date: "2026-08-13", from: "2026-08-01" }), "?from=2026-08-01");
++  assert.equal(reportQuery({ ...base, mode: "DATE", date: "2026-08-13", from: "2026-08-01", to: "2026-08-31" }), "?date=2026-08-13");
++});
++
++test("Batch No. rides along in every mode, independent of the date", () => {
++  assert.equal(reportQuery({ ...base, batch: "D-1372" }), "?batch=D-1372");
++  assert.equal(reportQuery({ ...base, mode: "DATE", date: "2026-08-13", batch: "D-1372" }), "?date=2026-08-13&batch=D-1372");
++  assert.equal(
++    reportQuery({ ...base, mode: "RANGE", from: "2026-08-01", to: "2026-08-31", batch: "D-1372" }),
++    "?from=2026-08-01&to=2026-08-31&batch=D-1372",
++  );
++});
++
++test("every field is trimmed, and whitespace-only is nothing", () => {
++  assert.equal(reportQuery({ ...base, mode: "DATE", date: " 2026-08-13 ", batch: "  D-1372  " }), "?date=2026-08-13&batch=D-1372");
++  assert.equal(reportQuery({ ...base, mode: "DATE", date: "   " }), "");
++  assert.equal(reportQuery({ ...base, batch: "   " }), "");
++});
+diff --git a/tests/roboSlabSearch.test.ts b/tests/roboSlabSearch.test.ts
+index b60099c..e6dbab6 100644
+--- a/tests/roboSlabSearch.test.ts
++++ b/tests/roboSlabSearch.test.ts
+@@ -5,13 +5,18 @@ import { slabSearchWhere } from "../src/lib/robo/slabSearch.ts";
+ import { productionDateWhere } from "../src/lib/robo/productionDate.ts";
+ 
+ /* The "Find a Slab" filter. Production Date, Batch No., Slab Number and Design
+-   Name have to compose — an operator narrowing by two of them means AND. Batch
+-   No. and Design Name are the pair that can go wrong, because both live on the
+-   same related setup.
++   Name have to compose — an operator narrowing by two of them means AND.
+ 
+-   Production Date is the other one to watch: it is not a column on the slab at
+-   all but a fallback across two relations, so it arrives as an OR that has to
+-   sit BESIDE the setup filter rather than inside it. See productionDate.ts. */
++   Batch No. no longer lives on the related setup as a `contains`: the route
++   resolves the typed number to the setups it names (batchNo.ts / batchFilter.ts)
++   and hands in `batchRecipeIds`, which this narrows on the scalar `batchRecipeId`
++   FK. Design Name is the only filter left on the relation, so the old
++   two-writers-one-relation hazard is gone — but the composition still has to
++   hold, and that is what these pin.
++
++   Production Date is the one to watch: not a column on the slab at all but a
++   fallback across two relations, so it arrives as an OR that has to sit BESIDE
++   the other keys rather than inside them. See productionDate.ts. */
+ 
+ /** The production-date match, so these tests state the composition rather than
+  *  restating productionDateWhere's own shape — that is pinned in its own file. */
+@@ -24,7 +29,7 @@ test("no filters searches everything", () => {
+ });
+ 
+ test("blank and whitespace-only values are not filters", () => {
+-  const { where, hasFilters } = slabSearchWhere({ date: "  ", slabNumber: "", designName: null, batchNo: undefined });
++  const { where, hasFilters } = slabSearchWhere({ date: "  ", slabNumber: "", designName: null, batchRecipeIds: null });
+   assert.deepEqual(where, {});
+   assert.equal(hasFilters, false);
+ });
+@@ -33,39 +38,46 @@ test("each filter narrows its own column", () => {
+   assert.deepEqual(slabSearchWhere({ date: "2026-08-18" }).where, { OR: onDate("2026-08-18") });
+   assert.deepEqual(slabSearchWhere({ slabNumber: "140748" }).where, { slabNumber: { contains: "140748" } });
+   assert.deepEqual(slabSearchWhere({ shiftId: "shift_1" }).where, { shiftId: "shift_1" });
+-  assert.deepEqual(slabSearchWhere({ batchNo: "B-1042" }).where, { batchRecipe: { batchNo: { contains: "B-1042" } } });
++  assert.deepEqual(slabSearchWhere({ batchRecipeIds: ["r1", "r2"] }).where, { batchRecipeId: { in: ["r1", "r2"] } });
+   assert.deepEqual(slabSearchWhere({ designName: "BANYAN" }).where, { batchRecipe: { designName: { contains: "BANYAN" } } });
+ });
+ 
+-test("batch number and design name AND together instead of overwriting", () => {
+-  // The bug this guards: two assignments to where.batchRecipe, the second
+-  // replacing the first, so one of the two filters silently does nothing.
+-  const { where } = slabSearchWhere({ batchNo: "B-1042", designName: "BANYAN" });
++test("a batch that matched nothing is an empty-in filter, NOT no filter", () => {
++  // The route resolved a real, typed batch number to zero setups. That must
++  // narrow to zero rows — `{ in: [] }` — not fall through to the whole register.
++  const { where, hasFilters } = slabSearchWhere({ batchRecipeIds: [] });
++  assert.deepEqual(where, { batchRecipeId: { in: [] } });
++  assert.equal(hasFilters, true);
++});
++
++test("batch (by id) and design name AND together as separate top-level keys", () => {
++  const { where } = slabSearchWhere({ batchRecipeIds: ["r1"], designName: "BANYAN" });
+   assert.deepEqual(where, {
+-    batchRecipe: { designName: { contains: "BANYAN" }, batchNo: { contains: "B-1042" } },
++    batchRecipeId: { in: ["r1"] },
++    batchRecipe: { designName: { contains: "BANYAN" } },
+   });
+ });
+ 
+ test("all four screen filters compose", () => {
+   const { where, hasFilters } = slabSearchWhere({
+     date: "2026-08-18",
+-    batchNo: " B-1042 ",
++    batchRecipeIds: ["r1", "r2"],
+     slabNumber: " 140748 ",
+     designName: " BANYAN ",
+   });
+   assert.deepEqual(where, {
+     OR: onDate("2026-08-18"),
+     slabNumber: { contains: "140748" },
+-    batchRecipe: { designName: { contains: "BANYAN" }, batchNo: { contains: "B-1042" } },
++    batchRecipeId: { in: ["r1", "r2"] },
++    batchRecipe: { designName: { contains: "BANYAN" } },
+   });
+   assert.equal(hasFilters, true);
+ });
+ 
+-test("the date filter sits beside the setup filter, not inside it", () => {
+-  /* Both narrow the setup, so putting the date INTO where.batchRecipe would be
+-     the same clobbering bug this module exists to prevent, one relation over.
+-     Prisma ANDs the top-level keys, so as separate keys they narrow each other:
+-     "this design, on this production date". */
++test("the date filter sits beside the design filter, not inside it", () => {
++  /* Putting the date INTO where.batchRecipe would collapse two independent
++     narrowings into one relation filter. Prisma ANDs the top-level keys, so as
++     separate keys they narrow each other: "this design, on this date". */
+   const { where } = slabSearchWhere({ date: "2026-08-18", designName: "BANYAN" });
+   assert.deepEqual(Object.keys(where).sort(), ["OR", "batchRecipe"]);
+   assert.deepEqual(where.batchRecipe, { designName: { contains: "BANYAN" } });
+@@ -78,10 +90,14 @@ test("the date is the one the operator entered, not the shift's own", () => {
+      Thursday's run came back empty, because every one of those slabs sat on a
+      shift row dated whenever the register was caught up. */
+   const { where } = slabSearchWhere({ date: "2026-08-13" });
+-  assert.deepEqual(where.OR?.[0], { batchRecipe: { productionDate: "2026-08-13" } });
++  // OR[0] is the slab's own per-slab date now; the setup date is OR[1]. Neither
++  // is a bare shift.date filter, which is the bug this guards.
++  assert.deepEqual(where.OR?.[0], { productionDate: "2026-08-13" });
++  assert.deepEqual(where.OR?.[1], { productionDate: null, batchRecipe: { productionDate: "2026-08-13" } });
+   assert.equal("shift" in where, false, "no bare shift.date filter may remain");
+ });
+ 
+-test("values are trimmed, so a pasted space does not miss every row", () => {
+-  assert.deepEqual(slabSearchWhere({ batchNo: "  B-7  " }).where, { batchRecipe: { batchNo: { contains: "B-7" } } });
++test("string values are trimmed, so a pasted space does not miss every row", () => {
++  assert.deepEqual(slabSearchWhere({ slabNumber: "  140748  " }).where, { slabNumber: { contains: "140748" } });
++  assert.deepEqual(slabSearchWhere({ designName: "  BANYAN  " }).where, { batchRecipe: { designName: { contains: "BANYAN" } } });
+ });
+-- 
+2.43.0
+
+
+From 52ff6024e3578c6318f6357a36090e497b3bfe6f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 2 Sep 2026 09:53:43 +0000
+Subject: [PATCH 2/2] chromia(qc): fix stuck "Saving...", return to origin view
+ with filters, no forced redirects
+
+Saving QC no longer hangs. A server redirect() inside the useActionState action
+pinned the button on "Saving..." until a heavy force-dynamic destination finished
+rendering, which on a slow render never happened though the save had committed. The
+action now returns success and the client navigates, so the button clears the instant
+the save commits and cannot be double-submitted.
+
+After saving, QC returns to exactly where the slab was opened from -- the filtered
+Slab Records view (filters intact) or Operator Entry -- instead of jumping to
+Recalibration/Stockyard. Every outcome returns the same way, Recalibration included;
+it no longer redirects to the Recalibration page. QC business logic is unchanged.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SPqDFZ7o6eq1utS7hzoQsF
+---
+ src/app/chromia/operator/qc-panel.tsx  | 87 ++++++++++++++++++--------
+ src/app/chromia/slabs/page.tsx         | 20 +++---
+ src/app/chromia/slabs/row-actions.tsx  | 14 ++++-
+ src/components/chromia/ui/slab-no.tsx  |  2 +-
+ src/lib/chromia/server/actions/slab.ts | 52 ++++++++-------
+ src/lib/chromia/slab-links.ts          |  9 +--
+ 6 files changed, 118 insertions(+), 66 deletions(-)
+
+diff --git a/src/app/chromia/operator/qc-panel.tsx b/src/app/chromia/operator/qc-panel.tsx
+index 2ec6849..77194a1 100644
+--- a/src/app/chromia/operator/qc-panel.tsx
++++ b/src/app/chromia/operator/qc-panel.tsx
+@@ -1,9 +1,11 @@
+ 'use client';
+ 
+-import { useActionState } from 'react';
++import { useActionState, useEffect, useRef, useTransition } from 'react';
++import { useRouter } from 'next/navigation';
+ 
+ import { FormError } from '@/components/chromia/ui';
+ import { SectionCard } from '@/components/chromia/ui/form';
++import { APP_ROUTES } from '@/lib/chromia/constants/app';
+ import {
+   completeSlabAction,
+   editSlabQcAction,
+@@ -18,7 +20,11 @@ interface Props {
+   slabId: string;
+   slabNo: string;
+   recalibrationReasons: Option[];
+-  /** The filtered Slab Records query to return to after saving — see slabHref. */
++  /**
++   * Where the slab was opened from — a full in-app path, filters and all, to
++   * return to once QC is saved (the filtered Slab Records view, say). Absent
++   * when the slab was opened from Operator Entry, which is then the default.
++   */
+   back?: string;
+   /**
+    * Correction mode (the Edit path): the QC section opens pre-filled with the
+@@ -29,23 +35,31 @@ interface Props {
+   initial?: { grade?: string; disposition?: string; slabRemarks?: string };
+ }
+ 
++/** Only an in-app Chromia path is ever navigated to, so a stray `back` can
++ *  never send the grader off the module. */
++function returnTarget(back?: string): string {
++  return back && back.startsWith('/chromia/') ? back : APP_ROUTES.operator;
++}
++
+ /**
+  * The QC Section, on the operator's own screen.
+  *
+- * It used to be the second half of a page of its own — /chromia/slabs/new —
+- * whose first half asked for a "fully printed date" that the person grading
+- * was not there to know. That page is gone: its first half went with the field
+- * and its second half is this, sitting under the entry the slab was booked on
+- * with the same grade and outcome rules it always had.
++ * Its own form and its own button, deliberately — correcting the operator's
++ * entry and deciding a slab's grade are different acts, and the grade opens a
++ * dispatch, a stock entry or a recalibration trip.
+  *
+- * Its own form and its own button, deliberately. Correcting what the operator
+- * typed and deciding a slab's grade are different acts with different
+- * consequences — the grade opens a dispatch, a stock entry or a recalibration
+- * trip — and one button that silently did both would make the second one an
+- * accident of pressing the first.
+- *
+- * `QcSection` itself is imported unchanged from where it has always lived, so
+- * the allowed grade/outcome pairs stay decided in exactly one place.
++ * ── SAVE, THEN RETURN — WITHOUT A SERVER REDIRECT ─────────────────────────
++ * The action reports success and nothing more (see slab.ts): it does NOT
++ * redirect. A server redirect inside a useActionState action kept this button
++ * pinned on "Saving…" until a heavy destination page finished rendering, which
++ * on a slow render never happened — the save looked stuck though it had
++ * committed. Here instead the button's pending clears the instant the save
++ * returns, and THIS component then navigates the grader back to wherever the
++ * slab was opened from: the same filtered Slab Records view, or Operator Entry.
++ * Every outcome returns the same way — Recalibration included; it no longer
++ * jumps to the Recalibration page. The button stays disabled from the first
++ * click through the return, so a slab is never double-graded and the control is
++ * never left in a stuck state.
+  */
+ export function QcPanel({
+   slabId,
+@@ -55,19 +69,30 @@ export function QcPanel({
+   edit = false,
+   initial,
+ }: Props) {
++  const router = useRouter();
+   const [state, formAction, isPending] = useActionState(
+     edit ? editSlabQcAction : completeSlabAction,
+     INITIAL_STATE,
+   );
++  const [isReturning, startReturn] = useTransition();
++  const returnedFor = useRef<number | null>(null);
++
++  useEffect(() => {
++    if (!state.savedAt || returnedFor.current === state.savedAt) return;
++    returnedFor.current = state.savedAt; // navigate once per successful save
++    startReturn(() => router.push(returnTarget(back)));
++  }, [state.savedAt, back, router]);
++
++  const saved = Boolean(state.savedAt);
++  // Disabled from the click through the return: no second submit, and never a
++  // control left enabled while work is still in flight.
++  const busy = isPending || isReturning || saved;
+ 
+   return (
+     <div className="mb-6">
+       <SectionCard title={edit ? 'QC Section — correct' : 'QC Section'} accent="grade">
+         <form action={formAction} className="flex flex-col gap-6">
+           <input type="hidden" name="slabId" value={slabId} />
+-          {/* The filtered view to return to once this is saved. Absent when the
+-              slab was not opened from a filtered Slab Records search. */}
+-          {back ? <input type="hidden" name="back" value={back} /> : null}
+ 
+           <QcSection
+             recalibrationReasons={recalibrationReasons}
+@@ -80,20 +105,28 @@ export function QcPanel({
+           <div className="border-line flex flex-wrap items-center gap-4 border-t pt-5">
+             <button
+               type="submit"
+-              disabled={isPending}
++              disabled={busy}
+               className="bg-brand-600 hover:bg-brand-700 inline-flex h-11 items-center justify-center rounded-lg px-6 text-sm font-semibold text-white shadow-[0_1px_2px_rgba(16,24,40,0.12)] transition-colors disabled:cursor-not-allowed disabled:opacity-55"
+             >
+               {isPending
+                 ? 'Saving…'
+-                : edit
+-                  ? `Save QC changes for slab ${slabNo}`
+-                  : `Save QC for slab ${slabNo}`}
++                : saved
++                  ? 'Saved — returning…'
++                  : edit
++                    ? `Save QC changes for slab ${slabNo}`
++                    : `Save QC for slab ${slabNo}`}
+             </button>
+-            <span className="text-muted text-sm">
+-              {edit
+-                ? 'This replaces the current grade and outcome on the same record.'
+-                : 'The entry above stays In-Processing until this is saved.'}
+-            </span>
++            {saved ? (
++              <span className="text-status-active text-sm font-medium">
++                ✓ QC saved for slab {slabNo}.
++              </span>
++            ) : (
++              <span className="text-muted text-sm">
++                {edit
++                  ? 'This replaces the current grade and outcome on the same record.'
++                  : 'The entry above stays In-Processing until this is saved.'}
++              </span>
++            )}
+           </div>
+         </form>
+       </SectionCard>
+diff --git a/src/app/chromia/slabs/page.tsx b/src/app/chromia/slabs/page.tsx
+index 6de6960..3260b89 100644
+--- a/src/app/chromia/slabs/page.tsx
++++ b/src/app/chromia/slabs/page.tsx
+@@ -63,15 +63,15 @@ export default async function SlabsPage({
+   const to = filtered ? total : Math.min(filters.page * filters.pageSize, total);
+ 
+   /*
+-   * The current filter query, carried on each slab link so QC can return to it.
+-   * A slab number opens the QC screen, and completing QC used to redirect to a
+-   * bare /chromia/slabs — dropping the very filter the in-charge was working
+-   * through and making them retype it before every single slab. The link hands
+-   * the filters along; the QC save sends them back (see completeSlabAction).
+-   * Only when something is actually filtered — unfiltered browsing returns to
+-   * the plain list exactly as before.
++   * The full page URL to return to after QC — this path AND its current
++   * filters — carried on every slab link and every Edit link. QC opens on the
++   * operator screen; when it saves, the panel comes back to exactly this view,
++   * filters intact, so the in-charge working through a filtered month can grade
++   * slab after slab without retyping the filter each time. Unfiltered browsing
++   * carries the plain /chromia/slabs path, so it returns to the list all the
++   * same. See qc-panel.tsx for the return itself.
+    */
+-  const backQuery = filtered ? buildQuery(filters) : undefined;
++  const backTo = `${APP_ROUTES.slabs}${filtered ? `?${buildQuery(filters)}` : ''}`;
+ 
+   return (
+     <>
+@@ -132,7 +132,7 @@ export default async function SlabsPage({
+                       </td>
+                       <td className={`${tdMuted} font-mono`}>{slab.batch.batchNo}</td>
+                       <td className={td}>
+-                        <SlabNo id={slab.id} status={slab.status} slabNo={slab.slabNo} back={backQuery} />
++                        <SlabNo id={slab.id} status={slab.status} slabNo={slab.slabNo} back={backTo} />
+                       </td>
+                       <td className={td}>{slab.baseMaterial.name}</td>
+                       <td className={tdMuted}>
+@@ -160,7 +160,7 @@ export default async function SlabsPage({
+                         {slab.remarks ?? '—'}
+                       </td>
+                       <td className={`${td} text-right`}>
+-                        <RowActions slabId={slab.id} slabNo={slab.slabNo} />
++                        <RowActions slabId={slab.id} slabNo={slab.slabNo} back={backTo} />
+                       </td>
+                     </tr>
+                   ))}
+diff --git a/src/app/chromia/slabs/row-actions.tsx b/src/app/chromia/slabs/row-actions.tsx
+index 4bdd607..371b11e 100644
+--- a/src/app/chromia/slabs/row-actions.tsx
++++ b/src/app/chromia/slabs/row-actions.tsx
+@@ -19,7 +19,17 @@ const INITIAL_STATE: SlabRecordFormState = {};
+  *
+  * Delete asks first, and the question names the slab.
+  */
+-export function RowActions({ slabId, slabNo }: { slabId: string; slabNo: string }) {
++export function RowActions({
++  slabId,
++  slabNo,
++  back,
++}: {
++  slabId: string;
++  slabNo: string;
++  /** The full Slab Records URL (with filters) to return to after an Edit save,
++   *  so correcting a slab keeps the in-charge on the same filtered view. */
++  back?: string;
++}) {
+   const [state, formAction, isPending] = useActionState(deleteSlabRecordAction, INITIAL_STATE);
+   const [asking, setAsking] = useState(false);
+ 
+@@ -32,7 +42,7 @@ export function RowActions({ slabId, slabNo }: { slabId: string; slabNo: string
+   return (
+     <span className="flex items-center justify-end gap-1.5 whitespace-nowrap">
+       <Link
+-        href={`${APP_ROUTES.operator}?slab=${slabId}&edit=1`}
++        href={`${APP_ROUTES.operator}?slab=${slabId}&edit=1${back ? `&back=${encodeURIComponent(back)}` : ''}`}
+         aria-label={`Edit slab ${slabNo}`}
+         className="border-line surface hover:border-line-strong inline-flex h-9 items-center justify-center rounded-lg border px-3 text-xs font-medium transition-colors hover:bg-[var(--surface-muted)]"
+       >
+diff --git a/src/components/chromia/ui/slab-no.tsx b/src/components/chromia/ui/slab-no.tsx
+index 88a6fd2..ccf22fa 100644
+--- a/src/components/chromia/ui/slab-no.tsx
++++ b/src/components/chromia/ui/slab-no.tsx
+@@ -26,7 +26,7 @@ export function SlabNo({
+   status: SlabStatus;
+   slabNo: string;
+   className?: string;
+-  /** The filter query to return to after QC — see slabHref. */
++  /** The full page URL (with filters) to return to after QC — see slabHref. */
+   back?: string;
+ }) {
+   const href = slabHref(id, status, back);
+diff --git a/src/lib/chromia/server/actions/slab.ts b/src/lib/chromia/server/actions/slab.ts
+index d7f81d9..32fb556 100644
+--- a/src/lib/chromia/server/actions/slab.ts
++++ b/src/lib/chromia/server/actions/slab.ts
+@@ -1,7 +1,6 @@
+ 'use server';
+ 
+ import { revalidatePath } from 'next/cache';
+-import { redirect } from 'next/navigation';
+ 
+ import { APP_ROUTES } from '@/lib/chromia/constants/app';
+ import { ChromiaDisposition as Disposition } from '@prisma/client';
+@@ -24,6 +23,10 @@ import { completeSlabIntake } from '@/lib/chromia/server/services/slab-intake-se
+ export interface SlabIntakeFormState {
+   error?: string;
+   fieldErrors?: Record<string, string[] | undefined>;
++  /** Set once the save succeeds, so the panel knows to return the user to the
++   *  page they came from. A number (not a boolean) so two saves in a row are
++   *  two distinct successes and the panel navigates for each. */
++  savedAt?: number;
+ }
+ 
+ /** Run the outcome-specific record for everything except recalibration. */
+@@ -187,30 +190,35 @@ async function saveQc(
+     throw error;
+   }
+ 
++  // Every page a QC outcome can change is marked stale, so whichever one the
++  // panel returns to shows the just-graded slab correctly — the record in Slab
++  // Records, the counts on the Dashboard, and the queues on Recalibration,
++  // Stockyard and Dispatch. The operator screen too: it is where the grading
++  // happens, so it is stale the instant this returns.
+   revalidatePath(APP_ROUTES.slabs);
+   revalidatePath(APP_ROUTES.dashboard);
+   revalidatePath(APP_ROUTES.recalibrations);
+-  // QC is graded from the operator screen now, so that screen is stale the
+-  // moment this returns — without this, going Back to it re-offers the QC
+-  // section for a slab that has just been graded.
++  revalidatePath(APP_ROUTES.stockyard);
++  revalidatePath(APP_ROUTES.dispatch);
+   revalidatePath(APP_ROUTES.operator);
+ 
+-  // Straight to the Recalibration page, where the slab is now waiting to be
+-  // sent. No query string: the record is simply in the table.
+-  if (qc.disposition === Disposition.RECALIBRATION) {
+-    redirect(APP_ROUTES.recalibrations);
+-  }
+-
+-  // Back to the history table — and to the SAME filtered view the slab was
+-  // opened from, when it carried one. Processing a month of old records used to
+-  // dump the in-charge back at the unfiltered list after every slab, so the
+-  // February filter had to be retyped before each one. `back` is the filter
+-  // query the row was found under; re-parsed through URLSearchParams so only a
+-  // well-formed query string can ever become the destination.
+-  const back = formData.get('back');
+-  if (typeof back === 'string' && back.trim() !== '') {
+-    const clean = new URLSearchParams(back).toString();
+-    if (clean) redirect(`${APP_ROUTES.slabs}?${clean}`);
+-  }
+-  redirect(APP_ROUTES.slabs);
++  /*
++   * No redirect() from here — deliberately, and this is the fix.
++   *
++   * A server redirect() inside a useActionState action ties the form's pending
++   * state to a server-driven navigation. The destinations here are
++   * force-dynamic pages (the whole filtered Slab Records list, the Recalibration
++   * table), and while one of those rendered the button sat on "Saving…" — on a
++   * slow render it never came back, so the save looked stuck even though it had
++   * already committed. Worse, it forced the destination: Recalibration jumped to
++   * the Recalibration page, and every other outcome to Slab Records, no matter
++   * which screen the grader had actually come from.
++   *
++   * So the action just reports success. The panel (qc-panel.tsx) resolves its
++   * own pending the moment this returns, then navigates the user back to exactly
++   * where the slab was opened from — the same filtered Slab Records view, or
++   * Operator Entry — client-side. Recalibration is no exception: the record is
++   * updated here, and the user stays where they were.
++   */
++  return { savedAt: Date.now() };
+ }
+diff --git a/src/lib/chromia/slab-links.ts b/src/lib/chromia/slab-links.ts
+index 90a3c33..29e232d 100644
+--- a/src/lib/chromia/slab-links.ts
++++ b/src/lib/chromia/slab-links.ts
+@@ -31,10 +31,11 @@ export function needsIntakeQc(status: SlabStatusType): boolean {
+  * nothing to open: its work is done or belongs to the Recalibration section.
+  * Returning null rather than a dead link keeps the table honest about that.
+  *
+- * `back` is an optional query string — the filters the row was found under —
+- * carried along so that completing QC can return to that same filtered view
+- * rather than a bare list. It is the query part only (no leading `?`), and it
+- * is url-encoded here so its own `&`/`=` survive being one parameter's value.
++ * `back` is an optional full in-app URL — the page the row was found on, with
++ * its filters — carried along so that completing QC can return to that same
++ * view rather than a bare list. It is url-encoded here so its own `?`/`&`/`=`
++ * survive being one parameter's value; the QC panel reads it back and navigates
++ * there (see qc-panel.tsx), after checking it is an in-app /chromia path.
+  */
+ export function slabHref(id: string, status: SlabStatusType, back?: string): string | null {
+   if (!needsIntakeQc(status)) return null;
+-- 
+2.43.0
+

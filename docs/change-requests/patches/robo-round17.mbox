@@ -1,0 +1,450 @@
+From a9bb67dfa48ab051db89e6dafe069193c746e238 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 8 Sep 2026 05:03:47 +0000
+Subject: [PATCH] =?UTF-8?q?robo(slabs):=20split=20a=20mixed=20batch=20?=
+ =?UTF-8?q?=E2=80=94=20Batch=20No.=20/=20Design=20/=20Target=20Slabs=20on?=
+ =?UTF-8?q?=20slab=20Edit?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds the three batch fields to the Edit-slab screen, beside Production Date and
+Thickness, each with an "apply to this slab and every following one" toggle.
+
+Unlike Date/Thickness (which live on the slab), Batch No., Design and Target
+Slabs live on the shared batch RECIPE, so changing them for a range is not a
+field write -- it is a SPLIT. Ticking a field's box moves this slab and every
+following slab of the run into the target batch: joined if a batch of that
+number+design already exists in the shift, otherwise created from this batch's
+own setup (machines, program, thickness, date copied). Earlier slabs stay put;
+each slab's own times, delays and per-slab date travel with it. This is how two
+runs recorded as one batch -- 1372 Crystallo and 1404 Bellagio green merged --
+get separated; a 3-batch mix is two forward-splits.
+
+- batchSplit.ts (pure, tested): resolveTargetBatch (ticked field wins, else the
+  current batch's value) and isReparent/sameBatchIdentity (a real move only when
+  number or design changed; matched on number AND design, design case-insensitive;
+  Target-Slabs-only is a plain attribute edit on the batch, no move).
+- production/[id] PATCH: after the date/thickness range step, re-parents the
+  forward run (forwardRunIds over the recipe's slabs) to the found-or-created
+  target recipe, in the same transaction, and logs it (kind "edit") so the split
+  is auditable and reversible. Only runs when a box is ticked and the slab has a
+  batch.
+- RoboEntryForm: the three fields + toggles in a clearly-marked "split a mixed
+  run" block, shown only when editing a slab that is in a batch; sent to the API
+  only when a box is ticked, so changing a field alone never moves a slab.
+
+No schema or DB change -- re-parenting uses the existing batchRecipeId; new
+recipes are ordinary rows. Verified: tsc clean, 699 tests pass, next build clean.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SPqDFZ7o6eq1utS7hzoQsF
+---
+ src/app/api/robo/production/[id]/route.ts | 121 ++++++++++++++++++++++
+ src/components/robo/RoboEntryForm.tsx     |  74 ++++++++++++-
+ src/lib/robo/batchSplit.ts                |  71 +++++++++++++
+ tests/roboBatchSplit.test.ts              |  48 +++++++++
+ 4 files changed, 313 insertions(+), 1 deletion(-)
+ create mode 100644 src/lib/robo/batchSplit.ts
+ create mode 100644 tests/roboBatchSplit.test.ts
+
+diff --git a/src/app/api/robo/production/[id]/route.ts b/src/app/api/robo/production/[id]/route.ts
+index b7fa744..aefcaf8 100644
+--- a/src/app/api/robo/production/[id]/route.ts
++++ b/src/app/api/robo/production/[id]/route.ts
+@@ -6,6 +6,8 @@ import { SLAB_COMPLETED, SLAB_IN_PROCESSING } from "@/lib/robo/utils";
+ import { forwardRunIds } from "@/lib/robo/rangeUpdate";
+ import { productionDateOf } from "@/lib/robo/productionDate";
+ import { roboThicknessKey } from "@/lib/robo/thickness";
++import { resolveDesignId } from "@/lib/robo/setupMastersDb";
++import { resolveTargetBatch, isReparent, type BatchFields } from "@/lib/robo/batchSplit";
+ 
+ export async function GET(_: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+   const { id } = await params;
+@@ -160,6 +162,27 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
+     data.status = body.outTime ? SLAB_COMPLETED : SLAB_IN_PROCESSING;
+   }
+ 
++  // Batch Number / Design / Target Slabs live on the batch RECIPE, shared by every
++  // slab in the batch — so changing them for a range is not a per-slab write, it is
++  // a SPLIT: this slab and every following one in the run move to a recipe for the
++  // new batch (joined if one exists in the shift, else created from this batch's own
++  // setup). It is how a run recorded as one batch — 1372 Crystallo and 1404 Bellagio
++  // green merged — gets separated. See batchSplit.ts. Each field acts only when its
++  // "apply forward" box is ticked.
++  const applyBatchNoForward     = body.batchNo     !== undefined && Boolean(body.applyBatchNoToRange);
++  const applyDesignForward      = body.designName  !== undefined && Boolean(body.applyDesignToRange);
++  const applyTargetSlabsForward = body.targetSlabs !== undefined && Boolean(body.applyTargetSlabsToRange);
++  const reparentRequested = applyBatchNoForward || applyDesignForward || applyTargetSlabsForward;
++
++  const newBatchNo: string | null = applyBatchNoForward ? (String(body.batchNo ?? "").trim() || null) : null;
++  const newDesignName: string = applyDesignForward ? String(body.designName ?? "").trim() : "";
++  const newTargetSlabs: number | null = applyTargetSlabsForward
++    ? (body.targetSlabs === null || body.targetSlabs === "" || Number.isNaN(Number(body.targetSlabs)) ? null : Number(body.targetSlabs))
++    : null;
++  // Design master resolved OUTSIDE the transaction — its own upsert — exactly as the
++  // setup create does, and only when the design itself is being changed.
++  const newDesignId = applyDesignForward && newDesignName ? await resolveDesignId(newDesignName) : null;
++
+   // One transaction: the slab's own edits, any forward-applied range, and the
+   // appended delay logs land together or not at all, so a mid-write failure
+   // can't leave a half-saved edit.
+@@ -212,6 +235,104 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
+       }
+     }
+ 
++    // 3.5 Batch split — re-parent this slab and every following one in the run to a
++    //     different batch recipe. Only when a batch field was applied forward AND the
++    //     slab has a batch. The target's fields are the current batch's, overridden by
++    //     whichever of Batch No. / Design / Target Slabs was ticked.
++    if (reparentRequested && start.batchRecipeId) {
++      const currentRecipe = await tx.roboBatchRecipe.findUnique({
++        where: { id: start.batchRecipeId },
++        include: { entries: true },
++      });
++      if (currentRecipe) {
++        const currentFields: BatchFields = {
++          batchNo: currentRecipe.batchNo,
++          designName: currentRecipe.designName,
++          targetSlabs: currentRecipe.targetSlabs,
++        };
++        const target = resolveTargetBatch(currentFields, {
++          batchNo:     applyBatchNoForward     ? { value: newBatchNo, apply: true } : undefined,
++          designName:  applyDesignForward      ? { value: newDesignName, apply: true } : undefined,
++          targetSlabs: applyTargetSlabsForward ? { value: newTargetSlabs, apply: true } : undefined,
++        });
++
++        if (!isReparent(currentFields, target)) {
++          // Same batch — only Target Slabs changed. That is an attribute of the whole
++          // batch, so it is written on the recipe, no slabs move.
++          if (applyTargetSlabsForward && target.targetSlabs !== currentRecipe.targetSlabs) {
++            await tx.roboBatchRecipe.update({ where: { id: currentRecipe.id }, data: { targetSlabs: target.targetSlabs } });
++          }
++        } else {
++          // The run to move: this slab and every following slab of the CURRENT recipe,
++          // in register order. They share one recipe, so the run is this slab to the
++          // end of the batch; earlier slabs stay put.
++          const runSlabs = await tx.roboProductionRecord.findMany({
++            where: { batchRecipeId: currentRecipe.id },
++            orderBy: [{ serialNumber: "asc" }, { createdAt: "asc" }],
++            select: { id: true, batchRecipeId: true },
++          });
++          const moveIds = forwardRunIds(runSlabs, id, (s) => s.batchRecipeId ?? "");
++
++          // Join an existing batch of that number+design in the same shift (never the
++          // one we are splitting FROM), else create one from this batch's own setup.
++          const existing = await tx.roboBatchRecipe.findFirst({
++            where: {
++              shiftId: currentRecipe.shiftId,
++              batchNo: target.batchNo,
++              designName: { equals: target.designName, mode: "insensitive" },
++              NOT: { id: currentRecipe.id },
++            },
++            select: { id: true },
++          });
++          let targetRecipeId: string;
++          if (existing) {
++            targetRecipeId = existing.id;
++          } else {
++            const created = await tx.roboBatchRecipe.create({
++              data: {
++                shiftId:        currentRecipe.shiftId,
++                batchNo:        target.batchNo,
++                designId:       applyDesignForward ? newDesignId : currentRecipe.designId,
++                designName:     target.designName,
++                programName:    currentRecipe.programName,
++                targetSlabs:    target.targetSlabs,
++                thickness:      currentRecipe.thickness,
++                productionDate: currentRecipe.productionDate,
++                notes:          currentRecipe.notes,
++                entries: {
++                  create: currentRecipe.entries.map((e) => ({
++                    machineId:       e.machineId,
++                    programName:     e.programName,
++                    toolName:        e.toolName,
++                    liquidName:      e.liquidName,
++                    powderName:      e.powderName,
++                    rollerHeight:    e.rollerHeight,
++                    targetCycleTime: e.targetCycleTime,
++                    notes:           e.notes,
++                  })),
++                },
++              },
++              select: { id: true },
++            });
++            targetRecipeId = created.id;
++          }
++
++          await tx.roboProductionRecord.updateMany({
++            where: { id: { in: moveIds } },
++            data: { batchRecipeId: targetRecipeId },
++          });
++
++          // Logged so the split is auditable and reversible.
++          await logActionTx(tx, {
++            kind: "edit",
++            model: "RoboProductionRecord",
++            summary: `Split ${moveIds.length} slab(s) out of batch ${currentFields.batchNo ?? "—"} / ${currentFields.designName || "—"} into ${target.batchNo ?? "—"} / ${target.designName || "—"}`,
++            payload: { movedIds: moveIds, fromRecipeId: currentRecipe.id, toRecipeId: targetRecipeId },
++          });
++        }
++      }
++    }
++
+     // 4. Delay logs — a full reconcile against the set the client sent, so the
+     //    delay log is fully editable. A delay that arrives WITH an id is updated
+     //    in place (change one field, or several, on an existing delay); one
+diff --git a/src/components/robo/RoboEntryForm.tsx b/src/components/robo/RoboEntryForm.tsx
+index 2b14580..e42e5fd 100644
+--- a/src/components/robo/RoboEntryForm.tsx
++++ b/src/components/robo/RoboEntryForm.tsx
+@@ -176,7 +176,7 @@ const btnGhost = "rounded-lg border border-gray-300 px-4 py-2 text-sm font-mediu
+ type MachineEntry = { programName: string; toolName: string; liquidName: string; powderName: string; rollerHeight: string; targetCycleTime: string };
+ const emptyEntry = (): MachineEntry => ({ programName: "", toolName: "", liquidName: "", powderName: "", rollerHeight: "", targetCycleTime: "" });
+ 
+-const emptySlab = () => ({ serialNumber: "", slabNumber: "", productionDate: "", thickness: "", inTime: "", outTime: "", roymixCycleTime: "", roymixBodyWeight: "", remarks: "" });
++const emptySlab = () => ({ serialNumber: "", slabNumber: "", productionDate: "", thickness: "", inTime: "", outTime: "", roymixCycleTime: "", roymixBodyWeight: "", remarks: "", batchNo: "", designName: "", targetSlabs: "" });
+ /** Toggle a machine name in a delay's set — add it if absent, drop it if
+  *  present. Order is kept so the first stays first (that is what machineId
+  *  resolves from). */
+@@ -464,6 +464,11 @@ export function RoboEntryForm({ recordId, setupEdit, canDelete = false }: {
+    *  Reset whenever a different slab is loaded, or the edit is left. */
+   const [applyDateForward, setApplyDateForward] = useState(false);
+   const [applyThicknessForward, setApplyThicknessForward] = useState(false);
++  // Batch-split "apply forward" toggles — Batch No. / Design / Target Slabs. Ticking
++  // one moves this slab + the following ones to that batch (see saveSlab).
++  const [applyBatchNoForward, setApplyBatchNoForward] = useState(false);
++  const [applyDesignForward, setApplyDesignForward] = useState(false);
++  const [applyTargetSlabsForward, setApplyTargetSlabsForward] = useState(false);
+   /** The slab's Production Date / Thickness as loaded, so a save only writes a
+    *  per-slab override when the operator actually changed the value (or ticked
+    *  "apply forward"). An untouched field is left off the request, so the slab
+@@ -541,6 +546,13 @@ export function RoboEntryForm({ recordId, setupEdit, canDelete = false }: {
+         roymixCycleTime: rec.roymixCycleTime != null ? String(rec.roymixCycleTime) : "",
+         roymixBodyWeight: rec.roymixBodyWeight != null ? String(rec.roymixBodyWeight) : "",
+         remarks: rec.remarks ?? "",
++        // The batch this slab currently sits in — Batch No. / Design / Target Slabs.
++        // Editing these and ticking "apply forward" SPLITS the run: this slab and the
++        // ones after it move to that batch (see saveSlab / the API). Pre-filled from
++        // the current batch so a split starts from the truth.
++        batchNo: rec.batchRecipe?.batchNo ?? "",
++        designName: rec.batchRecipe?.designName ?? "",
++        targetSlabs: rec.batchRecipe?.targetSlabs != null ? String(rec.batchRecipe.targetSlabs) : "",
+       });
+       // Remember what was loaded, so the save can tell an untouched Date /
+       // Thickness (leave it alone) from a real correction (write it).
+@@ -555,6 +567,9 @@ export function RoboEntryForm({ recordId, setupEdit, canDelete = false }: {
+     // to fix one thing can never carry a stale forward-apply into the save.
+     setApplyDateForward(false);
+     setApplyThicknessForward(false);
++    setApplyBatchNoForward(false);
++    setApplyDesignForward(false);
++    setApplyTargetSlabsForward(false);
+     // The slab's existing delays load as editable rows — each keeps its DB id so
+     // a save corrects it in place, and its machine set is unpacked from the
+     // (possibly multi-Robo) machineName. Add / edit / remove all happen here.
+@@ -1211,6 +1226,21 @@ export function RoboEntryForm({ recordId, setupEdit, canDelete = false }: {
+       patchBody.thickness = slab.thickness.trim() || null;
+       patchBody.applyThicknessToRange = applyThicknessForward;
+     }
++    // Batch split — sent ONLY when a box is ticked, so changing a field without
++    // ticking never moves a slab. The server re-parents this slab and the ones after
++    // it to the target batch (see the API route / batchSplit.ts).
++    if (applyBatchNoForward) {
++      patchBody.batchNo = slab.batchNo.trim() || null;
++      patchBody.applyBatchNoToRange = true;
++    }
++    if (applyDesignForward) {
++      patchBody.designName = slab.designName.trim();
++      patchBody.applyDesignToRange = true;
++    }
++    if (applyTargetSlabsForward) {
++      patchBody.targetSlabs = slab.targetSlabs.trim() || null;
++      patchBody.applyTargetSlabsToRange = true;
++    }
+     const res = await (editingId
+       ? fetch(`/api/robo/production/${editingId}`, {
+           method: "PATCH", headers: { "Content-Type": "application/json" },
+@@ -1705,6 +1735,48 @@ export function RoboEntryForm({ recordId, setupEdit, canDelete = false }: {
+                 </div>
+               )}
+ 
++              {/* Batch / Design / Target Slabs — SPLIT a mixed run. Unlike Date and
++                  Thickness (which live on the slab), these live on the batch, so ticking
++                  "apply forward" MOVES this slab and the ones after it into that batch —
++                  how two runs recorded as one (1372 Crystallo + 1404 Bellagio green) get
++                  separated. Only on an edit, only when the slab is in a batch. */}
++              {editingId && activeBatch && (
++                <div className="rounded-xl border border-amber-200 bg-amber-50/60 p-4 sm:col-span-2">
++                  <div className="text-sm font-semibold text-gray-800">Batch &amp; design — split a mixed run</div>
++                  <p className="mb-3 mt-0.5 text-xs text-gray-500">
++                    Change a field and tick <span className="font-medium text-gray-700">apply forward</span> to move <span className="font-medium text-gray-700">this slab and every following one in the batch</span> into that batch (joined if it already exists in the shift, else created from this batch&rsquo;s setup). Leave the boxes off and nothing moves.
++                  </p>
++                  <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
++                    <div>
++                      <span className={label}>Batch No.</span>
++                      <input value={slab.batchNo} onChange={(e) => setSlab((p) => ({ ...p, batchNo: e.target.value }))} placeholder="e.g. 1404" className={inp} />
++                      <label className="mt-2 flex cursor-pointer items-start gap-2 text-xs">
++                        <input type="checkbox" checked={applyBatchNoForward} onChange={(e) => setApplyBatchNoForward(e.target.checked)} className="mt-0.5 h-4 w-4 shrink-0 rounded border-gray-300" />
++                        <span className="text-gray-600">Apply to <span className="font-medium text-gray-800">this slab and every following one</span>.</span>
++                      </label>
++                    </div>
++                    <div>
++                      <span className={label}>Design</span>
++                      <input value={slab.designName} onChange={(e) => setSlab((p) => ({ ...p, designName: e.target.value }))}
++                        list="robo-split-designs" autoComplete="off" placeholder="e.g. Bellagio green" className={inp} />
++                      <datalist id="robo-split-designs">{designs.map((d) => <option key={d.id} value={d.name} />)}</datalist>
++                      <label className="mt-2 flex cursor-pointer items-start gap-2 text-xs">
++                        <input type="checkbox" checked={applyDesignForward} onChange={(e) => setApplyDesignForward(e.target.checked)} className="mt-0.5 h-4 w-4 shrink-0 rounded border-gray-300" />
++                        <span className="text-gray-600">Apply to <span className="font-medium text-gray-800">this slab and every following one</span>.</span>
++                      </label>
++                    </div>
++                    <div>
++                      <span className={label}>Target Slabs</span>
++                      <input type="number" value={slab.targetSlabs} onChange={(e) => setSlab((p) => ({ ...p, targetSlabs: e.target.value }))} placeholder="e.g. 120" className={inp} />
++                      <label className="mt-2 flex cursor-pointer items-start gap-2 text-xs">
++                        <input type="checkbox" checked={applyTargetSlabsForward} onChange={(e) => setApplyTargetSlabsForward(e.target.checked)} className="mt-0.5 h-4 w-4 shrink-0 rounded border-gray-300" />
++                        <span className="text-gray-600">Apply forward (or to the whole batch if only this changed).</span>
++                      </label>
++                    </div>
++                  </div>
++                </div>
++              )}
++
+               {/* Row 2 — S.No. and Slab number. */}
+               <div>
+                 <span className={label}>S.No.</span>
+diff --git a/src/lib/robo/batchSplit.ts b/src/lib/robo/batchSplit.ts
+new file mode 100644
+index 0000000..5cdde02
+--- /dev/null
++++ b/src/lib/robo/batchSplit.ts
+@@ -0,0 +1,71 @@
++/**
++ * Splitting a mixed batch — the pure part.
++ *
++ * Batch Number, Design and Target Slabs are NOT per-slab fields: they live on the
++ * shared RoboBatchRecipe every slab in a batch points at. So "change the batch for
++ * a range of slabs" cannot write a column on those slabs — it re-parents them to a
++ * DIFFERENT recipe. That is how two runs recorded as one batch (e.g. 1372 Crystallo
++ * and 1404 Bellagio green merged together) get separated: pick the slab where the
++ * second batch starts, give it that batch's number/design, and this moves it and
++ * every following slab in the run into a recipe for that batch — created if none
++ * exists in the shift, joined if one does.
++ *
++ * Pure and alias-free so `node --test` can reach it. The route owns the Prisma
++ * find-or-create and the re-parenting updateMany; this owns the two decisions that
++ * must be exactly right: what the target batch's fields are, and whether the
++ * target is genuinely a DIFFERENT batch (a real split) or the same one.
++ */
++
++export interface BatchFields {
++  batchNo: string | null;
++  designName: string;
++  targetSlabs: number | null;
++}
++
++/** One requested change: the new value, and whether its "apply forward" box is
++ *  ticked. An unticked (or absent) field keeps the current batch's value. */
++export interface FieldChange<T> {
++  value: T;
++  apply: boolean;
++}
++
++export interface BatchChange {
++  batchNo?: FieldChange<string | null>;
++  designName?: FieldChange<string>;
++  targetSlabs?: FieldChange<number | null>;
++}
++
++/**
++ * The target batch's fields: each is the requested value when its box is ticked,
++ * otherwise the current batch's value. So splitting off "1404 / Bellagio green"
++ * while leaving Target Slabs unticked keeps the current batch's target on the new
++ * recipe, and ticking only Design corrects the design without touching the number.
++ */
++export function resolveTargetBatch(current: BatchFields, change: BatchChange): BatchFields {
++  return {
++    batchNo:     change.batchNo?.apply     ? change.batchNo.value     : current.batchNo,
++    designName:  change.designName?.apply  ? change.designName.value  : current.designName,
++    targetSlabs: change.targetSlabs?.apply ? change.targetSlabs.value : current.targetSlabs,
++  };
++}
++
++const normNo = (s: string | null | undefined) => (s ?? "").trim();
++const normDesign = (s: string | null | undefined) => (s ?? "").trim().toLowerCase();
++
++/**
++ * Whether two batches are the SAME batch — matched on number AND design together,
++ * so 1404/Bellagio and 1404/Crystallo are different batches (a reused number is
++ * not the same run). Design compares case-insensitively and trimmed, the number
++ * trimmed: how the same batch gets typed twice by hand. Target Slabs is NOT part
++ * of identity — it is an attribute of the batch, not what names it.
++ */
++export function sameBatchIdentity(a: BatchFields, b: BatchFields): boolean {
++  return normNo(a.batchNo) === normNo(b.batchNo) && normDesign(a.designName) === normDesign(b.designName);
++}
++
++/** A real split moves slabs to a DIFFERENT batch (number or design changed). When
++ *  identity is unchanged and only Target Slabs differs, nothing moves — that is a
++ *  plain attribute edit on the current batch, handled separately. */
++export function isReparent(current: BatchFields, target: BatchFields): boolean {
++  return !sameBatchIdentity(current, target);
++}
+diff --git a/tests/roboBatchSplit.test.ts b/tests/roboBatchSplit.test.ts
+new file mode 100644
+index 0000000..9e7cfa4
+--- /dev/null
++++ b/tests/roboBatchSplit.test.ts
+@@ -0,0 +1,48 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++
++import { resolveTargetBatch, sameBatchIdentity, isReparent, type BatchFields } from "../src/lib/robo/batchSplit.ts";
++
++const cur: BatchFields = { batchNo: "1372", designName: "Crystallo", targetSlabs: 80 };
++
++test("splitting off a new batch: ticked fields change, unticked keep the current", () => {
++  const target = resolveTargetBatch(cur, {
++    batchNo: { value: "1404", apply: true },
++    designName: { value: "Bellagio green", apply: true },
++    // Target Slabs box left unticked → keeps the current 80
++  });
++  assert.deepEqual(target, { batchNo: "1404", designName: "Bellagio green", targetSlabs: 80 });
++  assert.equal(isReparent(cur, target), true);
++});
++
++test("changing only the design forward keeps the same number", () => {
++  const target = resolveTargetBatch(cur, { designName: { value: "Bellagio green", apply: true } });
++  assert.deepEqual(target, { batchNo: "1372", designName: "Bellagio green", targetSlabs: 80 });
++  assert.equal(isReparent(cur, target), true); // design changed → different batch
++});
++
++test("nothing ticked → target equals current → not a re-parent", () => {
++  const target = resolveTargetBatch(cur, {});
++  assert.deepEqual(target, cur);
++  assert.equal(isReparent(cur, target), false);
++});
++
++test("only Target Slabs ticked → same batch identity, NOT a re-parent", () => {
++  const target = resolveTargetBatch(cur, { targetSlabs: { value: 120, apply: true } });
++  assert.equal(target.targetSlabs, 120);
++  assert.equal(sameBatchIdentity(cur, target), true);
++  assert.equal(isReparent(cur, target), false); // just an attribute edit, no slab moves
++});
++
++test("identity matches on number AND design, trimmed & case-insensitive on design", () => {
++  assert.equal(sameBatchIdentity(cur, { batchNo: " 1372 ", designName: "crystallo", targetSlabs: 999 }), true);
++  assert.equal(sameBatchIdentity(cur, { batchNo: "1372", designName: "Bellagio green", targetSlabs: 80 }), false); // same no, diff design
++  assert.equal(sameBatchIdentity(cur, { batchNo: "1404", designName: "Crystallo", targetSlabs: 80 }), false);      // diff no, same design
++});
++
++test("a re-parent is driven by the resolved target, ticked box included", () => {
++  const t1 = resolveTargetBatch(cur, { batchNo: { value: "1372", apply: true } }); // re-typing the same number
++  assert.equal(isReparent(cur, t1), false); // same identity → no move
++  const t2 = resolveTargetBatch(cur, { batchNo: { value: "1405", apply: true } });
++  assert.equal(isReparent(cur, t2), true);
++});
+-- 
+2.43.0
+

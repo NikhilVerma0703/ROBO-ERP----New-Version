@@ -1,0 +1,2334 @@
+From 49a9a1d9717af32f0ca586447eca5b73cfde1661 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 12:19:35 +0000
+Subject: [PATCH 1/2] robo(tests): read the three new source guards as LF, so a
+ Windows checkout does not pass them blind
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+CI caught it: tests/sourceLineEndings.test.ts, added to main after this round
+was started, requires every test that reads a source file as TEXT to normalise
+its line endings. The three guards added with the Shift and hourly-chart
+changes read the file as the checkout left it.
+
+It matters in one direction and silently: on a CRLF working copy every \n in a
+pattern misses, so an assert.match fails for a reason that has nothing to do
+with the code — and worse, an assert.doesNotMatch passes without ever looking.
+A guard that cannot fail is not a guard.
+
+Only the three readers change; the assertions are the same ones.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SPqDFZ7o6eq1utS7hzoQsF
+---
+ tests/roboHourlyDelays.test.ts    | 5 ++++-
+ tests/roboHourlyShifts.test.ts    | 5 ++++-
+ tests/roboProductionShift.test.ts | 5 ++++-
+ 3 files changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/tests/roboHourlyDelays.test.ts b/tests/roboHourlyDelays.test.ts
+index 99f9ed5..a8e4094 100644
+--- a/tests/roboHourlyDelays.test.ts
++++ b/tests/roboHourlyDelays.test.ts
+@@ -179,7 +179,10 @@ test("no delays given means every hour reads none, not undefined", () => {
+ 
+ /* ── Wiring guards ─────────────────────────────────────────────────── */
+ 
+-const src = (p: string) => readFileSync(new URL(`../src/${p}`, import.meta.url), "utf8");
++/** A source file as the repository holds it: LF, whatever the checkout did to it.
++ *  A CRLF working copy would make every \n in the patterns below miss, and a
++ *  doesNotMatch pass without looking — see tests/sourceLineEndings.test.ts. */
++const src = (p: string) => readFileSync(new URL(`../src/${p}`, import.meta.url), "utf8").replace(/\r\n/g, "\n");
+ 
+ test("the route reads this batch's delays through its slabs, and hands them to the series", () => {
+   const s = src("app/api/robo/reports/hourly/route.ts");
+diff --git a/tests/roboHourlyShifts.test.ts b/tests/roboHourlyShifts.test.ts
+index 1e3ebdb..a85d719 100644
+--- a/tests/roboHourlyShifts.test.ts
++++ b/tests/roboHourlyShifts.test.ts
+@@ -140,7 +140,10 @@ test("every block of the owner's run is named", () => {
+ 
+ /* ── Wiring guards ─────────────────────────────────────────────────── */
+ 
+-const src = (p: string) => readFileSync(new URL(`../src/${p}`, import.meta.url), "utf8");
++/** A source file as the repository holds it: LF, whatever the checkout did to it.
++ *  A CRLF working copy would make every \n in the patterns below miss, and a
++ *  doesNotMatch pass without looking — see tests/sourceLineEndings.test.ts. */
++const src = (p: string) => readFileSync(new URL(`../src/${p}`, import.meta.url), "utf8").replace(/\r\n/g, "\n");
+ 
+ test("the line is stroked with the gradient, and is still one line", () => {
+   const s = src("components/robo/reports/report-charts.tsx");
+diff --git a/tests/roboProductionShift.test.ts b/tests/roboProductionShift.test.ts
+index a367d8c..b571815 100644
+--- a/tests/roboProductionShift.test.ts
++++ b/tests/roboProductionShift.test.ts
+@@ -186,7 +186,10 @@ test("a 24-hour day splits A / B / C exactly where the plant says", () => {
+ 
+ /* ── Wiring guards ─────────────────────────────────────────────────── */
+ 
+-const src = (p: string) => readFileSync(new URL(`../src/${p}`, import.meta.url), "utf8");
++/** A source file as the repository holds it: LF, whatever the checkout did to it.
++ *  A CRLF working copy would make every \n in the patterns below miss, and a
++ *  doesNotMatch pass without looking — see tests/sourceLineEndings.test.ts. */
++const src = (p: string) => readFileSync(new URL(`../src/${p}`, import.meta.url), "utf8").replace(/\r\n/g, "\n");
+ 
+ test("both write paths validate the shift through parseShiftCode", () => {
+   // A raw `body.productionShift` reaching Prisma would let any string into a
+-- 
+2.43.0
+
+
+From cf60a59a1a8ca8bd3d8497787b731e8b0a90ef2a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 12:50:15 +0000
+Subject: [PATCH 2/2] attendance: one register for the Robo line and the
+ Chromia line
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The same operators work both lines — some days one, some days the other,
+some days both — so attendance is one register, not two that have to be
+kept in step. There is one set of tables, one handler and one screen; the
+two ERPs differ only in which door they come through.
+
+That is why nothing here synchronises anything. A day entered on the Robo
+tablet IS the row the Chromia tablet shows, because it is the row, and
+(date, operator) is UNIQUE in the database — so the same day saved from
+both ends is one record the second save corrects, never a duplicate.
+
+── THE DATA ──────────────────────────────────────────────────────────────
+Three tables, namespaced attendance_* and owned by neither module, the way
+consumable_* and fg_* are. Added to Neon out-of-band as usual, additively.
+Its block sits between LAB and ACCOUNTS, under its own banner, because the
+Accounts block has to stay at the foot of the schema and the Lab block ends
+at the next module banner.
+  • attendance_operator — the roster, shared. Deliberately NOT RoboOperator:
+    that one is Robo-named and dormant (seeded once, read nowhere, no UI),
+    and would read oddly as the source of Chromia's operators. Seeded with
+    the two the owner named.
+  • attendance_day — one row per operator per date, with the lines worked.
+    An operator on both lines has ONE In and ONE Out: they came to work once.
+  • attendance_leave — leave asked for, free of the attendance row, because
+    leave is asked in advance and may never become a day worked.
+
+── THE API ───────────────────────────────────────────────────────────────
+One handler, mounted twice: /api/robo/attendance/… behind roboGate and the
+middleware's /api/robo rule, /api/chromia/attendance/… behind chromiaGate
+and the /api/chromia rule. NOT a shared /api/attendance prefix, which would
+be wrong twice over — middleware has no rule for it, so every other
+department's login would reach it, while the ROBO and CHROMIA role caps
+(which allow only their own module's paths) would lock out the two logins
+that need it. Twenty near-identical route files was the other option, and
+navModel.ts already records what happens to hand-kept copies.
+
+── THE PAGE ──────────────────────────────────────────────────────────────
+Last section of both ERPs, one component rendered by both pages.
+  • Daily Attendance — a date, then the roster in alphabetical order with
+    Line, In-Time, Out-Time, Total Working Hours and Edit. The lines are a
+    two-way pick; the times are the entry form's own TimeInput, so 1625 is
+    16:25 and 1367 is refused; the hours appear as the Out is typed, from
+    the same function the server stores by, so the row does not change on
+    save. A night shift crossing midnight is eight hours, not minus sixteen,
+    and anything past sixteen hours reads as the typo it is. + Add Operator
+    adds, renames and removes; an operator with attendance on record is
+    taken off the roster rather than deleted, so their history survives.
+  • Request Leave — empty to start, as asked: date, S.No., operator, leave
+    time (from–to, or blank for a full day), reason, remarks. S.No. is the
+    row's position within its date, computed and never stored — the rule
+    Slab Records already follows, because a typed serial gets mistyped and
+    then two rows claim the same number.
+  • Downloads — record type, operator, and one period (a date, last week,
+    month-wise, a custom range, or all records), combining as asked: an
+    operator and a month gives that operator in that month. The results are
+    shown on the page first and the Excel is built from the SAME query, so
+    the sheet is the table you were just looking at.
+
+Responsive: checked rendered at 390, 810 and 1440px — no sideways scroll,
+44px tap targets on touch, both registers readable on a phone.
+
+Nav: last row of ROBO_ITEMS and CHROMIA_ITEMS, a section in each tablet's
+own arm (both are allowlists — a row left out is a page with no link), the
+Chromia swipe order and its route constant. nav-sidebar.json moves with it:
+four logins gain the row and nothing else differs, checked structurally
+rather than by eye before the fixture was rewritten.
+
+tests: the lines (one, both, order-independent, de-duplicated), worked
+hours including midnight and the long-shift cap, leave times, alphabetical
+names, every period mode (including February in a leap year and December
+rolling into January), the filters combining, a half-filled range staying
+open, the sheet's columns matching the register's, the file name, and
+guards that both ERPs run the one handler over the one upsert, that both
+pages render the one component, that the table and the sheet share a query,
+and that Attendance is last in both navigations. Mutation-checked.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SPqDFZ7o6eq1utS7hzoQsF
+---
+ prisma/schema.prisma                          |  78 +++
+ .../api/chromia/attendance/[...path]/route.ts |  30 +
+ .../api/robo/attendance/[...path]/route.ts    |  29 +
+ src/app/chromia/attendance/page.tsx           |  24 +
+ src/app/robo/attendance/page.tsx              |  25 +
+ .../attendance/AttendanceClient.tsx           | 621 ++++++++++++++++++
+ src/lib/attendance/attendance.ts              | 145 ++++
+ src/lib/attendance/filters.ts                 | 175 +++++
+ src/lib/attendance/server.ts                  | 418 ++++++++++++
+ src/lib/chromia/config/navigation.ts          |   2 +
+ src/lib/chromia/constants/app.ts              |   3 +
+ src/lib/navModel.ts                           |  11 +
+ tests/attendance.test.ts                      | 293 +++++++++
+ tests/fixtures/nav-sidebar.json               |  79 ++-
+ 14 files changed, 1929 insertions(+), 4 deletions(-)
+ create mode 100644 src/app/api/chromia/attendance/[...path]/route.ts
+ create mode 100644 src/app/api/robo/attendance/[...path]/route.ts
+ create mode 100644 src/app/chromia/attendance/page.tsx
+ create mode 100644 src/app/robo/attendance/page.tsx
+ create mode 100644 src/components/attendance/AttendanceClient.tsx
+ create mode 100644 src/lib/attendance/attendance.ts
+ create mode 100644 src/lib/attendance/filters.ts
+ create mode 100644 src/lib/attendance/server.ts
+ create mode 100644 tests/attendance.test.ts
+
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index 49ba2b4..171eed3 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -9351,6 +9351,84 @@ model LabInwardOutwardRecord {
+   @@map("lab_inward_outward_record")
+ }
+ 
++// ==========================================
++// ATTENDANCE MODULE — ONE register, shared by the Robo line and the Chromia line.
++//
++// The same operators work both lines, some days one, some days both, so there
++// is exactly one set of tables and both modules read and write it. That is the
++// whole of the "keep the two ERPs in step" requirement: there is nothing to
++// synchronise because there is only ever one copy. The unique key on
++// (date, operator) is what makes a duplicate impossible rather than unlikely —
++// whichever ERP the day is entered from, it is the same row.
++//
++// Namespaced attendance_* and owned by neither module, like consumable_* and
++// fg_*. Times are "HH:MM" and dates yyyy-mm-dd, the convention the shop-floor
++// modules already use, so nothing here needs a timezone.
++// ==========================================
++
++/// The plant's operators, as the attendance register knows them. Deliberately
++/// NOT RoboOperator: that one is Robo-named, dormant (seeded once, read
++/// nowhere, no UI) and would read oddly as the source of Chromia's roster.
++model AttendanceOperator {
++  id        String   @id @default(cuid())
++  /// Unique, so the same person cannot be added twice from two screens.
++  name      String   @unique
++  /// Kept out of the register without losing their history. A name that has
++  /// ever been used cannot be deleted (the foreign keys below restrict it);
++  /// it is deactivated instead.
++  isActive  Boolean  @default(true)
++  createdAt DateTime @default(now())
++  updatedAt DateTime @updatedAt
++
++  days   AttendanceDay[]
++  leaves AttendanceLeave[]
++
++  @@map("attendance_operator")
++}
++
++/// One operator's attendance for one date — ONE row however many lines they
++/// worked. An operator on both lines that day has one In and one Out, not two
++/// of each: they came to work once.
++model AttendanceDay {
++  id         String             @id @default(cuid())
++  /// yyyy-mm-dd.
++  date       String
++  operatorId String
++  operator   AttendanceOperator @relation(fields: [operatorId], references: [id])
++  /// The lines worked, comma-joined in a fixed order: "ROBO", "CHROMIA" or
++  /// "ROBO,CHROMIA" — see lib/attendance/lines.ts, which is the only thing
++  /// that writes or reads this. Empty when nobody has said yet.
++  lines      String             @default("")
++  inTime     String?
++  outTime    String?
++  createdAt  DateTime           @default(now())
++  updatedAt  DateTime           @updatedAt
++
++  @@unique([date, operatorId])
++  @@index([date])
++  @@map("attendance_day")
++}
++
++/// A leave request, typed by the operator. Free of the attendance row on
++/// purpose: leave is asked for in advance and may never become a day worked.
++model AttendanceLeave {
++  id         String             @id @default(cuid())
++  /// yyyy-mm-dd — the date the leave is for.
++  date       String
++  operatorId String
++  operator   AttendanceOperator @relation(fields: [operatorId], references: [id])
++  /// The hours away, "HH:MM" each. Both empty reads as the whole day.
++  fromTime   String?
++  toTime     String?
++  reason     String             @default("")
++  remarks    String?
++  createdAt  DateTime           @default(now())
++  updatedAt  DateTime           @updatedAt
++
++  @@index([date])
++  @@map("attendance_leave")
++}
++
+ // ============================================================================
+ // ACCOUNTS MODULE — the accounts-receivable register and Payment Tracking,
+ // ported from the standalone "Accounts Automation" app and mounted at
+diff --git a/src/app/api/chromia/attendance/[...path]/route.ts b/src/app/api/chromia/attendance/[...path]/route.ts
+new file mode 100644
+index 0000000..7050ef7
+--- /dev/null
++++ b/src/app/api/chromia/attendance/[...path]/route.ts
+@@ -0,0 +1,30 @@
++import type { NextRequest } from 'next/server';
++
++import { attendanceApi } from '@/lib/attendance/server';
++import { chromiaGate } from '@/lib/chromia/access';
++
++export const dynamic = 'force-dynamic';
++
++/**
++ * /api/chromia/attendance/… — the Chromia line's door onto the ONE attendance
++ * register, the twin of /api/robo/attendance/…. Same handler, same tables: an
++ * operator's day entered on the Robo tablet IS the row the Chromia tablet
++ * shows, because it is the same row.
++ *
++ * Middleware already stops anyone without the CHROMIA role or an admin rank at
++ * the path prefix; chromiaGate is the second layer, the way the module's other
++ * API routes do it, because a handler that trusts middleware alone is one
++ * matcher edit away from being public.
++ */
++async function handle(req: NextRequest, ctx: { params: Promise<{ path?: string[] }> }) {
++  const gate = await chromiaGate();
++  if (!gate.ok) return new Response(gate.status === 401 ? 'Unauthorized' : 'Forbidden', { status: gate.status });
++  const { path } = await ctx.params;
++  return attendanceApi(req, path ?? []);
++}
++
++export const GET = handle;
++export const POST = handle;
++export const PUT = handle;
++export const PATCH = handle;
++export const DELETE = handle;
+diff --git a/src/app/api/robo/attendance/[...path]/route.ts b/src/app/api/robo/attendance/[...path]/route.ts
+new file mode 100644
+index 0000000..0367752
+--- /dev/null
++++ b/src/app/api/robo/attendance/[...path]/route.ts
+@@ -0,0 +1,29 @@
++import type { NextRequest } from "next/server";
++import { attendanceApi } from "@/lib/attendance/server";
++import { roboGate } from "@/lib/rbac";
++
++export const dynamic = "force-dynamic";
++
++/**
++ * /api/robo/attendance/… — the Robo line's door onto the ONE attendance
++ * register. Chromia has its own at /api/chromia/attendance/…, and both reach
++ * the same handler over the same tables, so the two ERPs cannot disagree:
++ * there is no copy to keep in step.
++ *
++ * Here because of the gate, not the data. The middleware rule for /api/robo
++ * and roboGate below are what keep this to the Robo login and admins; a shared
++ * /api/attendance prefix would have no rule at all, and the ROBO role's own
++ * cap would then lock it out of the thing it needs. See lib/attendance/server.ts.
++ */
++async function handle(req: NextRequest, ctx: { params: Promise<{ path?: string[] }> }) {
++  const refused = await roboGate();
++  if (refused) return refused;
++  const { path } = await ctx.params;
++  return attendanceApi(req, path ?? []);
++}
++
++export const GET = handle;
++export const POST = handle;
++export const PUT = handle;
++export const PATCH = handle;
++export const DELETE = handle;
+diff --git a/src/app/chromia/attendance/page.tsx b/src/app/chromia/attendance/page.tsx
+new file mode 100644
+index 0000000..963ba57
+--- /dev/null
++++ b/src/app/chromia/attendance/page.tsx
+@@ -0,0 +1,24 @@
++import type { Metadata } from 'next';
++
++import { AttendanceClient } from '@/components/attendance/AttendanceClient';
++import { PageHeader } from '@/components/chromia/ui';
++
++export const metadata: Metadata = { title: 'Attendance' };
++export const dynamic = 'force-dynamic';
++
++/**
++ * Chromia → Attendance. The twin of /robo/attendance: one component over one
++ * set of tables, so the two lines read the same register and an edit on either
++ * is the edit. The module layout supplies the Shell and chromiaGate.
++ */
++export default function ChromiaAttendancePage() {
++  return (
++    <div className="mx-auto max-w-6xl">
++      <PageHeader
++        title="Attendance"
++        description="One register for both lines — the same operators, the same days, whichever ERP it is entered from."
++      />
++      <AttendanceClient api="/api/chromia/attendance" />
++    </div>
++  );
++}
+diff --git a/src/app/robo/attendance/page.tsx b/src/app/robo/attendance/page.tsx
+new file mode 100644
+index 0000000..590fc89
+--- /dev/null
++++ b/src/app/robo/attendance/page.tsx
+@@ -0,0 +1,25 @@
++import type { Metadata } from "next";
++import { Shell } from "@/components/Shell";
++import { AttendanceClient } from "@/components/attendance/AttendanceClient";
++
++export const dynamic = "force-dynamic";
++export const metadata: Metadata = { title: "Attendance | Pacific ERP" };
++
++/**
++ * Robo → Attendance. The same register the Chromia side shows, over the same
++ * tables; only the API door differs, because only the gate does. See
++ * lib/attendance/server.ts.
++ */
++export default function RoboAttendancePage() {
++  return (
++    <Shell>
++      <div className="mb-6">
++        <h1 className="text-2xl font-semibold tracking-tight text-gray-900">Attendance</h1>
++        <p className="mt-1 max-w-2xl text-sm text-gray-500">
++          One register for both lines — the same operators, the same days, whichever ERP it is entered from.
++        </p>
++      </div>
++      <AttendanceClient api="/api/robo/attendance" />
++    </Shell>
++  );
++}
+diff --git a/src/components/attendance/AttendanceClient.tsx b/src/components/attendance/AttendanceClient.tsx
+new file mode 100644
+index 0000000..11d9c12
+--- /dev/null
++++ b/src/components/attendance/AttendanceClient.tsx
+@@ -0,0 +1,621 @@
++"use client";
++/**
++ * Attendance — the SAME screen in both ERPs.
++ *
++ * One component, rendered by /robo/attendance and /chromia/attendance, talking
++ * to one set of tables through whichever of the two API doors its module owns
++ * (the `api` prop). That is the whole of "keep the two in step": there is no
++ * second screen to keep matching and no second copy of the data to reconcile.
++ * An operator's day entered on the Robo tablet is the row the Chromia tablet
++ * shows, because it is the row.
++ *
++ * Three registers, in the order the shop floor fills them in: the day's
++ * attendance, leave asked for, and the downloads that read both back.
++ */
++import { useCallback, useEffect, useMemo, useState } from "react";
++import { Card } from "@/components/ui";
++import { TimeInput } from "@/components/robo/TimeInput";
++import { LINES, LINE_LABELS, linesLabel, parseLines, workedLabel, type LineCode } from "@/lib/attendance/attendance";
++import {
++  PERIOD_LABELS, PERIOD_MODES, RECORD_TYPES, RECORD_TYPE_LABELS,
++  type PeriodMode, type RecordType,
++} from "@/lib/attendance/filters";
++
++/* The register's own styling, the same shapes the Robo entry form uses so a
++   tablet operator meets one set of controls across the ERP. */
++const inp = "w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm shadow-sm transition focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20 disabled:bg-gray-50 disabled:text-gray-400";
++const label = "mb-1 block text-xs font-medium text-gray-600";
++const btnPrimary = "rounded-lg bg-brand px-4 py-2 text-sm font-medium text-white transition hover:bg-brand/90 disabled:opacity-60 [@media_screen_and_(pointer:coarse)]:min-h-[44px]";
++const btnGhost = "rounded-lg border border-gray-300 px-3 py-1.5 text-sm font-medium text-gray-700 transition hover:bg-gray-50 [@media_screen_and_(pointer:coarse)]:min-h-[44px]";
++const th = "whitespace-nowrap px-3 py-2.5 text-left text-xs font-semibold uppercase tracking-wide text-gray-500";
++const td = "px-3 py-2.5 align-top text-sm text-gray-700";
++
++/** Today on the device's own calendar — the register opens on today. */
++const todayStr = () => {
++  const d = new Date();
++  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
++};
++const thisMonth = () => todayStr().slice(0, 7);
++
++interface DayRow {
++  operatorId: string;
++  operatorName: string;
++  isActive: boolean;
++  lines: string;
++  linesLabel: string;
++  inTime: string;
++  outTime: string;
++  worked: string;
++  saved: boolean;
++}
++interface Operator { id: string; name: string; isActive: boolean }
++interface LeaveRow {
++  id: string; date: string; serial: number; operatorId: string; operatorName: string;
++  fromTime: string; toTime: string; leaveTime: string; reason: string; remarks: string;
++}
++
++/** A draft of one attendance row, while it is being edited. */
++interface Draft { lines: LineCode[]; inTime: string; outTime: string }
++
++export function AttendanceClient({ api }: {
++  /** This module's door onto the shared register: "/api/robo/attendance" or
++   *  "/api/chromia/attendance". Only the gate differs; the data is one. */
++  api: string;
++}) {
++  const [date, setDate] = useState(todayStr);
++  const [rows, setRows] = useState<DayRow[]>([]);
++  const [operators, setOperators] = useState<Operator[]>([]);
++  const [leave, setLeave] = useState<LeaveRow[]>([]);
++  const [loading, setLoading] = useState(true);
++  const [error, setError] = useState("");
++  const [notice, setNotice] = useState("");
++
++  const [editing, setEditing] = useState<string | null>(null);
++  const [draft, setDraft] = useState<Draft>({ lines: [], inTime: "", outTime: "" });
++  const [saving, setSaving] = useState(false);
++
++  const call = useCallback(async (path: string, init?: RequestInit) => {
++    const res = await fetch(`${api}/${path}`, { cache: "no-store", ...init });
++    if (!res.ok) {
++      const body = await res.json().catch(() => null);
++      throw new Error((body as { error?: string })?.error || "That did not save. Please try again.");
++    }
++    return res.json();
++  }, [api]);
++
++  const loadDay = useCallback(async (d: string) => {
++    setLoading(true);
++    setError("");
++    try {
++      const data = await call(`day?date=${encodeURIComponent(d)}`);
++      setRows((data as { rows: DayRow[] }).rows ?? []);
++    } catch (e) {
++      setError((e as Error).message);
++    } finally {
++      setLoading(false);
++    }
++  }, [call]);
++
++  const loadOperators = useCallback(async () => {
++    try { setOperators(await call("operators")); } catch { /* the register still reads */ }
++  }, [call]);
++  const loadLeave = useCallback(async () => {
++    try { setLeave(await call("leave")); } catch { /* ditto */ }
++  }, [call]);
++
++  useEffect(() => { void loadDay(date); }, [date, loadDay]);
++  useEffect(() => { void loadOperators(); void loadLeave(); }, [loadOperators, loadLeave]);
++
++  const startEdit = (r: DayRow) => {
++    setEditing(r.operatorId);
++    setDraft({ lines: parseLines(r.lines), inTime: r.inTime, outTime: r.outTime });
++    setError("");
++  };
++
++  const toggleLine = (code: LineCode) =>
++    setDraft((d) => ({ ...d, lines: d.lines.includes(code) ? d.lines.filter((l) => l !== code) : [...d.lines, code] }));
++
++  const saveRow = async (operatorId: string) => {
++    setSaving(true);
++    setError("");
++    try {
++      const saved = await call("day", {
++        method: "PUT",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ date, operatorId, ...draft }),
++      });
++      setRows((rs) => rs.map((r) => (r.operatorId === operatorId ? { ...r, ...(saved as Partial<DayRow>) } : r)));
++      setEditing(null);
++    } catch (e) {
++      setError((e as Error).message);
++    } finally {
++      setSaving(false);
++    }
++  };
++
++  /* Worked hours as the operator types the Out — the same figure the server
++     will store, from the same function, so the row never changes on save. */
++  const draftWorked = useMemo(() => workedLabel(draft.inTime, draft.outTime), [draft.inTime, draft.outTime]);
++
++  return (
++    <div className="space-y-10">
++      {error && <p className="rounded-lg bg-red-50 px-4 py-2.5 text-sm font-medium text-red-700">{error}</p>}
++      {notice && <p className="rounded-lg bg-emerald-50 px-4 py-2.5 text-sm font-medium text-emerald-800">{notice}</p>}
++
++      <DailyAttendance
++        date={date} setDate={setDate} rows={rows} loading={loading}
++        editing={editing} draft={draft} draftWorked={draftWorked} saving={saving}
++        startEdit={startEdit} cancel={() => setEditing(null)} toggleLine={toggleLine}
++        setDraft={setDraft} saveRow={saveRow}
++        operators={operators}
++        onOperatorsChanged={async (msg) => { setNotice(msg); await loadOperators(); await loadDay(date); }}
++        call={call} setError={setError}
++      />
++
++      <RequestLeave
++        rows={leave} operators={operators} call={call} setError={setError}
++        onChanged={(next) => setLeave(next)}
++      />
++
++      <Downloads api={api} operators={operators} />
++    </div>
++  );
++}
++
++/* ── 1. Daily Attendance ───────────────────────────────────────────── */
++
++function DailyAttendance(props: {
++  date: string; setDate: (d: string) => void; rows: DayRow[]; loading: boolean;
++  editing: string | null; draft: Draft; draftWorked: string; saving: boolean;
++  startEdit: (r: DayRow) => void; cancel: () => void; toggleLine: (c: LineCode) => void;
++  setDraft: (f: (d: Draft) => Draft) => void; saveRow: (id: string) => void;
++  operators: Operator[];
++  onOperatorsChanged: (message: string) => void | Promise<void>;
++  call: (path: string, init?: RequestInit) => Promise<unknown>;
++  setError: (m: string) => void;
++}) {
++  const { date, setDate, rows, loading, editing, draft, draftWorked, saving } = props;
++  const [managing, setManaging] = useState(false);
++
++  return (
++    <section>
++      <SectionHead
++        title="Daily Attendance"
++        subtitle="One line per operator for the day. An operator on both lines has one In and one Out — they came to work once."
++      />
++
++      <Card>
++        <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
++          <div className="w-full sm:w-56">
++            <span className={label}>Date</span>
++            <input type="date" value={date} onChange={(e) => setDate(e.target.value)} className={inp} />
++          </div>
++          <button type="button" onClick={() => setManaging((v) => !v)} className={btnGhost}>
++            {managing ? "Done" : "+ Add Operator"}
++          </button>
++        </div>
++
++        {managing && (
++          <OperatorManager
++            operators={props.operators} call={props.call} setError={props.setError}
++            onChanged={props.onOperatorsChanged}
++          />
++        )}
++
++        <div className="overflow-x-auto">
++          <table className="w-full min-w-[46rem]">
++            <thead className="border-b border-gray-200 bg-slate-50">
++              <tr>
++                {["Operator Name", "Line", "In-Time", "Out-Time", "Total Working Hours", "Action"].map((h, i, a) => (
++                  <th key={h} className={`${th} ${i === a.length - 1 ? "text-right" : ""}`}>{h}</th>
++                ))}
++              </tr>
++            </thead>
++            <tbody>
++              {loading && (
++                <tr><td colSpan={6} className="px-3 py-10 text-center text-sm text-gray-400">Loading…</td></tr>
++              )}
++              {!loading && rows.length === 0 && (
++                <tr><td colSpan={6} className="px-3 py-10 text-center text-sm text-gray-400">
++                  No operators yet — add one above.
++                </td></tr>
++              )}
++              {!loading && rows.map((r) => {
++                const isEditing = editing === r.operatorId;
++                return (
++                  <tr key={r.operatorId} className="border-b border-gray-50 align-top">
++                    <td className={`${td} font-medium text-gray-900`}>
++                      {r.operatorName}
++                      {!r.isActive && <span className="ml-2 text-xs font-normal text-gray-400">(off the roster)</span>}
++                    </td>
++                    <td className={td}>
++                      {isEditing ? (
++                        <div className="flex flex-wrap gap-2">
++                          {LINES.map((code) => (
++                            <label key={code}
++                              className={`flex cursor-pointer items-center gap-2 rounded-lg border px-3 py-1.5 text-sm [@media_screen_and_(pointer:coarse)]:min-h-[44px] ${
++                                draft.lines.includes(code) ? "border-brand bg-brand/5 font-medium text-brand" : "border-gray-300 text-gray-600"}`}>
++                              <input type="checkbox" checked={draft.lines.includes(code)}
++                                onChange={() => props.toggleLine(code)} className="h-4 w-4 rounded border-gray-300" />
++                              {LINE_LABELS[code]}
++                            </label>
++                          ))}
++                        </div>
++                      ) : linesLabel(r.lines)}
++                    </td>
++                    <td className={td}>
++                      {isEditing
++                        ? <TimeInput value={draft.inTime} onChange={(v) => props.setDraft((d) => ({ ...d, inTime: v }))} className={`${inp} w-24`} />
++                        : (r.inTime || "-")}
++                    </td>
++                    <td className={td}>
++                      {isEditing
++                        ? <TimeInput value={draft.outTime} onChange={(v) => props.setDraft((d) => ({ ...d, outTime: v }))} className={`${inp} w-24`} />
++                        : (r.outTime || "-")}
++                    </td>
++                    <td className={`${td} font-medium text-gray-900`}>{isEditing ? draftWorked : r.worked}</td>
++                    <td className={`${td} text-right`}>
++                      {isEditing ? (
++                        <div className="flex justify-end gap-2 whitespace-nowrap">
++                          <button type="button" className={btnGhost} onClick={props.cancel} disabled={saving}>Cancel</button>
++                          <button type="button" className={btnPrimary} onClick={() => props.saveRow(r.operatorId)} disabled={saving}>
++                            {saving ? "Saving…" : "Save"}
++                          </button>
++                        </div>
++                      ) : (
++                        <button type="button" className={btnGhost} onClick={() => props.startEdit(r)}>
++                          {r.saved ? "Edit" : "Enter"}
++                        </button>
++                      )}
++                    </td>
++                  </tr>
++                );
++              })}
++            </tbody>
++          </table>
++        </div>
++      </Card>
++    </section>
++  );
++}
++
++/** Add, rename and remove operators. The list is shared, so a name added here
++ *  is on the other ERP's register too, on its next read. */
++function OperatorManager(props: {
++  operators: Operator[];
++  call: (path: string, init?: RequestInit) => Promise<unknown>;
++  setError: (m: string) => void;
++  onChanged: (message: string) => void | Promise<void>;
++}) {
++  const [adding, setAdding] = useState("");
++  const [busy, setBusy] = useState(false);
++  const [renaming, setRenaming] = useState<string | null>(null);
++  const [renameTo, setRenameTo] = useState("");
++
++  const run = async (fn: () => Promise<unknown>, message: string) => {
++    setBusy(true);
++    props.setError("");
++    try {
++      const out = await fn();
++      const d = out as { deactivated?: boolean; name?: string };
++      await props.onChanged(d?.deactivated
++        ? `${d.name} has attendance on record, so they have been taken off the roster rather than deleted — their history is kept.`
++        : message);
++    } catch (e) {
++      props.setError((e as Error).message);
++    } finally {
++      setBusy(false);
++    }
++  };
++
++  return (
++    <div className="mb-5 rounded-xl border border-gray-200 bg-slate-50/60 p-4">
++      <p className="mb-3 text-xs font-semibold uppercase tracking-wide text-gray-500">Operators</p>
++      <div className="mb-3 flex flex-wrap gap-2">
++        <input value={adding} onChange={(e) => setAdding(e.target.value)} placeholder="New operator's name"
++          className={`${inp} sm:max-w-xs`} />
++        <button type="button" className={btnPrimary} disabled={busy || !adding.trim()}
++          onClick={() => run(async () => {
++            const r = await props.call("operators", {
++              method: "POST", headers: { "Content-Type": "application/json" },
++              body: JSON.stringify({ name: adding }),
++            });
++            setAdding("");
++            return r;
++          }, `${adding.trim()} added.`)}>Add</button>
++      </div>
++      <ul className="space-y-1.5">
++        {props.operators.map((o) => (
++          <li key={o.id} className="flex flex-wrap items-center gap-2 text-sm">
++            {renaming === o.id ? (
++              <>
++                <input value={renameTo} onChange={(e) => setRenameTo(e.target.value)} className={`${inp} sm:max-w-xs`} />
++                <button type="button" className={btnPrimary} disabled={busy}
++                  onClick={() => run(async () => {
++                    const r = await props.call(`operators/${o.id}`, {
++                      method: "PATCH", headers: { "Content-Type": "application/json" },
++                      body: JSON.stringify({ name: renameTo }),
++                    });
++                    setRenaming(null);
++                    return r;
++                  }, "Name changed.")}>Save</button>
++                <button type="button" className={btnGhost} onClick={() => setRenaming(null)}>Cancel</button>
++              </>
++            ) : (
++              <>
++                <span className={`flex-1 ${o.isActive ? "text-gray-800" : "text-gray-400"}`}>
++                  {o.name}{!o.isActive && " (off the roster)"}
++                </span>
++                <button type="button" className={btnGhost} onClick={() => { setRenaming(o.id); setRenameTo(o.name); }}>Rename</button>
++                {o.isActive ? (
++                  <button type="button" className={btnGhost} disabled={busy}
++                    onClick={() => run(() => props.call(`operators/${o.id}`, { method: "DELETE" }), `${o.name} removed.`)}>Remove</button>
++                ) : (
++                  <button type="button" className={btnGhost} disabled={busy}
++                    onClick={() => run(() => props.call(`operators/${o.id}`, {
++                      method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ isActive: true }),
++                    }), `${o.name} is back on the roster.`)}>Restore</button>
++                )}
++              </>
++            )}
++          </li>
++        ))}
++      </ul>
++    </div>
++  );
++}
++
++/* ── 2. Request Leave ──────────────────────────────────────────────── */
++
++const emptyLeave = () => ({ date: todayStr(), operatorId: "", fromTime: "", toTime: "", reason: "", remarks: "" });
++
++function RequestLeave(props: {
++  rows: LeaveRow[]; operators: Operator[];
++  call: (path: string, init?: RequestInit) => Promise<unknown>;
++  setError: (m: string) => void;
++  onChanged: (rows: LeaveRow[]) => void;
++}) {
++  const [form, setForm] = useState(emptyLeave);
++  const [editingId, setEditingId] = useState<string | null>(null);
++  const [busy, setBusy] = useState(false);
++  const active = props.operators.filter((o) => o.isActive || o.id === form.operatorId);
++
++  const submit = async () => {
++    setBusy(true);
++    props.setError("");
++    try {
++      const next = await props.call(editingId ? `leave/${editingId}` : "leave", {
++        method: editingId ? "PATCH" : "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify(form),
++      });
++      props.onChanged(next as LeaveRow[]);
++      setForm(emptyLeave());
++      setEditingId(null);
++    } catch (e) {
++      props.setError((e as Error).message);
++    } finally {
++      setBusy(false);
++    }
++  };
++
++  const remove = async (id: string) => {
++    setBusy(true);
++    try { props.onChanged(await props.call(`leave/${id}`, { method: "DELETE" }) as LeaveRow[]); }
++    catch (e) { props.setError((e as Error).message); }
++    finally { setBusy(false); }
++  };
++
++  return (
++    <section>
++      <SectionHead title="Request Leave" subtitle="Leave asked for, typed by the operator. Shared with the other line's register." />
++      <Card>
++        <div className="mb-5 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-6">
++          <div>
++            <span className={label}>Date</span>
++            <input type="date" value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} className={inp} />
++          </div>
++          <div className="lg:col-span-2">
++            <span className={label}>Operator Name</span>
++            <select value={form.operatorId} onChange={(e) => setForm({ ...form, operatorId: e.target.value })} className={inp}>
++              <option value="">Select operator</option>
++              {active.map((o) => <option key={o.id} value={o.id}>{o.name}</option>)}
++            </select>
++          </div>
++          <div>
++            <span className={label}>Leave Time</span>
++            <div className="flex items-center gap-1.5">
++              <TimeInput value={form.fromTime} onChange={(v) => setForm({ ...form, fromTime: v })} className={`${inp} px-2`} />
++              <span className="text-sm text-gray-400">to</span>
++              <TimeInput value={form.toTime} onChange={(v) => setForm({ ...form, toTime: v })} className={`${inp} px-2`} />
++            </div>
++            <p className="mt-1 text-xs text-gray-400">Leave both blank for a full day.</p>
++          </div>
++          <div>
++            <span className={label}>Leave Reason</span>
++            <input value={form.reason} onChange={(e) => setForm({ ...form, reason: e.target.value })} className={inp} />
++          </div>
++          <div>
++            <span className={label}>Remarks</span>
++            <input value={form.remarks} onChange={(e) => setForm({ ...form, remarks: e.target.value })} className={inp} />
++          </div>
++        </div>
++        <div className="mb-5 flex gap-2">
++          <button type="button" className={btnPrimary} disabled={busy || !form.operatorId} onClick={submit}>
++            {editingId ? "Save changes" : "Add leave record"}
++          </button>
++          {editingId && (
++            <button type="button" className={btnGhost} onClick={() => { setEditingId(null); setForm(emptyLeave()); }}>Cancel</button>
++          )}
++        </div>
++
++        <div className="overflow-x-auto">
++          <table className="w-full min-w-[48rem]">
++            <thead className="border-b border-gray-200 bg-slate-50">
++              <tr>
++                {["Date", "S.No.", "Operator Name", "Leave Time", "Leave Reason", "Remarks", "Action"].map((h, i, a) => (
++                  <th key={h} className={`${th} ${i === a.length - 1 ? "text-right" : ""}`}>{h}</th>
++                ))}
++              </tr>
++            </thead>
++            <tbody>
++              {props.rows.length === 0 ? (
++                <tr><td colSpan={7} className="px-3 py-10 text-center text-sm text-gray-400">No leave records yet.</td></tr>
++              ) : props.rows.map((r) => (
++                <tr key={r.id} className="border-b border-gray-50">
++                  <td className={`${td} whitespace-nowrap`}>{r.date}</td>
++                  <td className={td}>{r.serial}</td>
++                  <td className={`${td} font-medium text-gray-900`}>{r.operatorName}</td>
++                  <td className={`${td} whitespace-nowrap`}>{r.leaveTime}</td>
++                  <td className={td}>{r.reason || "-"}</td>
++                  <td className={td}>{r.remarks || "-"}</td>
++                  <td className={`${td} text-right`}>
++                    <div className="flex justify-end gap-2 whitespace-nowrap">
++                      <button type="button" className={btnGhost} onClick={() => {
++                        setEditingId(r.id);
++                        setForm({ date: r.date, operatorId: r.operatorId, fromTime: r.fromTime, toTime: r.toTime, reason: r.reason, remarks: r.remarks });
++                      }}>Edit</button>
++                      <button type="button" className={btnGhost} disabled={busy} onClick={() => remove(r.id)}>Remove</button>
++                    </div>
++                  </td>
++                </tr>
++              ))}
++            </tbody>
++          </table>
++        </div>
++      </Card>
++    </section>
++  );
++}
++
++/* ── 3. Downloads ──────────────────────────────────────────────────── */
++
++function Downloads({ api, operators }: { api: string; operators: Operator[] }) {
++  const [type, setType] = useState<RecordType>("ATTENDANCE");
++  const [operatorId, setOperatorId] = useState("");
++  const [period, setPeriod] = useState<PeriodMode>("DATE");
++  const [date, setDate] = useState(todayStr);
++  const [from, setFrom] = useState(todayStr);
++  const [to, setTo] = useState(todayStr);
++  const [month, setMonth] = useState(thisMonth);
++  const [result, setResult] = useState<{ columns: string[]; rows: Record<string, string | number>[]; description: string } | null>(null);
++  const [busy, setBusy] = useState(false);
++  const [error, setError] = useState("");
++
++  /* The filters, as the query string both the table and the sheet are asked
++     for. One function, so the download is exactly the table on screen. */
++  const query = useMemo(() => {
++    const q = new URLSearchParams({ type, period });
++    if (operatorId) q.set("operatorId", operatorId);
++    if (period === "DATE") q.set("date", date);
++    if (period === "RANGE") { q.set("from", from); q.set("to", to); }
++    if (period === "MONTH") q.set("month", month);
++    return q.toString();
++  }, [type, operatorId, period, date, from, to, month]);
++
++  const show = async () => {
++    setBusy(true);
++    setError("");
++    try {
++      const res = await fetch(`${api}/records?${query}`, { cache: "no-store" });
++      if (!res.ok) throw new Error("Could not read those records.");
++      setResult(await res.json());
++    } catch (e) {
++      setError((e as Error).message);
++    } finally {
++      setBusy(false);
++    }
++  };
++
++  return (
++    <section>
++      <SectionHead title="Downloads" subtitle="Filter the register, read it here, then take the same rows as a spreadsheet." />
++      <Card>
++        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
++          <div>
++            <span className={label}>Record Type</span>
++            <select value={type} onChange={(e) => setType(e.target.value as RecordType)} className={inp}>
++              {RECORD_TYPES.map((t) => <option key={t} value={t}>{RECORD_TYPE_LABELS[t]}</option>)}
++            </select>
++          </div>
++          <div>
++            <span className={label}>Operator Name</span>
++            <select value={operatorId} onChange={(e) => setOperatorId(e.target.value)} className={inp}>
++              <option value="">All operators</option>
++              {operators.map((o) => <option key={o.id} value={o.id}>{o.name}</option>)}
++            </select>
++          </div>
++          <div>
++            <span className={label}>Period</span>
++            <select value={period} onChange={(e) => setPeriod(e.target.value as PeriodMode)} className={inp}>
++              {PERIOD_MODES.map((m) => <option key={m} value={m}>{PERIOD_LABELS[m]}</option>)}
++            </select>
++          </div>
++          {period === "DATE" && (
++            <div><span className={label}>Date</span>
++              <input type="date" value={date} onChange={(e) => setDate(e.target.value)} className={inp} /></div>
++          )}
++          {period === "MONTH" && (
++            <div><span className={label}>Month</span>
++              <input type="month" value={month} onChange={(e) => setMonth(e.target.value)} className={inp} /></div>
++          )}
++          {period === "RANGE" && (
++            <>
++              <div><span className={label}>From</span>
++                <input type="date" value={from} onChange={(e) => setFrom(e.target.value)} className={inp} /></div>
++              <div><span className={label}>To</span>
++                <input type="date" value={to} onChange={(e) => setTo(e.target.value)} className={inp} /></div>
++            </>
++          )}
++        </div>
++
++        <div className="mt-4 flex flex-wrap items-center gap-2">
++          <button type="button" className={btnPrimary} onClick={show} disabled={busy}>
++            {busy ? "Reading…" : "Show results"}
++          </button>
++          <a href={`${api}/export?${query}`} className={btnGhost}>📥 Download Excel</a>
++        </div>
++        {error && <p className="mt-3 text-sm font-medium text-red-700">{error}</p>}
++
++        {result && (
++          <div className="mt-6">
++            <p className="mb-2 text-sm text-gray-500">
++              <span className="font-medium text-gray-800">{result.rows.length}</span>
++              {result.rows.length === 1 ? " record" : " records"} · {result.description}
++            </p>
++            <div className="overflow-x-auto">
++              <table className="w-full min-w-[44rem]">
++                <thead className="border-b border-gray-200 bg-slate-50">
++                  <tr>{result.columns.map((c) => <th key={c} className={th}>{c}</th>)}</tr>
++                </thead>
++                <tbody>
++                  {result.rows.length === 0 ? (
++                    <tr><td colSpan={result.columns.length} className="px-3 py-10 text-center text-sm text-gray-400">
++                      Nothing matches those filters.
++                    </td></tr>
++                  ) : result.rows.map((r, i) => (
++                    <tr key={i} className="border-b border-gray-50">
++                      {result.columns.map((c) => <td key={c} className={td}>{String(r[c] ?? "-")}</td>)}
++                    </tr>
++                  ))}
++                </tbody>
++              </table>
++            </div>
++          </div>
++        )}
++      </Card>
++    </section>
++  );
++}
++
++function SectionHead({ title, subtitle }: { title: string; subtitle: string }) {
++  return (
++    <div className="mb-4 flex items-start gap-3">
++      <span className="mt-1 h-7 w-1.5 shrink-0 rounded-full bg-brand" />
++      <div>
++        <h2 className="text-xl font-bold tracking-tight text-gray-900">{title}</h2>
++        <p className="mt-0.5 max-w-2xl text-sm text-gray-500">{subtitle}</p>
++      </div>
++    </div>
++  );
++}
+diff --git a/src/lib/attendance/attendance.ts b/src/lib/attendance/attendance.ts
+new file mode 100644
+index 0000000..31c9ba3
+--- /dev/null
++++ b/src/lib/attendance/attendance.ts
+@@ -0,0 +1,145 @@
++/**
++ * The Attendance register's own rules — the half that is pure arithmetic and
++ * text, so `node --test` can reach it and the two ERPs cannot drift apart by
++ * each deciding something for itself.
++ *
++ * Pure and alias-free, like lib/robo/productionDate.ts.
++ *
++ * ── ONE REGISTER, TWO ERPs ────────────────────────────────────────────────
++ * Robo and Chromia share the operators, so they share the register: the same
++ * three attendance_* tables, read and written by both. Nothing is copied
++ * between them and nothing has to be kept in step, because there is only ever
++ * one row — (date, operator) is unique in the database, so the same day
++ * entered from either screen is the same record, and an edit on one screen IS
++ * the edit on the other.
++ *
++ * Times are "HH:MM" and dates yyyy-mm-dd, the convention the shop floor
++ * already uses. No Date object, no timezone, anywhere in this file.
++ */
++
++/* ── The two lines ─────────────────────────────────────────────────── */
++
++/** Stored codes, in the order they are offered and shown. */
++export const LINES = ["ROBO", "CHROMIA"] as const;
++export type LineCode = (typeof LINES)[number];
++
++export const LINE_LABELS: Record<LineCode, string> = {
++  ROBO: "Robo Line",
++  CHROMIA: "Chromia Line",
++};
++
++/**
++ * The lines of a stored row: comma-joined codes, always in LINES order and
++ * never repeated, so "CHROMIA,ROBO" and "ROBO,ROBO,CHROMIA" both read as the
++ * one set they mean. Anything that is not a line is dropped rather than shown
++ * as a line nobody runs.
++ */
++export function parseLines(stored: string | null | undefined): LineCode[] {
++  const seen = new Set(
++    String(stored ?? "")
++      .split(",")
++      .map((s) => s.trim().toUpperCase())
++      .filter((s): s is LineCode => (LINES as readonly string[]).includes(s)),
++  );
++  return LINES.filter((l) => seen.has(l));
++}
++
++/** The storage form of a set of lines — the inverse of parseLines, and the
++ *  only thing that writes attendance_day.lines. */
++export function joinLines(lines: readonly string[]): string {
++  return parseLines(lines.join(",")).join(",");
++}
++
++/** "Robo Line", "Robo Line + Chromia Line", or "-" when none is set. */
++export function linesLabel(stored: string | null | undefined): string {
++  const l = parseLines(stored);
++  return l.length === 0 ? "-" : l.map((c) => LINE_LABELS[c]).join(" + ");
++}
++
++/* ── Worked hours ──────────────────────────────────────────────────── */
++
++/** Minutes since midnight for "HH:MM", or null. */
++function toMins(t: string | null | undefined): number | null {
++  const m = /^\s*(\d{1,2}):(\d{2})\s*$/.exec(t ?? "");
++  if (!m) return null;
++  const h = Number(m[1]);
++  const min = Number(m[2]);
++  return h > 23 || min > 59 ? null : h * 60 + min;
++}
++
++/** The longest shift the register will accept as one day's work. A night
++ *  shift that starts at 22:00 and ends at 06:00 is eight hours; anything past
++ *  sixteen is a typed Out that belongs to a different day. */
++export const MAX_SHIFT_MINUTES = 16 * 60;
++
++/**
++ * Minutes worked between an In and an Out, or null when the pair cannot say.
++ *
++ * An Out earlier than the In is the night shift crossing midnight (22:00 →
++ * 06:00 is 8 hours), the same reading the Robo delay log and the hourly
++ * reports already use. Equal times are null, not zero: nobody works a shift of
++ * no length, so it is a typo rather than a reading. Past MAX_SHIFT_MINUTES it
++ * is null too — an inverted or mistyped pair should show as nothing rather
++ * than as an impossible day.
++ */
++export function workedMinutes(inTime: string | null | undefined, outTime: string | null | undefined): number | null {
++  const a = toMins(inTime);
++  const b = toMins(outTime);
++  if (a === null || b === null) return null;
++  let diff = b - a;
++  if (diff < 0) diff += 24 * 60;
++  if (diff <= 0 || diff > MAX_SHIFT_MINUTES) return null;
++  return diff;
++}
++
++/** "8h 15m", "45m" — the same shape fmtDuration gives everywhere else, and
++ *  "-" when there is nothing to show. */
++export function workedLabel(inTime: string | null | undefined, outTime: string | null | undefined): string {
++  const mins = workedMinutes(inTime, outTime);
++  if (mins === null) return "-";
++  const h = Math.floor(mins / 60);
++  const m = mins % 60;
++  return h > 0 ? (m > 0 ? `${h}h ${m}m` : `${h}h`) : `${m}m`;
++}
++
++/** The hours away on a leave row, by the same rule. Both times empty is the
++ *  whole day, which the register writes in words rather than as a number. */
++export function leaveLabel(fromTime: string | null | undefined, toTime: string | null | undefined): string {
++  const from = (fromTime ?? "").trim();
++  const to = (toTime ?? "").trim();
++  if (!from && !to) return "Full day";
++  if (!from || !to) return from || to;
++  return `${from}–${to}`;
++}
++
++/* ── Sorting ───────────────────────────────────────────────────────── */
++
++/**
++ * Operator names in alphabetical order, as the register shows them.
++ *
++ * Compared case- and punctuation-insensitively so "Praveen Kumar.S" and
++ * "praveen kumar s" sort as the same word — the register is typed by hand and
++ * a stray capital should not move a name down the page.
++ */
++export function compareOperatorNames(a: string, b: string): number {
++  const key = (s: string) => s.replace(/[^\p{L}\p{N}]+/gu, " ").trim().toLocaleLowerCase();
++  return key(a).localeCompare(key(b)) || a.localeCompare(b);
++}
++
++/* ── What an operator's name may be ────────────────────────────────── */
++
++/** A typed operator name, tidied: inner runs of space collapsed, ends
++ *  trimmed. "" when there is nothing left, which the caller refuses. */
++export function cleanOperatorName(raw: unknown): string {
++  return String(raw ?? "").replace(/\s+/g, " ").trim();
++}
++
++export const OPERATOR_NAME_MAX = 80;
++
++/** Why a name cannot be used, or null when it can. */
++export function operatorNameError(raw: unknown): string | null {
++  const name = cleanOperatorName(raw);
++  if (!name) return "Enter the operator's name.";
++  if (name.length > OPERATOR_NAME_MAX) return `Keep the name under ${OPERATOR_NAME_MAX} characters.`;
++  return null;
++}
+diff --git a/src/lib/attendance/filters.ts b/src/lib/attendance/filters.ts
+new file mode 100644
+index 0000000..6502940
+--- /dev/null
++++ b/src/lib/attendance/filters.ts
+@@ -0,0 +1,175 @@
++/**
++ * The Attendance Downloads filter — which records the page lists and the
++ * spreadsheet then contains.
++ *
++ * Pure and alias-free so `node --test` can reach it. The SAME function decides
++ * both, which is the point: the sheet is the table you were just looking at,
++ * never a second query that could answer differently.
++ *
++ * Dates are yyyy-mm-dd strings throughout and the arithmetic is done in whole
++ * days since the epoch, in UTC — so "last week" is seven calendar days and
++ * nothing shifts across a timezone.
++ */
++
++export const RECORD_TYPES = ["ATTENDANCE", "LEAVE"] as const;
++export type RecordType = (typeof RECORD_TYPES)[number];
++
++export const RECORD_TYPE_LABELS: Record<RecordType, string> = {
++  ATTENDANCE: "Attendance",
++  LEAVE: "Leave",
++};
++
++/**
++ * How the period is chosen. They are modes, not separate filters: a date and a
++ * month cannot both be in force, and offering them as independent boxes is how
++ * a screen ends up with a filter the reader cannot explain.
++ */
++export const PERIOD_MODES = ["DATE", "LAST_WEEK", "MONTH", "RANGE", "ALL"] as const;
++export type PeriodMode = (typeof PERIOD_MODES)[number];
++
++export const PERIOD_LABELS: Record<PeriodMode, string> = {
++  DATE: "A single date",
++  LAST_WEEK: "Last week",
++  MONTH: "Month-wise",
++  RANGE: "Custom date range",
++  ALL: "All records",
++};
++
++export interface AttendanceFilter {
++  type: RecordType;
++  /** One operator's id, or "" for every operator. */
++  operatorId: string;
++  period: PeriodMode;
++  /** PERIOD "DATE". */
++  date?: string;
++  /** PERIOD "RANGE". Either end may be left empty, which leaves it open. */
++  from?: string;
++  to?: string;
++  /** PERIOD "MONTH", as yyyy-mm. */
++  month?: string;
++}
++
++/** Whole days since the epoch for a yyyy-mm-dd, or null. UTC, so no timezone
++ *  moves the day. */
++export function dayNum(d: string | null | undefined): number | null {
++  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec((d ?? "").trim());
++  if (!m) return null;
++  const n = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
++  return Number.isFinite(n) ? Math.floor(n / 86_400_000) : null;
++}
++
++/** The inverse. */
++export function dateFromDayNum(dn: number): string {
++  return new Date(dn * 86_400_000).toISOString().slice(0, 10);
++}
++
++/** The last day of a yyyy-mm month: the day before the first of the next. */
++function lastOfMonth(year: number, month1: number): string {
++  const firstOfNext = Date.UTC(month1 === 12 ? year + 1 : year, month1 === 12 ? 0 : month1, 1);
++  return dateFromDayNum(Math.floor(firstOfNext / 86_400_000) - 1);
++}
++
++/** How many days "last week" covers, today included. */
++export const LAST_WEEK_DAYS = 7;
++
++/**
++ * The inclusive yyyy-mm-dd bounds the filter covers. A null bound is open —
++ * "All records" is open at both ends, and a half-filled custom range is open
++ * at the end left blank rather than silently becoming today.
++ *
++ * `today` is passed in rather than read from the clock, so the same filter
++ * always gives the same window in a test and the server and the page cannot
++ * disagree about what day it is.
++ */
++export function periodBounds(f: AttendanceFilter, today: string): { from: string | null; to: string | null } {
++  switch (f.period) {
++    case "DATE": {
++      const d = dayNum(f.date) === null ? null : (f.date as string);
++      return { from: d, to: d };
++    }
++    case "LAST_WEEK": {
++      const t = dayNum(today);
++      if (t === null) return { from: null, to: null };
++      return { from: dateFromDayNum(t - (LAST_WEEK_DAYS - 1)), to: today };
++    }
++    case "MONTH": {
++      const m = /^(\d{4})-(\d{2})$/.exec((f.month ?? "").trim());
++      if (!m) return { from: null, to: null };
++      const year = Number(m[1]);
++      const month1 = Number(m[2]);
++      if (month1 < 1 || month1 > 12) return { from: null, to: null };
++      return { from: `${m[1]}-${m[2]}-01`, to: lastOfMonth(year, month1) };
++    }
++    case "RANGE": {
++      const a = dayNum(f.from) === null ? null : (f.from as string);
++      const b = dayNum(f.to) === null ? null : (f.to as string);
++      // Typed the wrong way round reads as the range they meant, not as empty.
++      if (a !== null && b !== null && a > b) return { from: b, to: a };
++      return { from: a, to: b };
++    }
++    default:
++      return { from: null, to: null };
++  }
++}
++
++/** A row of either register, as far as filtering cares. */
++export interface FilterableRow {
++  date: string;
++  operatorId: string;
++}
++
++/** Does this row pass the filter? Operator and period are ANDed — picking an
++ *  operator AND a month gives that operator's rows in that month, which is
++ *  what both of them being set has to mean. */
++export function matchesFilter(row: FilterableRow, f: AttendanceFilter, today: string): boolean {
++  if (f.operatorId && row.operatorId !== f.operatorId) return false;
++  const { from, to } = periodBounds(f, today);
++  // yyyy-mm-dd compares as text exactly as it compares as a date.
++  if (from !== null && row.date < from) return false;
++  if (to !== null && row.date > to) return false;
++  return true;
++}
++
++/** The filter in words, for the heading above the results and the sheet's own
++ *  first line: "Attendance · Praveen Kumar.S · October 2026". */
++export function describeFilter(f: AttendanceFilter, today: string, operatorName: string): string {
++  const parts: string[] = [RECORD_TYPE_LABELS[f.type]];
++  parts.push(f.operatorId ? operatorName || "Operator" : "All operators");
++  const { from, to } = periodBounds(f, today);
++  if (from === null && to === null) parts.push("All dates");
++  else if (from === to) parts.push(String(from));
++  else parts.push(`${from ?? "the start"} → ${to ?? "today"}`);
++  return parts.join(" · ");
++}
++
++/** The download's file name — the filter, so two downloads never collide in a
++ *  Downloads folder. */
++export function filterFileName(f: AttendanceFilter, today: string, operatorName: string): string {
++  const safe = (s: string) => s.replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "all";
++  const { from, to } = periodBounds(f, today);
++  const span = from === null && to === null ? "all" : from === to ? String(from) : `${from ?? "start"}_${to ?? today}`;
++  const who = f.operatorId ? safe(operatorName) : "all-operators";
++  return `${RECORD_TYPE_LABELS[f.type]}_${who}_${span}.xlsx`;
++}
++
++/* ── The sheets ────────────────────────────────────────────────────── */
++
++/** The Attendance sheet's columns, in the order the register shows them. */
++export const ATTENDANCE_COLUMNS = [
++  "Date", "Operator Name", "Line", "In-Time", "Out-Time", "Total Working Hours",
++] as const;
++export const ATTENDANCE_WIDTHS = [13, 24, 24, 10, 10, 20];
++
++/** The Leave sheet's, likewise. */
++export const LEAVE_COLUMNS = [
++  "Date", "S.No.", "Operator Name", "Leave Time", "Leave Reason", "Remarks",
++] as const;
++export const LEAVE_WIDTHS = [13, 7, 24, 16, 32, 32];
++
++export function columnsFor(type: RecordType): readonly string[] {
++  return type === "LEAVE" ? LEAVE_COLUMNS : ATTENDANCE_COLUMNS;
++}
++
++export function widthsFor(type: RecordType): number[] {
++  return type === "LEAVE" ? LEAVE_WIDTHS : ATTENDANCE_WIDTHS;
++}
+diff --git a/src/lib/attendance/server.ts b/src/lib/attendance/server.ts
+new file mode 100644
+index 0000000..91a41b0
+--- /dev/null
++++ b/src/lib/attendance/server.ts
+@@ -0,0 +1,418 @@
++/**
++ * The Attendance API — ONE implementation, mounted twice.
++ *
++ * ── WHY ONE FILE AND NOT TWO SETS OF ROUTES ───────────────────────────────
++ * Robo and Chromia must always show the same register, so there is one set of
++ * tables and one set of handlers. What differs between the two ERPs is only
++ * which gate lets you in: /api/robo/attendance/… is behind roboGate and the
++ * middleware's /api/robo rule, /api/chromia/attendance/… behind chromiaGate
++ * and the /api/chromia rule. Each module's route file is five lines — its own
++ * gate, then this.
++ *
++ * It is NOT mounted at a new /api/attendance prefix, which would be the
++ * obvious thing and is wrong twice over: middleware has no rule for it, so
++ * every other department's login would reach it, while the ROBO and CHROMIA
++ * role caps (which allow only their own module's paths) would lock out the two
++ * logins that actually need it.
++ *
++ * Twenty near-identical route files — ten endpoints in two modules — would be
++ * the alternative, and Nav.tsx already records what happens to hand-kept
++ * copies: they drift the first time one of them is edited. So the dispatch is
++ * by path here, once.
++ */
++
++import * as XLSX from "xlsx-js-style";
++import { prisma } from "@/lib/prisma";
++import { styleRoboSheet } from "@/lib/robo/exportStyle";
++import { toPlantDateInput } from "@/lib/chromia/plant-time";
++import { isValidTime } from "@/lib/robo/time";
++import {
++  cleanOperatorName,
++  compareOperatorNames,
++  joinLines,
++  leaveLabel,
++  linesLabel,
++  operatorNameError,
++  workedLabel,
++} from "./attendance.ts";
++import {
++  ATTENDANCE_COLUMNS,
++  LEAVE_COLUMNS,
++  PERIOD_MODES,
++  RECORD_TYPES,
++  columnsFor,
++  describeFilter,
++  filterFileName,
++  periodBounds,
++  widthsFor,
++  type AttendanceFilter,
++  type PeriodMode,
++  type RecordType,
++} from "./filters.ts";
++
++/** Today, on the plant's clock rather than the server's — the host runs in UTC
++ *  and "last week" must not start a day early for a night shift. */
++const todayPlant = () => toPlantDateInput(new Date());
++
++const json = (body: unknown, status = 200) =>
++  Response.json(body, { status, headers: { "Cache-Control": "no-store" } });
++const bad = (message: string, status = 400) => json({ error: message }, status);
++
++const isDate = (v: unknown): v is string => /^\d{4}-\d{2}-\d{2}$/.test(String(v ?? ""));
++
++/** A typed time as it is stored: "HH:MM", or null for an empty box. Anything
++ *  that is not a time is refused rather than stored as text nobody can total. */
++function timeOrNull(v: unknown): string | null | undefined {
++  const s = String(v ?? "").trim();
++  if (!s) return null;
++  return isValidTime(s) ? s : undefined; // undefined = invalid, the caller refuses
++}
++
++/* ── Operators ─────────────────────────────────────────────────────── */
++
++async function listOperators() {
++  const rows = await prisma.attendanceOperator.findMany({
++    select: { id: true, name: true, isActive: true },
++  });
++  // Alphabetical, the way the register reads — not by when they were added.
++  return rows.sort((a, b) => compareOperatorNames(a.name, b.name));
++}
++
++/* ── The day's register ────────────────────────────────────────────── */
++
++/**
++ * Every active operator for a date, each with their row if one exists. The
++ * register is the roster, not the rows: an operator with nothing entered yet
++ * still has a line to fill in, which is the whole point of a register.
++ */
++async function dayRegister(date: string) {
++  const [operators, days] = await Promise.all([
++    listOperators(),
++    prisma.attendanceDay.findMany({ where: { date } }),
++  ]);
++  const byOperator = new Map(days.map((d) => [d.operatorId, d]));
++  return operators
++    .filter((o) => o.isActive || byOperator.has(o.id))
++    .map((o) => {
++      const d = byOperator.get(o.id);
++      return {
++        operatorId: o.id,
++        operatorName: o.name,
++        isActive: o.isActive,
++        lines: d?.lines ?? "",
++        linesLabel: linesLabel(d?.lines),
++        inTime: d?.inTime ?? "",
++        outTime: d?.outTime ?? "",
++        worked: workedLabel(d?.inTime, d?.outTime),
++        saved: Boolean(d),
++      };
++    });
++}
++
++/* ── Leave ─────────────────────────────────────────────────────────── */
++
++async function listLeave() {
++  const rows = await prisma.attendanceLeave.findMany({
++    orderBy: [{ date: "desc" }, { createdAt: "asc" }],
++    take: 500,
++    include: { operator: { select: { name: true } } },
++  });
++  /* S.No. is the row's 1..N position within its own date, computed here and
++     never stored — the same rule Slab Records follows, and for the same
++     reason: a typed serial on a register gets mistyped and then two rows
++     claim the same number. */
++  const seenPerDate = new Map<string, number>();
++  const dated = [...rows].sort((a, b) => a.date.localeCompare(b.date) || a.createdAt.getTime() - b.createdAt.getTime());
++  const serials = new Map<string, number>();
++  for (const r of dated) {
++    const n = (seenPerDate.get(r.date) ?? 0) + 1;
++    seenPerDate.set(r.date, n);
++    serials.set(r.id, n);
++  }
++  return rows.map((r) => ({
++    id: r.id,
++    date: r.date,
++    serial: serials.get(r.id) ?? 1,
++    operatorId: r.operatorId,
++    operatorName: r.operator?.name ?? "",
++    fromTime: r.fromTime ?? "",
++    toTime: r.toTime ?? "",
++    leaveTime: leaveLabel(r.fromTime, r.toTime),
++    reason: r.reason ?? "",
++    remarks: r.remarks ?? "",
++  }));
++}
++
++/* ── Downloads ─────────────────────────────────────────────────────── */
++
++function readFilter(p: URLSearchParams): AttendanceFilter {
++  const type = (RECORD_TYPES as readonly string[]).includes(String(p.get("type")))
++    ? (p.get("type") as RecordType)
++    : "ATTENDANCE";
++  const period = (PERIOD_MODES as readonly string[]).includes(String(p.get("period")))
++    ? (p.get("period") as PeriodMode)
++    : "ALL";
++  return {
++    type,
++    period,
++    operatorId: p.get("operatorId") ?? "",
++    date: p.get("date") ?? undefined,
++    from: p.get("from") ?? undefined,
++    to: p.get("to") ?? undefined,
++    month: p.get("month") ?? undefined,
++  };
++}
++
++/** The where-clause a filter means. The period is turned into bounds once, by
++ *  periodBounds, so the page's table and the spreadsheet cannot disagree. */
++function filterWhere(f: AttendanceFilter, today: string) {
++  const { from, to } = periodBounds(f, today);
++  const where: { operatorId?: string; date?: { gte?: string; lte?: string } } = {};
++  if (f.operatorId) where.operatorId = f.operatorId;
++  if (from !== null || to !== null) {
++    where.date = {};
++    if (from !== null) where.date.gte = from;
++    if (to !== null) where.date.lte = to;
++  }
++  return where;
++}
++
++/** The rows a filter selects, already shaped as the table and the sheet show
++ *  them — ONE function behind both, so the download is the table you looked at. */
++async function filteredRows(f: AttendanceFilter, today: string) {
++  const where = filterWhere(f, today);
++  if (f.type === "LEAVE") {
++    const rows = await prisma.attendanceLeave.findMany({
++      where,
++      orderBy: [{ date: "asc" }, { createdAt: "asc" }],
++      include: { operator: { select: { name: true } } },
++    });
++    const perDate = new Map<string, number>();
++    return rows.map((r) => {
++      const n = (perDate.get(r.date) ?? 0) + 1;
++      perDate.set(r.date, n);
++      return {
++        "Date": r.date,
++        "S.No.": n,
++        "Operator Name": r.operator?.name ?? "",
++        "Leave Time": leaveLabel(r.fromTime, r.toTime),
++        "Leave Reason": r.reason ?? "",
++        "Remarks": r.remarks ?? "",
++      } as Record<string, string | number>;
++    });
++  }
++  const rows = await prisma.attendanceDay.findMany({
++    where,
++    orderBy: [{ date: "asc" }],
++    include: { operator: { select: { name: true } } },
++  });
++  return [...rows]
++    .sort((a, b) => a.date.localeCompare(b.date) || compareOperatorNames(a.operator?.name ?? "", b.operator?.name ?? ""))
++    .map((r) => ({
++      "Date": r.date,
++      "Operator Name": r.operator?.name ?? "",
++      "Line": linesLabel(r.lines),
++      "In-Time": r.inTime ?? "-",
++      "Out-Time": r.outTime ?? "-",
++      "Total Working Hours": workedLabel(r.inTime, r.outTime),
++    }) as Record<string, string | number>);
++}
++
++async function operatorNameOf(id: string): Promise<string> {
++  if (!id) return "";
++  const row = await prisma.attendanceOperator.findUnique({ where: { id }, select: { name: true } });
++  return row?.name ?? "";
++}
++
++/* ── The one handler ───────────────────────────────────────────────── */
++
++/**
++ * Dispatch on the path AFTER ".../attendance". Both module routes hand their
++ * own segments in, so the same request reaches the same code whichever ERP
++ * asked.
++ */
++export async function attendanceApi(req: Request, segments: string[]): Promise<Response> {
++  const url = new URL(req.url);
++  const p = url.searchParams;
++  const [head, id] = segments;
++  const method = req.method.toUpperCase();
++  const body = method === "GET" || method === "DELETE" ? {} : await req.json().catch(() => ({}));
++
++  /* operators */
++  if (head === "operators" && !id) {
++    if (method === "GET") return json(await listOperators());
++    if (method === "POST") {
++      const name = cleanOperatorName((body as { name?: unknown }).name);
++      const err = operatorNameError(name);
++      if (err) return bad(err);
++      const clash = await prisma.attendanceOperator.findUnique({ where: { name }, select: { id: true } });
++      if (clash) return bad(`${name} is already on the list.`, 409);
++      const row = await prisma.attendanceOperator.create({ data: { name }, select: { id: true, name: true, isActive: true } });
++      return json(row, 201);
++    }
++  }
++
++  if (head === "operators" && id) {
++    if (method === "PATCH") {
++      const data: { name?: string; isActive?: boolean } = {};
++      if ((body as { name?: unknown }).name !== undefined) {
++        const name = cleanOperatorName((body as { name?: unknown }).name);
++        const err = operatorNameError(name);
++        if (err) return bad(err);
++        const clash = await prisma.attendanceOperator.findFirst({ where: { name, NOT: { id } }, select: { id: true } });
++        if (clash) return bad(`${name} is already on the list.`, 409);
++        data.name = name;
++      }
++      if (typeof (body as { isActive?: unknown }).isActive === "boolean") data.isActive = (body as { isActive: boolean }).isActive;
++      if (Object.keys(data).length === 0) return bad("Nothing to change.");
++      const row = await prisma.attendanceOperator.update({ where: { id }, data, select: { id: true, name: true, isActive: true } });
++      return json(row);
++    }
++    if (method === "DELETE") {
++      /* An operator who has ever been marked present is part of the record, so
++         deleting them would take their attendance with them. They are switched
++         off instead and keep their history; one who has never been used is
++         simply removed. The caller is told which happened. */
++      const [days, leaves] = await Promise.all([
++        prisma.attendanceDay.count({ where: { operatorId: id } }),
++        prisma.attendanceLeave.count({ where: { operatorId: id } }),
++      ]);
++      if (days + leaves > 0) {
++        const row = await prisma.attendanceOperator.update({ where: { id }, data: { isActive: false }, select: { name: true } });
++        return json({ deactivated: true, name: row.name, records: days + leaves });
++      }
++      await prisma.attendanceOperator.delete({ where: { id } });
++      return json({ deleted: true });
++    }
++  }
++
++  /* the day's register */
++  if (head === "day") {
++    if (method === "GET") {
++      const date = isDate(p.get("date")) ? (p.get("date") as string) : todayPlant();
++      return json({ date, rows: await dayRegister(date) });
++    }
++    if (method === "PUT") {
++      const b = body as { date?: unknown; operatorId?: unknown; lines?: unknown; inTime?: unknown; outTime?: unknown };
++      if (!isDate(b.date)) return bad("Pick a date.");
++      const operatorId = String(b.operatorId ?? "");
++      if (!operatorId) return bad("Pick an operator.");
++      const inTime = timeOrNull(b.inTime);
++      const outTime = timeOrNull(b.outTime);
++      if (inTime === undefined) return bad("In-Time is not a valid time.");
++      if (outTime === undefined) return bad("Out-Time is not a valid time.");
++      const lines = joinLines(Array.isArray(b.lines) ? b.lines.map(String) : String(b.lines ?? "").split(","));
++      /* The upsert IS the "no duplicates" rule: (date, operatorId) is unique in
++         the database, so the same day saved from Robo and from Chromia is one
++         row that the second save corrects rather than a second row. */
++      const row = await prisma.attendanceDay.upsert({
++        where: { date_operatorId: { date: b.date, operatorId } },
++        create: { date: b.date, operatorId, lines, inTime, outTime },
++        update: { lines, inTime, outTime },
++      });
++      return json({
++        operatorId,
++        lines: row.lines,
++        linesLabel: linesLabel(row.lines),
++        inTime: row.inTime ?? "",
++        outTime: row.outTime ?? "",
++        worked: workedLabel(row.inTime, row.outTime),
++        saved: true,
++      });
++    }
++  }
++
++  /* leave */
++  if (head === "leave" && !id) {
++    if (method === "GET") return json(await listLeave());
++    if (method === "POST") {
++      const b = body as Record<string, unknown>;
++      if (!isDate(b.date)) return bad("Pick a date.");
++      const operatorId = String(b.operatorId ?? "");
++      if (!operatorId) return bad("Pick an operator.");
++      const fromTime = timeOrNull(b.fromTime);
++      const toTime = timeOrNull(b.toTime);
++      if (fromTime === undefined || toTime === undefined) return bad("Leave time is not a valid time.");
++      await prisma.attendanceLeave.create({
++        data: {
++          date: b.date,
++          operatorId,
++          fromTime,
++          toTime,
++          reason: String(b.reason ?? "").trim(),
++          remarks: String(b.remarks ?? "").trim() || null,
++        },
++      });
++      return json(await listLeave(), 201);
++    }
++  }
++
++  if (head === "leave" && id) {
++    if (method === "PATCH") {
++      const b = body as Record<string, unknown>;
++      const data: Record<string, unknown> = {};
++      if (b.date !== undefined) {
++        if (!isDate(b.date)) return bad("Pick a date.");
++        data.date = b.date;
++      }
++      if (b.operatorId !== undefined) {
++        if (!String(b.operatorId ?? "")) return bad("Pick an operator.");
++        data.operatorId = String(b.operatorId);
++      }
++      for (const k of ["fromTime", "toTime"] as const) {
++        if (b[k] !== undefined) {
++          const t = timeOrNull(b[k]);
++          if (t === undefined) return bad("Leave time is not a valid time.");
++          data[k] = t;
++        }
++      }
++      if (b.reason !== undefined) data.reason = String(b.reason ?? "").trim();
++      if (b.remarks !== undefined) data.remarks = String(b.remarks ?? "").trim() || null;
++      if (Object.keys(data).length === 0) return bad("Nothing to change.");
++      await prisma.attendanceLeave.update({ where: { id }, data });
++      return json(await listLeave());
++    }
++    if (method === "DELETE") {
++      await prisma.attendanceLeave.delete({ where: { id } });
++      return json(await listLeave());
++    }
++  }
++
++  /* downloads — the table, then the same rows as a sheet */
++  if (head === "records" && method === "GET") {
++    const f = readFilter(p);
++    const today = todayPlant();
++    const rows = await filteredRows(f, today);
++    return json({
++      columns: columnsFor(f.type),
++      rows,
++      description: describeFilter(f, today, await operatorNameOf(f.operatorId)),
++    });
++  }
++
++  if (head === "export" && method === "GET") {
++    const f = readFilter(p);
++    const today = todayPlant();
++    const rows = await filteredRows(f, today);
++    const columns = [...columnsFor(f.type)];
++    const ws = XLSX.utils.json_to_sheet(rows, { header: columns });
++    ws["!cols"] = widthsFor(f.type).map((wch) => ({ wch }));
++    styleRoboSheet(ws, { columnCount: columns.length });
++    const wb = XLSX.utils.book_new();
++    XLSX.utils.book_append_sheet(wb, ws, (f.type === "LEAVE" ? "Leave" : "Attendance").slice(0, 31));
++    const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
++    return new Response(buf, {
++      status: 200,
++      headers: {
++        "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
++        "Content-Disposition": `attachment; filename="${filterFileName(f, today, await operatorNameOf(f.operatorId))}"`,
++        "Cache-Control": "no-store",
++      },
++    });
++  }
++
++  return bad("Not found", 404);
++}
++
++/** Re-exported so a test can check the sheets match the registers on screen. */
++export { ATTENDANCE_COLUMNS, LEAVE_COLUMNS };
+diff --git a/src/lib/chromia/config/navigation.ts b/src/lib/chromia/config/navigation.ts
+index e7fa887..d43b3df 100644
+--- a/src/lib/chromia/config/navigation.ts
++++ b/src/lib/chromia/config/navigation.ts
+@@ -35,4 +35,6 @@ export const navigation: readonly NavItem[] = [
+   { title: 'Summary', href: '/chromia/reports', icon: 'reports' },
+   { title: 'Downloads', href: '/chromia/downloads', icon: 'downloads' },
+   { title: 'Import', href: '/chromia/import', icon: 'import' },
++  // Last, so swiping on past Import reaches it and nothing before it moves.
++  { title: 'Attendance', href: '/chromia/attendance', icon: 'attendance' },
+ ];
+diff --git a/src/lib/chromia/constants/app.ts b/src/lib/chromia/constants/app.ts
+index f6b421f..f2b21a2 100644
+--- a/src/lib/chromia/constants/app.ts
++++ b/src/lib/chromia/constants/app.ts
+@@ -26,6 +26,9 @@ export const APP_ROUTES = {
+   import: '/chromia/import',
+   reports: '/chromia/reports',
+   downloads: '/chromia/downloads',
++  /** The attendance register, shared with the Robo line — see
++   *  lib/attendance/server.ts for why there is one of it and two ways in. */
++  attendance: '/chromia/attendance',
+ } as const;
+ 
+ export const API_ROUTES = {
+diff --git a/src/lib/navModel.ts b/src/lib/navModel.ts
+index 3707334..967e107 100644
+--- a/src/lib/navModel.ts
++++ b/src/lib/navModel.ts
+@@ -294,6 +294,9 @@ const ROBO_ITEMS: NavItem[] = [
+   { href: "/robo/downloads", icon: I.box,     label: "Downloads" },
+   { href: "/robo/import",    icon: I.entry,   label: "Import" },
+   { href: "/robo/masters",   icon: I.tables,  label: "Master Lists" },
++  // Last, and the same register CHROMIA_ITEMS ends with — one page, two doors.
++  // See lib/attendance/server.ts.
++  { href: "/robo/attendance", icon: I.users,  label: "Attendance" },
+ ];
+ 
+ // Chromia module — the module's own ten screens (lib/chromia/config/navigation.ts),
+@@ -315,6 +318,7 @@ const CHROMIA_ITEMS: NavItem[] = [
+   { href: "/chromia/reports",                icon: I.ceo,      label: "Summary" },
+   { href: "/chromia/downloads",              icon: I.box,      label: "Downloads" },
+   { href: "/chromia/import",                 icon: I.entry,    label: "Import" },
++  { href: "/chromia/attendance",             icon: I.users,    label: "Attendance" },
+ ];
+ 
+ // Lab module (Role.LAB, scripts/0119) — the R&D sample register, ported from
+@@ -462,6 +466,10 @@ export function navSections({
+       section("Production", ROBO_ITEMS.filter((t) => t.href === "/robo" || t.href === "/robo/slabs")),
+       section("Reports", ROBO_ITEMS.filter((t) => t.href === "/robo/reports" || t.href === "/robo/downloads")),
+       section("Setup", ROBO_ITEMS.filter((t) => t.href === "/robo/import" || t.href === "/robo/masters")),
++      // The operators keep their own register, so the tablet needs it too —
++      // this arm is an allowlist, and a row left out of it is a page the Robo
++      // login simply has no link to.
++      section("Attendance", ROBO_ITEMS.filter((t) => t.href === "/robo/attendance")),
+     );
+   if (role === "CHROMIA" || (!isAdmin && branch === "CHROMIA"))
+     // chromia line tablet — the chromia module is their whole ERP. The branch
+@@ -479,6 +487,9 @@ export function navSections({
+       section("Recalibration", CHROMIA_ITEMS.filter((t) => t.href.startsWith("/chromia/recalibration"))),
+       section("Reports", CHROMIA_ITEMS.filter((t) => t.href === "/chromia/reports" || t.href === "/chromia/downloads")),
+       section("Setup", CHROMIA_ITEMS.filter((t) => t.href === "/chromia/import")),
++      // The shared register, the same row the Robo tablet's arm ends with.
++      // This arm is an allowlist too.
++      section("Attendance", CHROMIA_ITEMS.filter((t) => t.href === "/chromia/attendance")),
+       // THE PAGES OUTSIDE /chromia THIS LOGIN CAN HOLD, and there are two.
+       // The Chromia manager is a named slab-intake person (printed slabs enter
+       // finished goods by hand), and middleware carves /slab-intake through
+diff --git a/tests/attendance.test.ts b/tests/attendance.test.ts
+new file mode 100644
+index 0000000..afacc1e
+--- /dev/null
++++ b/tests/attendance.test.ts
+@@ -0,0 +1,293 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import { readFileSync } from "node:fs";
++
++import {
++  LINES,
++  MAX_SHIFT_MINUTES,
++  cleanOperatorName,
++  compareOperatorNames,
++  joinLines,
++  leaveLabel,
++  linesLabel,
++  operatorNameError,
++  parseLines,
++  workedLabel,
++  workedMinutes,
++} from "../src/lib/attendance/attendance.ts";
++import {
++  ATTENDANCE_COLUMNS,
++  LEAVE_COLUMNS,
++  columnsFor,
++  describeFilter,
++  filterFileName,
++  matchesFilter,
++  periodBounds,
++  widthsFor,
++  type AttendanceFilter,
++} from "../src/lib/attendance/filters.ts";
++
++/* The attendance register, shared by the Robo line and the Chromia line.
++ *
++ * The one thing these tests are really protecting: there is ONE register. Not
++ * two that are kept in step — one set of tables, one handler, one screen, and
++ * a unique key on (date, operator) so the same day entered from either ERP is
++ * the same row. Anything that quietly makes a second copy is the bug. */
++
++/* ── The two lines ─────────────────────────────────────────────────── */
++
++test("an operator can be on one line or both", () => {
++  assert.deepEqual(parseLines("ROBO"), ["ROBO"]);
++  assert.deepEqual(parseLines("CHROMIA"), ["CHROMIA"]);
++  assert.deepEqual(parseLines("ROBO,CHROMIA"), ["ROBO", "CHROMIA"]);
++  assert.deepEqual(parseLines(""), []);
++  assert.deepEqual(parseLines(null), []);
++});
++
++test("the lines read in one order however they were stored", () => {
++  // Two screens writing the same pair must not produce two different strings.
++  assert.deepEqual(parseLines("CHROMIA,ROBO"), ["ROBO", "CHROMIA"]);
++  assert.equal(joinLines(["CHROMIA", "ROBO"]), "ROBO,CHROMIA");
++  assert.equal(joinLines(["ROBO", "CHROMIA"]), "ROBO,CHROMIA");
++});
++
++test("a line named twice is still one line, and a line nobody runs is dropped", () => {
++  assert.equal(joinLines(["ROBO", "ROBO", "CHROMIA"]), "ROBO,CHROMIA");
++  assert.equal(joinLines(["ROBO", "POLISHING", ""]), "ROBO");
++  assert.equal(joinLines([]), "");
++});
++
++test("lowercase and spacing do not make a different line", () => {
++  assert.equal(joinLines([" robo ", "chromia"]), "ROBO,CHROMIA");
++});
++
++test("the register names the lines in words", () => {
++  assert.equal(linesLabel("ROBO"), "Robo Line");
++  assert.equal(linesLabel("ROBO,CHROMIA"), "Robo Line + Chromia Line");
++  assert.equal(linesLabel(""), "-");
++});
++
++/* ── Worked hours ──────────────────────────────────────────────────── */
++
++test("the hours are the gap between In and Out", () => {
++  assert.equal(workedMinutes("09:00", "17:30"), 510);
++  assert.equal(workedLabel("09:00", "17:30"), "8h 30m");
++  assert.equal(workedLabel("09:00", "17:00"), "8h");
++  assert.equal(workedLabel("09:00", "09:45"), "45m");
++});
++
++test("a night shift crosses midnight instead of going backwards", () => {
++  // 22:00 → 06:00 is eight hours, not minus sixteen.
++  assert.equal(workedMinutes("22:00", "06:00"), 8 * 60);
++  assert.equal(workedLabel("22:00", "06:00"), "8h");
++  assert.equal(workedLabel("23:50", "00:10"), "20m");
++});
++
++test("a pair that cannot be a day's work reads as nothing, not as a number", () => {
++  assert.equal(workedMinutes("09:00", "09:00"), null); // nobody works no time
++  assert.equal(workedMinutes("09:00", ""), null);
++  assert.equal(workedMinutes(null, "17:00"), null);
++  assert.equal(workedMinutes("nonsense", "17:00"), null);
++  assert.equal(workedMinutes("25:00", "17:00"), null);
++  assert.equal(workedMinutes("09:70", "17:00"), null);
++  assert.equal(workedLabel("09:00", ""), "-");
++});
++
++test("longer than a long shift is a typo, and shows as nothing", () => {
++  // 08:00 → 07:00 the next morning is 23 hours — an Out that belongs to
++  // another day, not a day somebody worked.
++  assert.equal(workedMinutes("08:00", "07:00"), null);
++  assert.equal(workedMinutes("06:00", `${String(Math.floor((6 * 60 + MAX_SHIFT_MINUTES) / 60) % 24).padStart(2, "0")}:00`), MAX_SHIFT_MINUTES);
++});
++
++/* ── Leave ─────────────────────────────────────────────────────────── */
++
++test("leave reads as the hours away, or as the whole day", () => {
++  assert.equal(leaveLabel("14:00", "16:30"), "14:00–16:30");
++  assert.equal(leaveLabel("", ""), "Full day");
++  assert.equal(leaveLabel(null, null), "Full day");
++  assert.equal(leaveLabel("14:00", ""), "14:00");
++});
++
++/* ── Operator names ────────────────────────────────────────────────── */
++
++test("names sort alphabetically, whatever the capitals and dots", () => {
++  const names = ["Saravanan.L", "praveen kumar s", "Arun R", "Praveen Kumar.S"];
++  assert.deepEqual(
++    [...names].sort(compareOperatorNames),
++    ["Arun R", "praveen kumar s", "Praveen Kumar.S", "Saravanan.L"],
++  );
++});
++
++test("the owner's two operators are in the order the register shows them", () => {
++  assert.deepEqual(
++    ["Saravanan.L", "Praveen Kumar.S"].sort(compareOperatorNames),
++    ["Praveen Kumar.S", "Saravanan.L"],
++  );
++});
++
++test("a typed name is tidied, and an empty one refused", () => {
++  assert.equal(cleanOperatorName("  Praveen   Kumar.S  "), "Praveen Kumar.S");
++  assert.equal(operatorNameError("Praveen Kumar.S"), null);
++  assert.match(String(operatorNameError("   ")), /name/i);
++  assert.match(String(operatorNameError("x".repeat(200))), /characters/);
++});
++
++/* ── The download filters ──────────────────────────────────────────── */
++
++const TODAY = "2026-10-18";
++const f = (over: Partial<AttendanceFilter> = {}): AttendanceFilter =>
++  ({ type: "ATTENDANCE", operatorId: "", period: "ALL", ...over });
++
++test("a single date covers that one day", () => {
++  assert.deepEqual(periodBounds(f({ period: "DATE", date: "2026-10-12" }), TODAY), { from: "2026-10-12", to: "2026-10-12" });
++});
++
++test("last week is seven days up to and including today", () => {
++  assert.deepEqual(periodBounds(f({ period: "LAST_WEEK" }), TODAY), { from: "2026-10-12", to: "2026-10-18" });
++});
++
++test("month-wise is the whole calendar month, short months and leap years included", () => {
++  assert.deepEqual(periodBounds(f({ period: "MONTH", month: "2026-10" }), TODAY), { from: "2026-10-01", to: "2026-10-31" });
++  assert.deepEqual(periodBounds(f({ period: "MONTH", month: "2026-02" }), TODAY), { from: "2026-02-01", to: "2026-02-28" });
++  assert.deepEqual(periodBounds(f({ period: "MONTH", month: "2028-02" }), TODAY), { from: "2028-02-01", to: "2028-02-29" });
++  assert.deepEqual(periodBounds(f({ period: "MONTH", month: "2026-12" }), TODAY), { from: "2026-12-01", to: "2026-12-31" });
++});
++
++test("a custom range typed the wrong way round is still the range they meant", () => {
++  assert.deepEqual(periodBounds(f({ period: "RANGE", from: "2026-10-20", to: "2026-10-01" }), TODAY), { from: "2026-10-01", to: "2026-10-20" });
++});
++
++test("a half-filled range stays open at that end rather than quietly becoming today", () => {
++  assert.deepEqual(periodBounds(f({ period: "RANGE", from: "2026-10-01" }), TODAY), { from: "2026-10-01", to: null });
++  assert.deepEqual(periodBounds(f({ period: "RANGE", to: "2026-10-01" }), TODAY), { from: null, to: "2026-10-01" });
++});
++
++test("all records is open at both ends", () => {
++  assert.deepEqual(periodBounds(f(), TODAY), { from: null, to: null });
++});
++
++test("a period with nothing filled in selects nothing silently, not everything", () => {
++  // An unusable month must not fall back to "every record ever".
++  assert.deepEqual(periodBounds(f({ period: "MONTH", month: "" }), TODAY), { from: null, to: null });
++  assert.deepEqual(periodBounds(f({ period: "DATE", date: "oops" }), TODAY), { from: null, to: null });
++});
++
++/* ── Filters combine ───────────────────────────────────────────────── */
++
++const row = (date: string, operatorId: string) => ({ date, operatorId });
++
++test("an operator on their own shows only that operator", () => {
++  const filter = f({ operatorId: "op1" });
++  assert.equal(matchesFilter(row("2026-10-12", "op1"), filter, TODAY), true);
++  assert.equal(matchesFilter(row("2026-10-12", "op2"), filter, TODAY), false);
++});
++
++test("a date on its own shows every operator on that date", () => {
++  const filter = f({ period: "DATE", date: "2026-10-12" });
++  assert.equal(matchesFilter(row("2026-10-12", "op1"), filter, TODAY), true);
++  assert.equal(matchesFilter(row("2026-10-12", "op2"), filter, TODAY), true);
++  assert.equal(matchesFilter(row("2026-10-13", "op1"), filter, TODAY), false);
++});
++
++test("an operator AND a month means that operator, in that month", () => {
++  const filter = f({ operatorId: "op1", period: "MONTH", month: "2026-10" });
++  assert.equal(matchesFilter(row("2026-10-01", "op1"), filter, TODAY), true);
++  assert.equal(matchesFilter(row("2026-10-31", "op1"), filter, TODAY), true);
++  assert.equal(matchesFilter(row("2026-09-30", "op1"), filter, TODAY), false);
++  assert.equal(matchesFilter(row("2026-11-01", "op1"), filter, TODAY), false);
++  assert.equal(matchesFilter(row("2026-10-15", "op2"), filter, TODAY), false);
++});
++
++test("a type, an operator and a range all apply together", () => {
++  const filter = f({ type: "LEAVE", operatorId: "op1", period: "RANGE", from: "2026-10-05", to: "2026-10-09" });
++  assert.equal(matchesFilter(row("2026-10-05", "op1"), filter, TODAY), true);
++  assert.equal(matchesFilter(row("2026-10-09", "op1"), filter, TODAY), true);
++  assert.equal(matchesFilter(row("2026-10-04", "op1"), filter, TODAY), false);
++  assert.equal(matchesFilter(row("2026-10-07", "op2"), filter, TODAY), false);
++});
++
++test("all records with no operator keeps everything", () => {
++  assert.equal(matchesFilter(row("2020-01-01", "anyone"), f(), TODAY), true);
++});
++
++/* ── What the sheet says ───────────────────────────────────────────── */
++
++test("the sheet's columns are the register's columns", () => {
++  assert.deepEqual([...ATTENDANCE_COLUMNS], ["Date", "Operator Name", "Line", "In-Time", "Out-Time", "Total Working Hours"]);
++  assert.deepEqual([...LEAVE_COLUMNS], ["Date", "S.No.", "Operator Name", "Leave Time", "Leave Reason", "Remarks"]);
++  assert.deepEqual(columnsFor("LEAVE"), LEAVE_COLUMNS);
++  assert.deepEqual(columnsFor("ATTENDANCE"), ATTENDANCE_COLUMNS);
++  assert.equal(widthsFor("LEAVE").length, LEAVE_COLUMNS.length);
++  assert.equal(widthsFor("ATTENDANCE").length, ATTENDANCE_COLUMNS.length);
++});
++
++test("the filter says in words what it selected, and names the file by it", () => {
++  const filter = f({ operatorId: "op1", period: "MONTH", month: "2026-10" });
++  assert.equal(describeFilter(filter, TODAY, "Praveen Kumar.S"), "Attendance · Praveen Kumar.S · 2026-10-01 → 2026-10-31");
++  assert.equal(filterFileName(filter, TODAY, "Praveen Kumar.S"), "Attendance_Praveen-Kumar-S_2026-10-01_2026-10-31.xlsx");
++  assert.equal(filterFileName(f(), TODAY, ""), "Attendance_all-operators_all.xlsx");
++  assert.match(filterFileName(f({ type: "LEAVE", period: "DATE", date: "2026-10-12" }), TODAY, ""), /^Leave_all-operators_2026-10-12\.xlsx$/);
++});
++
++/* ── One register, two ERPs ────────────────────────────────────────── */
++
++/** A source file as the repository holds it: LF, whatever the checkout did to
++ *  it — see tests/sourceLineEndings.test.ts. */
++const src = (p: string) => readFileSync(new URL(`../src/${p}`, import.meta.url), "utf8").replace(/\r\n/g, "\n");
++
++test("both ERPs run the same handler over the same tables", () => {
++  // The moment one of them grows its own copy, the two registers can disagree
++  // — which is the only thing this feature had to avoid.
++  for (const p of ["app/api/robo/attendance/[...path]/route.ts", "app/api/chromia/attendance/[...path]/route.ts"]) {
++    assert.match(src(p), /attendanceApi\(req, path \?\? \[\]\)/, p);
++  }
++  assert.match(src("app/api/robo/attendance/[...path]/route.ts"), /roboGate\(\)/);
++  assert.match(src("app/api/chromia/attendance/[...path]/route.ts"), /chromiaGate\(\)/);
++});
++
++test("both pages render the one component, each through its own door", () => {
++  assert.match(src("app/robo/attendance/page.tsx"), /<AttendanceClient api="\/api\/robo\/attendance" \/>/);
++  assert.match(src("app/chromia/attendance/page.tsx"), /<AttendanceClient api="\/api\/chromia\/attendance" \/>/);
++});
++
++test("a day is upserted on (date, operator), so the same day is never two rows", () => {
++  const s = src("lib/attendance/server.ts");
++  assert.match(s, /attendanceDay\.upsert/);
++  assert.match(s, /where:\s*\{\s*date_operatorId:/);
++  assert.doesNotMatch(s, /attendanceDay\.create\(/);
++});
++
++test("the table and the spreadsheet are filled by the same query", () => {
++  // Two queries is how a download ends up disagreeing with the page above it.
++  const s = src("lib/attendance/server.ts");
++  assert.equal((s.match(/await filteredRows\(f, today\)/g) ?? []).length, 2);
++});
++
++test("Attendance is the last row of both ERPs' navigation", () => {
++  // The sidebar's rows live in lib/navModel.ts; Nav.tsx only draws them.
++  const nav = src("lib/navModel.ts");
++  const lastOf = (name: string) => {
++    const start = nav.indexOf(`const ${name}: NavItem[] = [`);
++    assert.ok(start >= 0, `${name} not found`);
++    const block = nav.slice(start, nav.indexOf("];", start));
++    const hrefs = [...block.matchAll(/href: "([^"]+)"/g)].map((m) => m[1]);
++    return hrefs[hrefs.length - 1];
++  };
++  assert.equal(lastOf("ROBO_ITEMS"), "/robo/attendance");
++  assert.equal(lastOf("CHROMIA_ITEMS"), "/chromia/attendance");
++  // And the shop-floor arms are allowlists — a row missing there is a page the
++  // tablet has no link to at all.
++  assert.match(nav, /ROBO_ITEMS\.filter\(\(t\) => t\.href === "\/robo\/attendance"\)/);
++  assert.match(nav, /CHROMIA_ITEMS\.filter\(\(t\) => t\.href === "\/chromia\/attendance"\)/);
++});
++
++test("the Chromia swipe order ends on Attendance too", () => {
++  const navcfg = src("lib/chromia/config/navigation.ts");
++  const hrefs = [...navcfg.matchAll(/href: '([^']+)'/g)].map((m) => m[1]);
++  assert.equal(hrefs[hrefs.length - 1], "/chromia/attendance");
++});
++
++test("the two lines offered are the two lines that exist", () => {
++  assert.deepEqual([...LINES], ["ROBO", "CHROMIA"]);
++});
+diff --git a/tests/fixtures/nav-sidebar.json b/tests/fixtures/nav-sidebar.json
+index d43897b..60da8c3 100644
+--- a/tests/fixtures/nav-sidebar.json
++++ b/tests/fixtures/nav-sidebar.json
+@@ -1,7 +1,7 @@
+ {
+  "_about": [
+-  "THE SIDEBAR AS IT WAS, for tests/navModel.test.ts. What src/components/Nav.tsx rendered at 89bccd8b \u2014 before its",
+-  "sections moved into src/lib/navModel.ts \u2014 for each seeded login (the keys of dashboard-edge-matrix.json, plus the",
++  "THE SIDEBAR AS IT WAS, for tests/navModel.test.ts. What src/components/Nav.tsx rendered at 89bccd8b — before its",
++  "sections moved into src/lib/navModel.ts — for each seeded login (the keys of dashboard-edge-matrix.json, plus the",
+   "dual-role login's primary job), fed by the props Shell.tsx computed at that commit, with the env lists unset",
+   "('none') and as the dev seed sets them ('dev': WEIGHTS_VERIFIER_EMAILS=linemanager@, SLAB_INTAKE_EMAILS=",
+   "linemanager@,fab.manager@). Each entry is the sidebar top to bottom: a heading (null for a flat nav) and its",
+@@ -12,9 +12,10 @@
+   "Since then, by request: the Design Names row in Admin (the design-name list, owner 8 Oct 2026), for those who keep the list: an admin (ADMIN@SHOP; ADMIN@INTL) and a shop-floor line manager (LM@SHOP; DUAL LM@SHOP).",
+   "Since then, by request: Commercial's rows follow the work from the PI (owner, 8 Oct 2026: \"PI has to be first step\"; \"currently commercial starts from Enquiry but it should start from PI\"). Proforma invoices moved up to follow Clients, ahead of Orders; Enquiries, kept but off the main path, moved down to follow Delivery Challans (ADMIN@OFFICE and the five Commercial desks; COMM_DOCS has no Enquiries row).",
+   "Since then, by request: Commercial's E-invoices row follows Invoices (owner, 8 Oct 2026: the accountant \"keys in the IRN and the e-way bill with his own login\"; DECISIONS-11), for every Commercial desk, all of which reach the e-invoice screen, the exec and logistics desks read-only (ADMIN@OFFICE, COMM@OFFICE, COMM_MGR@OFFICE, COMM_EXEC@OFFICE, COMM_DOCS@OFFICE, COMM_LOG@OFFICE).",
+-  "Since then, by request: the accountant's own Commercial section, after Inventory (owner, 8 Oct 2026: he \"keys in the IRN and the e-way bill with his own login, limited to the e-invoice work\"; DECISIONS-11 answer 4) \u2014 the rows the area table gives him, Invoices (read) and E-invoices, which came with the e-invoice page (ACCOUNTS@OFFICE).",
++  "Since then, by request: the accountant's own Commercial section, after Inventory (owner, 8 Oct 2026: he \"keys in the IRN and the e-way bill with his own login, limited to the e-invoice work\"; DECISIONS-11 answer 4) — the rows the area table gives him, Invoices (read) and E-invoices, which came with the e-invoice page (ACCOUNTS@OFFICE).",
+   "Since then, by request: the Lab module (owner's decision for the Lab port: a new capped role LAB, plus admins; scripts/0119). A Lab section after Sampling on the admin's Shop Floor nav (ADMIN@SHOP), and a new login, LAB@SHOP, whose whole nav is the module: Samples (Dashboard, Sample Data Entry, Inward / Outward, Plant Samples), Reports (Reports, Downloads) and Setup (Master Data). LAB@SHOP is in dashboard-edge-matrix.json too, which was regenerated from the real middleware (scripts/probe-edge-matrix.mts).",
+-  "Since then, by request: the Accounts row in the office card's Finance section, after Bill Automation (the owner's decision on the Accounts port, October 2026: the receivables register comes into the ERP as a module beside Bill Automation, for ACCOUNTS and FINANCE on the Office branch and admins; lib/accounts/access-rules maySeeAccountsModule) (ADMIN@OFFICE, FINANCE@OFFICE, ACCOUNTS@OFFICE)."
++  "Since then, by request: the Accounts row in the office card's Finance section, after Bill Automation (the owner's decision on the Accounts port, October 2026: the receivables register comes into the ERP as a module beside Bill Automation, for ACCOUNTS and FINANCE on the Office branch and admins; lib/accounts/access-rules maySeeAccountsModule) (ADMIN@OFFICE, FINANCE@OFFICE, ACCOUNTS@OFFICE).",
++  "Since then, by request: Attendance, the register the Robo and Chromia lines share (owner, 18 Oct 2026) — last in both modules' lists, so it is a new Attendance section on the two tablets (ROBO@SHOP, CHROMIA@SHOP and the legacy CHROMIA-branch login) and a row at the end of the admin's Robo and Chromia sections (ADMIN@SHOP). Not the same thing as the HR > Attendance row above, which is the office's own and admin-only."
+  ],
+  "sidebars": {
+   "ADMIN@SHOP": {
+@@ -96,6 +97,10 @@
+       [
+        "Master Lists",
+        "/robo/masters"
++      ],
++      [
++       "Attendance",
++       "/robo/attendance"
+       ]
+      ]
+     },
+@@ -141,6 +146,10 @@
+       [
+        "Import",
+        "/chromia/import"
++      ],
++      [
++       "Attendance",
++       "/chromia/attendance"
+       ]
+      ]
+     },
+@@ -382,6 +391,10 @@
+       [
+        "Master Lists",
+        "/robo/masters"
++      ],
++      [
++       "Attendance",
++       "/robo/attendance"
+       ]
+      ]
+     },
+@@ -427,6 +440,10 @@
+       [
+        "Import",
+        "/chromia/import"
++      ],
++      [
++       "Attendance",
++       "/chromia/attendance"
+       ]
+      ]
+     },
+@@ -1587,6 +1604,15 @@
+        "/robo/masters"
+       ]
+      ]
++    },
++    {
++     "heading": "Attendance",
++     "rows": [
++      [
++       "Attendance",
++       "/robo/attendance"
++      ]
++     ]
+     }
+    ],
+    "dev": [
+@@ -1628,6 +1654,15 @@
+        "/robo/masters"
+       ]
+      ]
++    },
++    {
++     "heading": "Attendance",
++     "rows": [
++      [
++       "Attendance",
++       "/robo/attendance"
++      ]
++     ]
+     }
+    ]
+   },
+@@ -1692,6 +1727,15 @@
+        "/chromia/import"
+       ]
+      ]
++    },
++    {
++     "heading": "Attendance",
++     "rows": [
++      [
++       "Attendance",
++       "/chromia/attendance"
++      ]
++     ]
+     }
+    ],
+    "dev": [
+@@ -1754,6 +1798,15 @@
+        "/chromia/import"
+       ]
+      ]
++    },
++    {
++     "heading": "Attendance",
++     "rows": [
++      [
++       "Attendance",
++       "/chromia/attendance"
++      ]
++     ]
+     }
+    ]
+   },
+@@ -3291,6 +3344,15 @@
+       ]
+      ]
+     },
++    {
++     "heading": "Attendance",
++     "rows": [
++      [
++       "Attendance",
++       "/chromia/attendance"
++      ]
++     ]
++    },
+     {
+      "heading": "Inventory",
+      "rows": [
+@@ -3362,6 +3424,15 @@
+       ]
+      ]
+     },
++    {
++     "heading": "Attendance",
++     "rows": [
++      [
++       "Attendance",
++       "/chromia/attendance"
++      ]
++     ]
++    },
+     {
+      "heading": "Inventory",
+      "rows": [
+-- 
+2.43.0
+

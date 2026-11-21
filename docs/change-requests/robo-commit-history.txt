@@ -1,0 +1,112 @@
+2026-07-30 9d36ae7 Robo module: one ERP-native entry form, ROBO role, namespaced schema
+2026-08-11 7226a04 Robo: the module grows from one entry form to slabs, reports, imports and masters
+2026-08-13 053d1ed robo-rename-display
+2026-08-13 231e3ec robo-rename-machines
+2026-08-13 297e41f robo-rename-display
+2026-08-13 2a5f0df robo-rename-display
+2026-08-14 4b7f1a6 Robo: the tablet can delete a slab, and an admin can put it back
+2026-08-14 e6ed27a Robo: finish the Robo1..Robo4 rename on the import side
+2026-08-14 f5344a6 Robo: a Production Setup can be corrected without starting a second one
+2026-08-14 fb07fd2 Robo: bring across the edit, delete and typed-time work done upstream
+2026-08-18 0f439c5 feat(robo): Batch No. filter on Find a Slab
+2026-08-18 c6ac327 feat(robo): production date and batch no. on the batch setup
+2026-08-20 04210a2 robo(exports): rebuild the two download sheets around what is read
+2026-08-20 1f9c644 robo(entry): show a slab's real remark in Recent slabs
+2026-08-20 28eedbc robo: Production Date now means the date the operator entered
+2026-08-20 2c323de robo(slabs): Batch Information, in place of a shift nobody enters
+2026-08-20 4ed0e75 robo(entry): a design now states the whole card, so two designs cannot mix
+2026-08-20 85a8f84 robo(entry): count the next S.No. and slab number from the register, not the shift
+2026-08-20 89030ae robo(entry): take three restatements off the slab-entry screen
+2026-08-20 9c28550 robo(slabs): Edit setup for any slab, however old, alongside Edit slab
+2026-08-20 d126bff robo(entry): let a long design name wrap instead of truncating on a tablet
+2026-08-20 d44136d robo(entry): on a touch screen, hand the cursor to the next empty field
+2026-08-20 d8a73f0 robo: make the rest of the app agree with the new production date
+2026-08-20 f38a288 robo(setup): stop the setup PATCH erasing each machine s notes
+2026-08-22 02638e9 robo(entry): clear the delay picker when the slab is saved
+2026-08-22 34bd1e5 robo(entry): lay the form out for the tablet it is typed on
+2026-08-22 d30099d robo(entry): count the next S.No. and slab no. from the last row, not the max
+2026-08-23 cd58b89 Security: headers, gates, secrets and dependencies — from the five-way audit
+2026-08-24 43a4dcd robo(slabs): reorder the results table, add Batch No., name the Action column
+2026-08-24 55ec03b robo(entry): rename the recent-slabs "#" column to "S.No."
+2026-08-24 7998756 Phones, tablets, desktops: the experience fixes — no feature, figure or timing changed
+2026-08-24 7a42f66 What the post-ship review caught: nine fixes across the shipped batches
+2026-08-24 87fb474 robo(masters): remove the Operators section
+2026-08-24 cd626aa robo(downloads): reshape the Production and Delay sheets, group by date
+2026-08-24 fcaf661 robo(entry): open a new batch with an empty setup form
+2026-08-28 060e09a Merge remote-tracking branch 'origin/feat/robo-chromia-round3'
+2026-09-02 7b629fa robo: batch matching, date/batch filters, per-slab production date, reports redesign, hourly chart, styled exports
+2026-09-02 84f7e97 Merge robo/chromia round 4: batch matching, per-slab production date, reports redesign, styled exports
+2026-09-04 f78d6cd robo: range-based Production Date / Thickness edit + reordered Entry layout
+2026-09-05 1ac8634 robo(reports): guarantee both charts are fresh + prove the delay aggregation
+2026-09-05 45fcdc9 robo(slabs): show every slab of a filtered batch, not just the newest 200
+2026-09-05 5fc0e36 robo(reports): make "Production Rate per Hour" readable + scrollable on tablets
+2026-09-05 704aba9 robo(entry): add "Close Batch" button between Edit setup and New batch
+2026-09-05 7092ab1 robo(reports): "Avg Slabs/hour" KPI — Total Slabs ÷ batch duration, no clock
+2026-09-05 7dcf1d3 robo(reports): fix "Production Rate per Hour" timeline across midnight + date markers
+2026-09-05 9492914 robo(delays): remove the "+ Add" button -- enter delays inline
+2026-09-05 970b7bf robo(slabs): keep Slab Records filters through Open -> Edit -> Save -> return
+2026-09-05 aab8ed9 robo(reports): add "Total Production Time" KPI + fix KPI order
+2026-09-05 bc291f1 robo(reports): stop a forward-mis-dated slab shifting the hourly chart ~24h
+2026-09-05 ebdce92 robo(delays): fully editable delay log + multiple Robos per delay
+2026-09-07 613f8ac Robo round 5 review fixes: slab-scoped delay edits, one placement rule for the reports, and three smaller repairs
+2026-09-07 620dd49 Merge robo round 5: editable delay log, range edits, fresh reports and the production-time KPIs
+2026-09-08 2dd2779 robo(slabs): split a mixed batch — Batch No. / Design / Target Slabs on slab Edit
+2026-09-08 95c2b9f robo(reports): stop a long-held slab fabricating an extra day; fix first hour label
+2026-09-08 bf3e40f robo(slabs): compute S.No. 1..N per batch from slab-number order, not the stored value
+2026-09-08 d8f3154 robo(downloads): Reference Sheet — a design's latest run, summarised
+2026-09-09 b2f0f7b Merge robo round 6: the reference sheet, a derived S.No., and no phantom extra day
+2026-09-16 016af9a robo(downloads): Reference Sheet — robot delays, per-Robo, per-program rows; drop note/blurb
+2026-09-16 a37f799 Robo: the stored date wins, and the KPI moves with the chart
+2026-09-16 d04ae6e robo(reports): trust each slab's own stored date in the hourly chart — end the date/hour drift
+2026-09-16 d8681b3 robo(slabs): show Batch Number / Design / Target Slabs inline in slab Edit
+2026-09-16 ecba2e2 robo(slabs): show S.No. under every filter, not only a Batch No. search
+2026-09-21 cf1665b Robo Downloads: three sections, and the Reference Sheet's numbers were wrong
+2026-09-25 3aa4b3d robo(entry): next S.No. and slab number always follow the last slab entered, across refresh, navigation and edits
+2026-09-25 4a1598d robo(reports): Production Rate per Hour and its KPIs draw a slab where it was made, not a day off
+2026-09-25 8b7aa60 robo(downloads): QC Rejection Analysis — count only Robo-line faults (Spillage, Pattern Problem in QC Line)
+2026-09-25 db45b25 robo(reports): Daily Slabs / Hour Trend = slabs on the date ÷ hours the line ran that date
+2026-09-25 df654dc robo(entry): "Delays this slab" laid out for tablet and phone - delay code on its own row, read in full
+2026-09-25 df8994f robo(downloads): Reference Sheet shows Reports' own figures for the latest batch; robot delays longest-first with a top-3 pie
+2026-09-28 6ce30f6 Remove dead code: 37 unused files, 132 unused exports, every unused import
+2026-09-28 a9868f1 Remove the API routes nothing calls, and retire the two that still wrote
+2026-09-28 d6c9145 Commercial overview: a period filter, money and flow KPIs, four charts
+2026-09-29 c54f473 Production dashboard: the data layer — every section gated, isolated and pinned
+2026-10-01 1e4aefe Merge origin/main: the Robo round of 25th Sep 2026 (PR #20)
+2026-10-18 2f4b3da robo(reports): the hourly chart says WHY an hour was quiet — every delay in it, with its total
+2026-10-18 36df16c robo(entry/records/downloads): Shift on every slab — picked on entry, shown in the register, in the sheets
+2026-10-18 6bec56e robo(reports): Production Rate per Hour reads shift by shift — one line, three colours, named underneath
+2026-10-18 8e3be4e attendance: one register for the Robo line and the Chromia line
+2026-10-20 153fb30 Robo register import: one record per slab number, batch numbers kept, one transaction, one import at a time: ROBO-2, ROBO-4, ROBO-7, ROBO-8
+2026-10-20 2e10bf5 Remove the unused Robo design and program PATCH routes: ROBO-3
+2026-10-20 2fb70d4 Robo apply-forward edits follow the slab number, not the stored S.No.: ROBO-1
+2026-10-20 3740f53 Restore last deleted slab: a refused restore can be closed, and no longer blocks older deletions or the global Undo: ROBO-9
+2026-10-20 62af2e1 Restore last deleted slab: refuse a taken slab number, never report a failed restore: ROBO-9
+2026-10-20 9f34f3d Fix round: 0123 refuses any attendance table not exactly as declared; every attendance write leaves a trail; the register says its failures where they happen
+2026-10-20 b47ffb7 Robo: the last four API reads refuse revoked sessions too
+2026-10-20 de34bbb Plant dates and times: SHOP-1, SHOP-4, SHOP-5, SHOP-6, FAB-4, COM-3, ROBO-6
+2026-10-20 ea00f45 robo(reference): a design is the same design however the spaces fall
+2026-10-21 757c8ee Merge review lane robo: batches 28, 29 (ROBO-*; script 0131)
+2026-10-21 be8597d robo(reports): an hour's delays are the hour's, cut at the hour
+2026-10-26 5051fca rbac: the tablet on the line marks today, the in-charge keeps the register
+2026-10-26 5705570 robo(reports): the batch's design, beside the batch number
+2026-10-26 8d3800a robo(reports): the shift band says how many slabs the shift made
+2026-10-26 c05e038 PRs #35 and #37: the review's 15 findings fixed, and the owner's answers
+2026-10-27 05b9448 Merge fix/e2e-imports-parse into release/2026-10-27-e2e
+2026-10-27 230704f E2E audit: stop link prefetch on list rows and cards (E2E-13); Back to form only follows a same-site path (E2E-79)
+2026-10-27 40608fc E2E audit: Robo register import no longer rolls back when one design ran two batches on one date (E2E-24)
+2026-10-27 a6955de E2E audit: review fixes (imports-parse)
+2026-10-27 b3c4270 E2E audit: refuse a sheet whose declared range is far too big (E2E-78, E2E-82)
+2026-11-17 126aff1 Merge branch 'claude/robo-rf-import' into claude/robo-plant-fill
+2026-11-17 1805f3b Merge branch 'claude/robo-rf-journey' into claude/robo-plant-fill
+2026-11-17 5ad8b4c Robo, filled from the plant: batch setup pick, each slab's own thickness, In/Out warning
+2026-11-17 7532daf Robo import: fill blank batch and thickness from the plant
+2026-11-17 764e47d Robo plant slab list: corrections from the review and the browser trial
+2026-11-17 7c91a91 Robo slab page: From the plant card
+2026-11-17 8629b7f Robo plant fill: corrections from the review
+2026-11-17 9260697 Merge branch 'claude/robo-rf-coverage' into claude/robo-plant-fill
+2026-11-17 b2fb97c Robo plant slab list: three edge cases from the second review
+2026-11-17 b59a29e Robo plant fill: one thickness rule for the import, one plant row per slab, old batches say so
+2026-11-17 c2fff00 Robo reports: made by the plant vs entered in Robo
+2026-11-17 d1d5b17 Robo plant fill: two edge cases from the check of the corrections
+2026-11-17 dcf95ee Robo entry: the running batch's slabs listed from the plant
+2026-11-17 e0a1eac Robo plant slab list: a slab with no press time shows a dash, not 'not at the press yet'

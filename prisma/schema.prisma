@@ -1,0 +1,881 @@
+// ============================================================================
+// Robo ERP (standalone) - Prisma schema.
+//
+// Every model below is copied BYTE FOR BYTE from Pacific ERP's
+// prisma/schema.prisma (main branch, Nov 2026). Nothing was renamed, so the
+// table and column names are identical to the main ERP's database.
+//
+//   * Robo module: the 14 Robo* models.
+//   * Attendance: AttendanceOperator / AttendanceDay / AttendanceLeave. In the
+//     main ERP this register is shared by Robo and Chromia; here it is Robo's own.
+//   * ActionLog: the audit trail that slab edits/deletes and attendance writes
+//     record into, and that the "restore deleted slab" banner reads.
+//   * READ-ONLY main-ERP tables Robo queries and never writes:
+//       Mis (production hours per batch), PolishQc (Downloads > QC Rejection
+//       Analysis), SyncLineOrderBatch and the Plant* tables (the plant PC's
+//       Breton data, used by the 17 Nov plant-fill features). In a standalone
+//       database they are empty, so those features show their "no plant data"
+//       states and QC Rejection Analysis counts 0.
+//
+// Schema changes: edit this file, then `npm run db:migrate -- --name <change>`.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+
+// ============================================================================
+// ROBO MODULE — Robo production line (merged from ROBO_MODULE standalone app).
+// Models are Robo-prefixed to keep them clearly namespaced from the Airtable-
+// generated tables above. Hand-maintained; NOT touched by gen-schema.py.
+// ============================================================================
+
+model RoboMachine {
+  id            String                 @id @default(cuid())
+  name          String                 @unique
+  type          String
+  isActive      Boolean                @default(true)
+  createdAt     DateTime               @default(now())
+  recipeEntries RoboBatchRecipeEntry[]
+  delayLogs     RoboDelayLog[]
+}
+
+model RoboDesign {
+  id           String            @id @default(cuid())
+  name         String            @unique
+  seriesName   String?
+  createdAt    DateTime          @default(now())
+  programs     RoboProgram[]
+  batchRecipes RoboBatchRecipe[]
+}
+
+model RoboProgram {
+  id           String            @id @default(cuid())
+  name         String            @unique
+  designId     String
+  design       RoboDesign        @relation(fields: [designId], references: [id])
+  createdAt    DateTime          @default(now())
+  batchRecipes RoboBatchRecipe[]
+}
+
+model RoboTool {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  createdAt DateTime @default(now())
+}
+
+model RoboLiquid {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  createdAt DateTime @default(now())
+}
+
+model RoboPowder {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  createdAt DateTime @default(now())
+}
+
+model RoboOperator {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+}
+
+model RoboDelayCode {
+  id              String         @id @default(cuid())
+  code            String         @unique
+  description     String
+  category        String
+  isRobotSpecific Boolean        @default(false)
+  createdAt       DateTime       @default(now())
+  delayLogs       RoboDelayLog[]
+}
+
+model RoboShift {
+  id                String                 @id @default(cuid())
+  date              String
+  shiftNumber       Int
+  startTime         String
+  endTime           String?
+  status            String                 @default("ACTIVE")
+  operatorName      String                 @default("")
+  notes             String?
+  // Fixed cycle times for Roycuts (set once per shift — applies to all slabs)
+  roycut1CycleTime  Int?
+  roycut2CycleTime  Int?
+  roycut3CycleTime  Int?
+  createdAt         DateTime               @default(now())
+  batchRecipes      RoboBatchRecipe[]
+  productionRecords RoboProductionRecord[]
+  delayLogs         RoboDelayLog[]
+
+  // One row per date and shift number. Two register imports at once each
+  // found no row for a date and made one, then recorded every slab again on
+  // it (code review of 20 Oct 2026, ROBO-8). In production by
+  // scripts/0131-robo-shift-date-unique.sql; the code works with or without
+  // it (lib/robo/registerImportDb.ts importShift, api/robo/shifts POST), so
+  // never use an upsert on this key — ON CONFLICT (date, "shiftNumber") fails
+  // outright on a database the script has not reached.
+  @@unique([date, shiftNumber])
+}
+
+model RoboBatchRecipe {
+  id                String                 @id @default(cuid())
+  shiftId           String
+  shift             RoboShift              @relation(fields: [shiftId], references: [id])
+  // The two the operator writes at the top of the setup. productionDate is a
+  // plain yyyy-mm-dd string, the same convention RoboShift.date already uses —
+  // the shift's own date is when the tablet was opened, and a run entered late
+  // or corrected the next morning belongs to the day it was produced, not the
+  // day it was typed. batchNo is the plant's own number for the run, free text
+  // because it is theirs to format. Both optional: setups saved before this
+  // existed have neither, and the form does not force either.
+  productionDate    String?
+  batchNo           String?
+  designId          String?
+  design            RoboDesign?            @relation(fields: [designId], references: [id])
+  programId         String?
+  program           RoboProgram?           @relation(fields: [programId], references: [id])
+  designName        String                 @default("")
+  programName       String                 @default("")
+  targetSlabs       Int?
+  thickness         Float?
+  notes             String?
+  createdAt         DateTime               @default(now())
+  entries           RoboBatchRecipeEntry[]
+  productionRecords RoboProductionRecord[]
+  // CR-003 (Trial Slab Entry, 20 Nov 2026). A setup saved from the Trial Slab
+  // Entry page: one setup per trial slab, so every trial can have its own
+  // programs, liquids, powders and reference photos. Its slab is an ordinary
+  // RoboProductionRecord and counts everywhere a regular slab does; the flag
+  // only keeps trial setups out of the regular Slab Entry's running batch and
+  // labels the slab "(Trial Slab)".
+  isTrial           Boolean                @default(false)
+  referencePhotos   RoboReferencePhoto[]
+}
+
+model RoboBatchRecipeEntry {
+  id              String          @id @default(cuid())
+  batchRecipeId   String
+  batchRecipe     RoboBatchRecipe @relation(fields: [batchRecipeId], references: [id])
+  machineId       String
+  machine         RoboMachine     @relation(fields: [machineId], references: [id])
+  programName     String? // Program name for this specific machine
+  toolName        String?
+  liquidName      String?
+  powderName      String?
+  rollerHeight    String?
+  targetCycleTime Int? // Target cycle time in seconds (fixed for production run)
+  notes           String?
+  // CR-003: on a trial setup, how the liquid / powder was set — "NORMAL" or
+  // "DEFINE" (DEFINE needs a reference photo, RoboReferencePhoto). Null on
+  // every regular setup.
+  liquidSetting   String?
+  powderSetting   String?
+
+  @@unique([batchRecipeId, machineId])
+}
+
+// CR-003: the reference photo a trial setup's Liquid or Powder carries when its
+// setting is DEFINE. One per (setup, machine, LIQUID|POWDER). The original as
+// uploaded and the edited (cropped / annotated) image are both kept, with the
+// editor's steps in `edits` so it can be opened and edited again.
+//
+// batchRecipeId is null while a photo is only uploaded (the setup is not saved
+// yet); saving the setup claims it. Edits never change a stored photo: every
+// save of the editor is a new row, so copying a setup from a previous trial
+// slab cannot alter that slab's photos.
+model RoboReferencePhoto {
+  id            String           @id @default(cuid())
+  batchRecipeId String?
+  batchRecipe   RoboBatchRecipe? @relation(fields: [batchRecipeId], references: [id], onDelete: Cascade)
+  machineId     String?
+  kind          String? // LIQUID | POWDER
+  originalData  Bytes
+  originalType  String
+  originalName  String?
+  editedData    Bytes?
+  editedType    String?
+  edits         Json?
+  notes         String?
+  createdAt     DateTime         @default(now())
+
+  @@unique([batchRecipeId, machineId, kind])
+  @@index([batchRecipeId])
+  @@index([createdAt])
+}
+
+model RoboProductionRecord {
+  id               String           @id @default(cuid())
+  serialNumber     Int?
+  slabNumber       String
+  shiftId          String
+  shift            RoboShift        @relation(fields: [shiftId], references: [id])
+  batchRecipeId    String?
+  batchRecipe      RoboBatchRecipe? @relation(fields: [batchRecipeId], references: [id])
+  // The slab's OWN production date, when it differs from the batch's. A batch
+  // can run past midnight — slabs 1-80 on 1 Sep, slab 81 at 00:03 on 2 Sep —
+  // and the operator sets this per slab so slab 81 reads 2 Sep while 1-80 stay
+  // 1 Sep, all on the same batch, same shift, same running S.No. Highest
+  // precedence in productionDate.ts: this, else the setup's date, else the
+  // shift's. INVARIANT: a real yyyy-mm-dd string or NULL, never "" — every
+  // writer stores `trim() || null`, so "no per-slab date" is exactly NULL and
+  // the where-builders can gate the fallback branches on `productionDate: null`
+  // alone. Nullable and added late, so existing and imported slabs are NULL and
+  // keep falling back to the setup exactly as before.
+  productionDate   String?
+  // The shift the operator picked for this slab: "A" (06:00-14:00), "B"
+  // (14:00-22:00) or "C" (22:00-06:00). NOT RoboShift.shiftNumber, which is one
+  // auto-created row per DAY stamped from the wall clock and shared by every
+  // slab and batch of that day — see lib/robo/productionShift.ts. Nullable and
+  // added late, so slabs saved before it existed and every imported one are
+  // NULL; productionShiftOf then reads the shift off the slab's own In Time.
+  // INVARIANT: "A", "B", "C" or NULL, never "" — the API validates on write.
+  // In production by scripts/0123-robo-shift-attendance.sql.
+  productionShift  String?
+  inTime           String?
+  outTime          String?
+  roymixCycleTime  Int? // RoyMix cycle time in seconds (varies per slab)
+  roymixBodyWeight Float? // RoyMix body weight in kg (recorded per slab)
+  thickness        Float?
+  status           String           @default("COMPLETED")
+  remarks          String?
+  createdAt        DateTime         @default(now())
+  delayLogs        RoboDelayLog[]
+}
+
+model RoboDelayLog {
+  id                 String                @id @default(cuid())
+  shiftId            String
+  shift              RoboShift             @relation(fields: [shiftId], references: [id])
+  productionRecordId String?
+  productionRecord   RoboProductionRecord? @relation(fields: [productionRecordId], references: [id])
+  machineId          String?
+  machine            RoboMachine?          @relation(fields: [machineId], references: [id])
+  machineName        String?
+  delayCodeId        String
+  delayCode          RoboDelayCode         @relation(fields: [delayCodeId], references: [id])
+  durationMinutes    Int
+  startTime          String?
+  endTime            String?
+  remarks            String?
+  createdAt          DateTime              @default(now())
+}
+
+/// One bulk import of a production register workbook (ROBO_MODULE upstream's
+/// ImportLog, namespaced). No relations on purpose - it is a journal, and the
+/// rows it describes survive it.
+model RoboImportLog {
+  id        String   @id @default(cuid())
+  fileName  String
+  period    String?
+  status    String   @default("failed")
+  totalRows Int      @default(0)
+  imported  Int      @default(0)
+  skipped   Int      @default(0)
+  failed    Int      @default(0)
+  message   String?
+  user      String   @default("System Administrator")
+  createdAt DateTime @default(now())
+}
+
+// ==========================================
+// ATTENDANCE MODULE — ONE register, shared by the Robo line and the Chromia line.
+//
+// The same operators work both lines, some days one, some days both, so there
+// is exactly one set of tables and both modules read and write it. That is the
+// whole of the "keep the two ERPs in step" requirement: there is nothing to
+// synchronise because there is only ever one copy. The unique key on
+// (date, operator) is what makes a duplicate impossible rather than unlikely —
+// whichever ERP the day is entered from, it is the same row.
+//
+// Namespaced attendance_* and owned by neither module, like consumable_* and
+// fg_*. Times are "HH:MM" and dates yyyy-mm-dd, the convention the shop-floor
+// modules already use, so nothing here needs a timezone.
+//
+// In production by scripts/0123-robo-shift-attendance.sql (with
+// RoboProductionRecord.productionShift); tests/roboShiftAttendance0123.test.ts
+// holds the script and this block to one another.
+// ==========================================
+
+/// The plant's operators, as the attendance register knows them. Deliberately
+/// NOT RoboOperator: that one is Robo-named, dormant (seeded once, read
+/// nowhere, no UI) and would read oddly as the source of Chromia's roster.
+model AttendanceOperator {
+  id        String   @id @default(cuid())
+  /// Unique, so the same person cannot be added twice from two screens.
+  name      String   @unique
+  /// Kept out of the register without losing their history. A name that has
+  /// ever been used cannot be deleted (the foreign keys below restrict it);
+  /// it is deactivated instead.
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  /// Where the name sits in the register, and the ONLY thing that decides it.
+  /// The roster is the owner's list in the owner's order — the order the line
+  /// is called in, which is not alphabetical and must not be re-sorted into it.
+  /// A new operator is appended (max + 1), so adding one never moves another.
+  ///
+  /// LAST in the model because it is last in the table: it was added after the
+  /// three tables were made, by scripts/0139-attendance-roster-order.sql, and
+  /// ADD COLUMN appends. tests/roboShiftAttendance0123.test.ts holds the two
+  /// orders to one another.
+  sortOrder Int      @default(0)
+
+  days   AttendanceDay[]
+  leaves AttendanceLeave[]
+
+  @@map("attendance_operator")
+}
+
+/// One operator's attendance for one SHIFT of a date — ONE row however many
+/// lines they worked in it. An operator on both lines in a shift has one In
+/// and one Out, not two of each. An operator called back for a second shift
+/// the same day has a second row (shiftNo 2), 7 Nov 2026 (scripts/0156 part 3).
+model AttendanceDay {
+  id         String             @id @default(cuid())
+  /// yyyy-mm-dd.
+  date       String
+  operatorId String
+  operator   AttendanceOperator @relation(fields: [operatorId], references: [id])
+  /// The lines worked, comma-joined in a fixed order: "ROBO", "CHROMIA" or
+  /// "ROBO,CHROMIA" — see parseLines / joinLines in lib/attendance/attendance.ts,
+  /// the only things that read or write this. Empty when nobody has said yet.
+  lines      String             @default("")
+  inTime     String?
+  outTime    String?
+  createdAt  DateTime           @default(now())
+  updatedAt  DateTime           @updatedAt
+  /// Which shift of the date this row is: 1, then 2 for an operator called
+  /// back the same day (7 Nov 2026, scripts/0156 part 3). Every row written
+  /// before is shift 1, and so is every save that does not name a shift (the
+  /// column's default) — so (date, operatorId, shiftNo) unique is, for them,
+  /// exactly the (date, operatorId) unique it replaced. LAST in the model
+  /// because ADD COLUMN appends.
+  shiftNo    Int                @default(1)
+  /// yyyy-mm-dd the Out-Time fell on (17 Nov 2026, scripts/0158 part 2): a
+  /// shift may run on for a day or more, which the two times alone cannot
+  /// say. Null on a row saved before, read from the times (Out before In =
+  /// the next date) — see outDate in lib/attendance/attendance.ts.
+  outDate    String?
+
+  @@unique([date, operatorId, shiftNo])
+  @@index([date])
+  @@map("attendance_day")
+}
+
+/// A leave request, typed by the operator. Free of the attendance row on
+/// purpose: leave is asked for in advance and may never become a day worked.
+model AttendanceLeave {
+  id         String             @id @default(cuid())
+  /// yyyy-mm-dd — the date the leave is for.
+  date       String
+  operatorId String
+  operator   AttendanceOperator @relation(fields: [operatorId], references: [id])
+  /// The hours away, "HH:MM" each. Both empty reads as the whole day.
+  fromTime   String?
+  toTime     String?
+  reason     String             @default("")
+  remarks    String?
+  createdAt  DateTime           @default(now())
+  updatedAt  DateTime           @updatedAt
+  /// Whether the operator said they would be away: "INFORMED" or "UNINFORMED".
+  /// The code, never the label — the words on screen can be reworded without
+  /// rewriting history. "" only for a row written before the field existed;
+  /// every new record must carry one, which the API enforces.
+  ///
+  /// LAST in the model because it is last in the table: added after 0123 made
+  /// it, by scripts/0140-attendance-leave-type.sql, and ADD COLUMN appends.
+  leaveType  String             @default("")
+
+  @@index([date])
+  @@map("attendance_leave")
+}
+
+// ============================================================================
+// ==========================================
+// END ATTENDANCE MODULE — what follows is the audit trail and the main ERP's
+// read-only tables (see the header of this file). The banner exists so
+// tests/roboShiftAttendance0123.test.ts can find where the attendance block ends;
+// in the main ERP that is the ACCOUNTS MODULE banner, which is not part of Robo.
+// ==========================================
+
+/// Append-only log of reversible data-fix actions, enabling "undo the last action".
+model ActionLog {
+  id        String    @id @default(cuid())
+  createdAt DateTime  @default(now()) @map("created_at")
+  actor     String?
+  batchKey  String?   @map("batch_key")
+  kind      String
+  model     String?
+  summary   String
+  payload   Json
+  undone    Boolean   @default(false)
+  undoneAt  DateTime? @map("undone_at")
+
+  @@index([batchKey, undone, createdAt])
+  @@map("action_log")
+}
+
+model Mis {
+  id                                                  String    @id @default(cuid())
+  airtableId                                          String    @unique
+  shift                                               Json?     @map("shift")
+  hour                                                String?   @map("hour")
+  submittedBy                                         String?   @map("submitted_by")
+  createdTime                                         DateTime? @map("created_time")
+  dateAndTime                                         DateTime? @map("date_and_time")
+  date                                                DateTime? @map("date")
+  batch                                               String?   @map("batch")
+  design                                              String?   @map("design")
+  productionType                                      String?   @map("production_type")
+  targetProduction                                    Json?     @map("target_production")
+  startingSlabNumber                                  Float?    @map("starting_slab_number")
+  endingSlabNumber                                    Float?    @map("ending_slab_number")
+  numberOfJumpedSlabs                                 Float?    @map("number_of_jumped_slabs")
+  numberOfSlabsProduced                               Json?     @map("number_of_slabs_produced")
+  achievableSlabOutput                                Json?     @map("achievable_slab_output")
+  totalDeviation                                      Json?     @map("total_deviation")
+  aCategory                                           Float?    @map("a_category")
+  aCategory2                                          Float?    @map("a_category2")
+  bCategory                                           Float?    @map("b_category")
+  cCategory                                           Float?    @map("c_category")
+  reasonForDeviation                                  String[]  @default([]) @map("reason_for_deviation")
+  anyBreakdownYesNo                                   String?   @map("any_breakdown_yes_no")
+  details                                             String?   @map("details")
+  processDelayDurationMinutes                         Float?    @map("process_delay_duration_minutes")
+  cleaningDelayDurationMinutes                        Float?    @map("cleaning_delay_duration_minutes")
+  breakdownDelayDurationMechanicalOrElectricalMinutes Float?    @map("breakdown_delay_duration_mechanical_or_electrical_minutes")
+  poweroutDelayDurationMinutes                        Float?    @map("powerout_delay_duration_minutes")
+  rcaNo                                               String?   @map("rca_no")
+  actionTaken                                         String?   @map("action_taken")
+  sparesUsed                                          String?   @map("spares_used")
+  additionalRemarks                                   String?   @map("additional_remarks")
+  plantAvailability                                   Json?     @map("plant_availability")
+  efficiency                                          Json?     @map("efficiency")
+  overallEquipmentEffectiveness                       Json?     @map("overall_equipment_effectiveness")
+  achievableOverallEfficiency                         Json?     @map("achievable_overall_efficiency")
+  slabSummaryIds                                      String[]  @default([]) @map("slab_summary")
+  slabsPerHourStd                                     Float?    @map("slabs_per_hour_std")
+  slabsPerHourActual                                  Float?    @map("slabs_per_hour_actual")
+  cyclesUnloaded                                      Float?    @map("cycles_unloaded")
+  cyclesMixed                                         Float?    @map("cycles_mixed")
+  thkAtMixerMm                                        Float?    @map("thk_at_mixer_mm")
+  thkAtPressMm                                        String?   @map("thk_at_press_mm")
+  areaOfProblem                                       String[]  @default([]) @map("area_of_problem")
+  productionInchargeName                              String?   @map("production_incharge_name")
+  maintenanceInchargeName                             String?   @map("maintenance_incharge_name")
+  electricalInchargeName                              String?   @map("electrical_incharge_name")
+  mechanicalInchargeName                              String?   @map("mechanical_incharge_name")
+  importedAt                                          DateTime  @default(now()) @map("imported_at")
+  syncedAt                                            DateTime  @updatedAt @map("synced_at")
+  batchKey                                            String?   @map("batch_key")
+  enteredById                                         String?   @map("entered_by_user_id") // who created this row in the ERP (operator self-edit)
+
+  @@index([batchKey])
+  // 0038 hot-path (2026-08-14): the shift-window OR shape ((date_and_time in window) OR
+  // (date_and_time IS NULL AND date in window)) runs ~3x per shift instance — ~270 seq
+  // scans per month-scoreboard load. The planner BitmapOrs these two. imported_at: /tables.
+  @@index([dateAndTime])
+  @@index([date])
+  @@index([importedAt])
+  @@map("mis")
+}
+
+model PolishQc {
+  id                  String    @id @default(cuid())
+  airtableId          String    @unique
+  slabNumber          Float?    @map("slab_number")
+  batchNumber         String?   @map("batch_number")
+  design              String?   @map("design")
+  createdTime         DateTime? @map("created_time")
+  lastModifiedBy      Json?     @map("last_modified_by")
+  rwStatus            String?   @map("rw_status")
+  repolishStatus      String?   @map("repolish_status")
+  inspector           String?   @map("inspector")
+  goingToDispatch     String?   @map("going_to_dispatch")
+  rwDoneBy            String?   @map("rw_done_by")
+  slabThickness       String?   @map("slab_thickness")
+  qualityIssue        String[]  @default([]) @map("quality_issue")
+  qualityGrade        String?   @map("quality_grade")
+  // TWO FACTS, NOT ONE. quality_grade above holds the polishing line's verdict
+  // (A/A2/B/C) — but markQcSlabCts overwrites it with 'CTS' when fabrication
+  // takes the slab, which destroys that verdict and answers a different
+  // question in its place. So:
+  //   quality_grade_before_cts  the verdict as it was, kept by scripts/0056
+  //   slab_mark                 FULL_SLAB / CTS / SAMPLE, by scripts/0057
+  // DECLARED HERE BECAUSE `prisma db push` DROPS UNDECLARED COLUMNS — that is
+  // exactly how alt_role and alt_branch were lost. Do not remove either line.
+  qualityGradeBeforeCts String?  @map("quality_grade_before_cts")
+  slabMark            String    @default("FULL_SLAB") @map("slab_mark")
+  topPolish           Boolean   @default(false) @map("top_polish")
+  bottomPolish        Boolean   @default(false) @map("bottom_polish")
+  lamination          Boolean   @default(false) @map("lamination")
+  sku                 String?   @map("sku")
+  bay                 String?   @map("bay")
+  // NO FINISH = POLISH (scripts/0149): a trigger turns NULL/blank into 'Polish'
+  // on every insert and update, so no row is left without a finish.
+  polishType          String?   @default("Polish") @map("polish_type")
+  dispatchStatus      String?   @map("dispatch_status")
+  barcode             Json?     @map("barcode")
+  barcodeApiLink      Json?     @map("barcode_api_link")
+  linkIds             String[]  @default([]) @map("link")
+  barcodeFromLink     Json?     @map("barcode_from_link")
+  batchNumberFromLink Json?     @map("batch_number_from_link")
+  mainBodyL           Float?    @map("main_body_l")
+  mainBodyA           Float?    @map("main_body_a")
+  mainBodyB           Float?    @map("main_body_b")
+  bBodyL              Float?    @map("b_body_l")
+  bBodyA              Float?    @map("b_body_a")
+  bBodyB              Float?    @map("b_body_b")
+  f3rdBodyL           Float?    @map("f_3rd_body_l")
+  f3rdBodyA           Float?    @map("f_3rd_body_a")
+  f3rdBodyB           Float?    @map("f_3rd_body_b")
+  image               Json?     @map("image")
+  shed4To5            Boolean   @default(false) @map("shed_4_to_5")
+  sentToChromia       Boolean   @default(false) @map("sent_to_chromia")
+  remarks             String?   @map("remarks")
+  formula             Json?     @map("formula")
+  printed             Boolean   @default(false) @map("printed")
+  chromia1Ids         String[]  @default([]) @map("chromia_1")
+  slabSummaryIds      String[]  @default([]) @map("slab_summary")
+  slabSegregationIds  String[]  @default([]) @map("slab_segregation")
+  chromia1Copy        String?   @map("chromia_1_copy")
+  importedAt          DateTime  @default(now()) @map("imported_at")
+  syncedAt            DateTime  @updatedAt @map("synced_at")
+  batchKey            String?   @map("batch_key")
+  enteredById         String?   @map("entered_by_user_id") // who created this row in the ERP (operator self-edit)
+
+  @@index([batchKey])
+  // 0038 hot-path (2026-08-14): slab_number was the app's single worst predicate — 11 ms
+  // seq scan over 3,624 buffers per shift instance in shiftScore (~90/scoreboard load),
+  // plus the dup guard on every QC save. imported_at serves /live findFirst + /tables sort.
+  @@index([slabNumber])
+  @@index([importedAt])
+  // 0051 hot-path (2026-08-23): the "created_time in range OR (created_time IS NULL AND
+  // imported_at in range)" window (misShift polish throughput, run 2-3x per /mis load and again
+  // every 45 s per open tab) was a 105 ms seq scan over 3,624 buffers because only imported_at
+  // was indexed — Postgres cannot BitmapOr the two arms until created_time has one too.
+  @@index([createdTime])
+  @@map("polish_qc")
+}
+
+/// A plant line order (F_MOLDING_ORDER) and the ERP batch and design its slabs
+/// belong to: from a typed line-head row, from MIS, or set by an incharge, whose
+/// word wins over MIS. Until it is resolved the matcher writes nothing for those
+/// slabs (sync_match mode batch_pending).
+model SyncLineOrderBatch {
+  lineOrder   Int      @id @map("line_order")
+  batch       String?
+  batchKey    String?  @map("batch_key")
+  /// Through the design list (currentDesignName).
+  design      String?
+  /// line_head · mis · incharge
+  source      String
+  /// pending · resolved · split
+  state       String
+  /// What it was worked out from: the slabs and MIS hours counted.
+  evidence    Json?
+  setByUserId String?  @map("set_by_user_id")
+  setByName   String?  @map("set_by_name")
+  setAt       DateTime @default(now()) @map("set_at") @db.Timestamptz(6)
+
+  @@map("sync_line_order_batch")
+}
+
+/// T_RPT_SLABS (BL_PACIFIC), the feed `slabs`: one row per slab, by its F_ID.
+/// Upserted: a slab's row fills in over an hour or two as it passes the
+/// distributor, Kreos, the press and the oven.
+model PlantSlab {
+  /// The key the feed's upsert meets on: here F_ID as text ("226011").
+  plantKey    String    @id @map("plant_key")
+  /// The row exactly as the PC sent it: the plant's own column names.
+  data        Json
+  /// The envelope's pc.madeAt: when the PC last read this version (naive
+  /// IST). A version read earlier never overwrites one read later, so an old
+  /// outbox file resent cannot roll a row back.
+  readAt      DateTime? @map("read_at") @db.Timestamp(3)
+  /// sha256 hex of the canonical JSON of data (keys sorted): the same version
+  /// read again moves readAt alone.
+  rowHash     String    @map("row_hash")
+  firstSeenAt DateTime  @default(now()) @map("first_seen_at") @db.Timestamptz(6)
+  /// The last time data changed.
+  changedAt   DateTime  @default(now()) @map("changed_at") @db.Timestamptz(6)
+  changeCount Int       @default(0) @map("change_count")
+  /// The plant_sync_post.id of the delivery that last wrote it (no hard FK).
+  postId      String?   @map("post_id")
+  fId         Int       @map("f_id")
+  /// F_ARTICLE.
+  article     String?
+  /// The last six digits of the article: the slab number on the floor's forms.
+  slabNo      Int?      @map("slab_no")
+  /// F_MOLDING_ORDER, when it is all digits.
+  lineOrder   Int?      @map("line_order")
+  /// F_STS_BEGIN_DIST: the distributor.
+  stsBegin    DateTime? @map("sts_begin") @db.Timestamp(3)
+  /// F_KRS_BEGIN_LAM: Kreos.
+  krsBegin    DateTime? @map("krs_begin") @db.Timestamp(3)
+  /// F_PRE_BEGIN: the press.
+  preBegin    DateTime? @map("pre_begin") @db.Timestamp(3)
+  /// F_OVE_END: out of the oven. NULL while the slab is still on the line.
+  oveEnd      DateTime? @map("ove_end") @db.Timestamp(3)
+
+  @@index([slabNo])
+  @@index([lineOrder])
+  @@index([preBegin])
+  // 0155 (Machine Overview round 2): each round-2 machine's candidate slabs, by
+  // its own plant time (the Distributor's begin, the Kreos's begin, the oven end).
+  @@index([stsBegin])
+  @@index([krsBegin])
+  @@index([oveEnd])
+  @@map("plant_slab")
+}
+
+/// T_RPT_BATCHES (BL_PACIFIC), the feed `mixLines`: one row per mixer line, by
+/// its F_ID; F_CODE is the cycle it belongs to (about 24 rows each). The
+/// shared columns are PlantSlab's.
+model PlantMixLine {
+  plantKey     String    @id @map("plant_key")
+  data         Json
+  readAt       DateTime? @map("read_at") @db.Timestamp(3)
+  rowHash      String    @map("row_hash")
+  firstSeenAt  DateTime  @default(now()) @map("first_seen_at") @db.Timestamptz(6)
+  changedAt    DateTime  @default(now()) @map("changed_at") @db.Timestamptz(6)
+  changeCount  Int       @default(0) @map("change_count")
+  postId       String?   @map("post_id")
+  fId          Int       @map("f_id")
+  /// F_CODE.
+  fCode        String?   @map("f_code")
+  /// F_DATE.
+  fDate        DateTime? @map("f_date") @db.Timestamp(3)
+  /// F_PRODUCT_ORDER.
+  productOrder String?   @map("product_order")
+
+  @@index([fCode])
+  @@index([fDate])
+  @@map("plant_mix_line")
+}
+
+/// T_WK_MES_CHANNEL_ORDERS joined to T_AN_WORK_ORDERS (BL_PACIFIC), channels 1
+/// to 18, the feed `channelOrders`: by the channel order's F_ID. Upserted: its
+/// state moves on to 4. The work order's columns arrive prefixed WO_. The
+/// shared columns are PlantSlab's.
+model PlantChannelOrder {
+  plantKey    String    @id @map("plant_key")
+  data        Json
+  readAt      DateTime? @map("read_at") @db.Timestamp(3)
+  rowHash     String    @map("row_hash")
+  firstSeenAt DateTime  @default(now()) @map("first_seen_at") @db.Timestamptz(6)
+  changedAt   DateTime  @default(now()) @map("changed_at") @db.Timestamptz(6)
+  changeCount Int       @default(0) @map("change_count")
+  postId      String?   @map("post_id")
+  fId         Int       @map("f_id")
+  /// F_ID_T_AN_WORK_ORDERS.
+  workOrderId Int?      @map("work_order_id")
+  /// F_ID_T_LS_MES_CHANNELS.
+  channel     Int?
+  /// F_ID_T_CO_CHANNEL_ORDER_STATES.
+  state       Int?
+  /// F_LUD.
+  lud         DateTime? @db.Timestamp(3)
+  /// WO_F_ID_T_AN_LINE_ORDERS.
+  lineOrder   Int?      @map("line_order")
+  /// WO_F_INDEX.
+  woIndex     Int?      @map("wo_index")
+
+  @@index([workOrderId])
+  @@index([lineOrder])
+  @@index([lud])
+  @@map("plant_channel_order")
+}
+
+/// ETLProcessPress01 (BL_PACIFIC) summarised per slab on the PC, the feed
+/// `pressSlabs`: by the slab code, trimmed. Upserted: a slab is summarised
+/// again every run its rows keep arriving. The shared columns are PlantSlab's.
+model PlantPressSlab {
+  plantKey    String    @id @map("plant_key")
+  data        Json
+  readAt      DateTime? @map("read_at") @db.Timestamp(3)
+  rowHash     String    @map("row_hash")
+  firstSeenAt DateTime  @default(now()) @map("first_seen_at") @db.Timestamptz(6)
+  changedAt   DateTime  @default(now()) @map("changed_at") @db.Timestamptz(6)
+  changeCount Int       @default(0) @map("change_count")
+  postId      String?   @map("post_id")
+  /// slabCode.
+  slabCode    String    @map("slab_code")
+  /// Its last six digits.
+  slabNo      Int?      @map("slab_no")
+  /// firstId, lastId: the press rows' ids the summary covers.
+  firstId     BigInt?   @map("first_id")
+  lastId      BigInt?   @map("last_id")
+  /// lastAt.
+  lastAt      DateTime? @map("last_at") @db.Timestamp(3)
+
+  @@index([slabNo])
+  @@index([lastAt])
+  @@map("plant_press_slab")
+}
+
+/// ETLProcessPress03s (BL_PACIFIC), the feed `pressHourly`: by its id. The
+/// shared columns are PlantSlab's.
+model PlantPressHourly {
+  plantKey    String    @id @map("plant_key")
+  data        Json
+  readAt      DateTime? @map("read_at") @db.Timestamp(3)
+  rowHash     String    @map("row_hash")
+  firstSeenAt DateTime  @default(now()) @map("first_seen_at") @db.Timestamptz(6)
+  changedAt   DateTime  @default(now()) @map("changed_at") @db.Timestamptz(6)
+  changeCount Int       @default(0) @map("change_count")
+  postId      String?   @map("post_id")
+  /// The plant row's id: not this table's key (plant_key is).
+  id          BigInt
+  /// TagName.
+  tagName     String?   @map("tag_name")
+  /// dataTimeStamp.
+  stamp       DateTime? @db.Timestamp(3)
+
+  @@index([stamp])
+  @@map("plant_press_hourly")
+}
+
+/// T_AN_LINE_ORDERS (BL_PACIFIC), the feed `lineOrders`: by its F_ID. The
+/// shared columns are PlantSlab's.
+model PlantLineOrder {
+  plantKey    String    @id @map("plant_key")
+  data        Json
+  readAt      DateTime? @map("read_at") @db.Timestamp(3)
+  rowHash     String    @map("row_hash")
+  firstSeenAt DateTime  @default(now()) @map("first_seen_at") @db.Timestamptz(6)
+  changedAt   DateTime  @default(now()) @map("changed_at") @db.Timestamptz(6)
+  changeCount Int       @default(0) @map("change_count")
+  postId      String?   @map("post_id")
+  fId         Int       @map("f_id")
+  /// F_LUD.
+  lud         DateTime? @db.Timestamp(3)
+  /// F_QTY.
+  qty         Int?
+  /// F_DESCRIPTION.
+  description String?
+
+  @@index([lud])
+  @@map("plant_line_order")
+}
+
+/// T_WK_FIELD_TAGS (BL_PACIFIC), the feed `settings`: one row per change of a
+/// mapped panel setting, keyed "<F_ID>|<F_LUD>|<sig>". INSERT ONLY: a change is
+/// an event, and a resend never moves it. The shared columns are PlantSlab's.
+model PlantSettingChange {
+  plantKey    String    @id @map("plant_key")
+  data        Json
+  readAt      DateTime? @map("read_at") @db.Timestamp(3)
+  rowHash     String    @map("row_hash")
+  firstSeenAt DateTime  @default(now()) @map("first_seen_at") @db.Timestamptz(6)
+  changedAt   DateTime  @default(now()) @map("changed_at") @db.Timestamptz(6)
+  changeCount Int       @default(0) @map("change_count")
+  postId      String?   @map("post_id")
+  fId         Int       @map("f_id")
+  /// F_LUD: when the panel changed it. Part of the key, so never NULL.
+  lud         DateTime  @db.Timestamp(3)
+  /// F_ObjName.
+  objName     String?   @map("obj_name")
+  /// F_VALUE_READ.
+  valueNum    Float?    @map("value_num")
+  /// F_WORD_Value_READ.
+  valueWord   BigInt?   @map("value_word")
+  /// F_String_Value_READ.
+  valueText   String?   @map("value_text")
+  /// observedAt: when the PC saw the change (PC time, naive).
+  observedAt  DateTime? @map("observed_at") @db.Timestamp(3)
+
+  @@index([fId, lud])
+  @@map("plant_setting_change")
+}
+
+/// BL_GEV_PACIFIC Publisher.DeploymentAudits joined to Publisher.Deployments,
+/// the DEPLOY audits, the feed `gevDeploys`: by the audit's Id. The shared
+/// columns are PlantSlab's.
+model PlantGevDeploy {
+  plantKey     String    @id @map("plant_key")
+  data         Json
+  readAt       DateTime? @map("read_at") @db.Timestamp(3)
+  rowHash      String    @map("row_hash")
+  firstSeenAt  DateTime  @default(now()) @map("first_seen_at") @db.Timestamptz(6)
+  changedAt    DateTime  @default(now()) @map("changed_at") @db.Timestamptz(6)
+  changeCount  Int       @default(0) @map("change_count")
+  postId       String?   @map("post_id")
+  /// Id.
+  auditId      String    @map("audit_id")
+  /// DeploymentId.
+  deploymentId String?   @map("deployment_id")
+  /// InstanceId.
+  instanceId   String?   @map("instance_id")
+  /// CreatedOn: UTC, unlike every other plant time.
+  createdOnUtc DateTime? @map("created_on_utc") @db.Timestamp(3)
+  /// Title.
+  title        String?
+
+  @@index([createdOnUtc])
+  @@map("plant_gev_deploy")
+}
+
+/// One row per delivery the ERP answered: accepted, or refused once the key was
+/// right (a wrong key leaves no row). Read by the plant sync page and the quiet
+/// alert. A batchId is accepted ONCE: plant_sync_post_batch_ok_key, a partial
+/// UNIQUE index on (batch_id) WHERE ok, lives in the database only, as Prisma
+/// cannot write it (scripts/0152) — a resent outbox file is answered duplicate
+/// and nothing is written twice, while refusals may repeat a batchId.
+model PlantSyncPost {
+  /// Made by the ERP (randomUUID); the table has no default.
+  id         String   @id
+  /// The envelope's batchId; NULL when the body could not be read.
+  batchId    String?  @map("batch_id")
+  receivedAt DateTime @default(now()) @map("received_at") @db.Timestamptz(6)
+  ok         Boolean
+  /// data · heartbeat
+  kind       String?
+  /// Sent by the PC's Test.
+  test       Boolean  @default(false)
+  pcHost     String?  @map("pc_host")
+  pcScript   String?  @map("pc_script")
+  /// pc.madeAt as the PC wrote it.
+  pcMadeAt   String?  @map("pc_made_at")
+  rowsIn     Int      @default(0) @map("rows_in")
+  /// Per feed: {received, inserted, updated, unchanged, rejected}.
+  stored     Json?
+  /// The first 50 rejected rows: {feed, index, reason}.
+  rejected   Json?
+  /// The PC's cursors, as it sent them.
+  cursors    Json?
+  /// The PC's own errors, as it sent them.
+  pcErrors   Json?    @map("pc_errors")
+  /// The PC's login latch, when it reports one.
+  latch      Json?
+  /// Files still waiting on the PC.
+  outbox     Int?
+  /// Why it was refused (ok = false).
+  refusal    String?
+  bytes      Int?
+  ms         Int?
+
+  @@index([receivedAt])
+  @@map("plant_sync_post")
+}
+
+/// The plant sync's small key/value state, e.g. key quiet-alert: what the quiet
+/// alert (/api/plant/cron/quiet) last sent.
+model PlantSyncState {
+  key       String   @id
+  value     Json
+  /// Stamped by the code's own SQL on each write; the default covers the first.
+  updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+
+  @@map("plant_sync_state")
+}

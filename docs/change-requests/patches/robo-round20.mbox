@@ -1,0 +1,572 @@
+From 55fa78de9b9fc48cdb709c0010b27299dde7d1ba Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 8 Sep 2026 10:53:30 +0000
+Subject: [PATCH] robo(slabs): compute S.No. 1..N per batch from slab-number
+ order, not the stored value
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+S.No. was read straight off the stored serialNumber — the number the operator
+typed (or the old paper register's own column, on an import). On old runs those
+were mistyped: a batch would go 1…36 then restart at 24, so the download showed
+duplicate S.No. and appeared to stop short of the real slab count (a 92-slab
+batch ending at 36). The Batch Numbers were mistyped alongside them, so the
+S.No. cannot be repaired from the S.No.
+
+S.No. is now DERIVED, everywhere it is shown, from the one authoritative order in
+the register: the physical SLAB NUMBER. Slabs are numbered by the plant as they
+are produced, so within a batch, ascending slab number is the production
+sequence — rank by it and the S.No. is a clean 1…N by construction. This fixes
+the old mistyped runs and every run from here on with no column to keep in step;
+the stored serialNumber is left untouched in the database, just no longer shown.
+
+  • New pure, tested helper slabSequence.ts (compareSlabOrder / sequencedByBatch
+    / sequenceNumbersById): numeric slab-number order, createdAt+id only breaking
+    ties, deterministic.
+  • Complete Production download (productionGrouping.ts): both layouts number
+    each batch 1…N in slab-number order — batch mode no longer prints the stored
+    S.No., date mode numbers each group the same way.
+  • Slab detail page: S.No. is this slab's rank within its batch.
+  • Slabs Records: a new S.No. column, computed server-side and shown when a
+    Batch No. is searched (the whole batch is in view); "-" for a partial set.
+
+Applies to old and new records uniformly — no data migration, no schema change.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SPqDFZ7o6eq1utS7hzoQsF
+---
+ src/app/api/robo/production/route.ts |  23 +++++-
+ src/app/robo/slabs/[id]/page.tsx     |  20 ++++-
+ src/components/robo/SlabsBrowser.tsx |  12 ++-
+ src/lib/robo/productionExport.ts     |  11 ++-
+ src/lib/robo/productionGrouping.ts   |  38 ++++++----
+ src/lib/robo/slabSequence.ts         | 109 +++++++++++++++++++++++++++
+ tests/roboProductionExport.test.ts   |   8 +-
+ tests/roboProductionGrouping.test.ts |  33 ++++----
+ tests/roboSlabSequence.test.ts       |  90 ++++++++++++++++++++++
+ 9 files changed, 303 insertions(+), 41 deletions(-)
+ create mode 100644 src/lib/robo/slabSequence.ts
+ create mode 100644 tests/roboSlabSequence.test.ts
+
+diff --git a/src/app/api/robo/production/route.ts b/src/app/api/robo/production/route.ts
+index 0f5160b..5bc17e0 100644
+--- a/src/app/api/robo/production/route.ts
++++ b/src/app/api/robo/production/route.ts
+@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
+ import { resolveBatchRecipeIds } from "@/lib/robo/batchFilter";
+ import { latestSerialNumber, nextSerialNumber } from "@/lib/robo/nextNumbers";
+ import { REGISTER_ORDER } from "@/lib/robo/registerOrderDb";
++import { sequenceNumbersById } from "@/lib/robo/slabSequence";
+ import { slabSearchWhere, slabListTake } from "@/lib/robo/slabSearch";
+ import { SLAB_COMPLETED, SLAB_IN_PROCESSING } from "@/lib/robo/utils";
+ 
+@@ -49,7 +50,27 @@ export async function GET(req: NextRequest) {
+     orderBy: { createdAt: "desc" },
+     take,
+   });
+-  return NextResponse.json(data);
++
++  /* S.No. — the slab's 1..N position in its batch by physical slab number, the
++     authoritative order (change #3); the stored serialNumber was mistyped on old
++     runs and is not shown. It is only meaningful over a WHOLE batch, so it is
++     computed when a Batch No. was searched (batchRecipeIds !== null → the query
++     returns every slab of the matched batch, take === undefined). For a
++     date/slab/design search the set can be partial batches, so seqNo stays null
++     and the column shows "-". Grouped by batchRecipeId; slabs without a batch
++     get no in-batch number. */
++  const seqById =
++    batchRecipeIds !== null
++      ? sequenceNumbersById(
++          data
++            .filter((d): d is typeof d & { batchRecipeId: string } => Boolean(d.batchRecipeId))
++            .map((d) => ({ id: d.id, slabNumber: d.slabNumber, createdAtMs: d.createdAt.getTime(), batchRecipeId: d.batchRecipeId })),
++          (s) => s.batchRecipeId,
++        )
++      : null;
++
++  const withSeq = data.map((d) => ({ ...d, seqNo: seqById?.get(d.id) ?? null }));
++  return NextResponse.json(withSeq);
+ }
+ 
+ /** Thrown inside the create transaction so the clash rolls the whole thing
+diff --git a/src/app/robo/slabs/[id]/page.tsx b/src/app/robo/slabs/[id]/page.tsx
+index f9e1b75..38e42e3 100644
+--- a/src/app/robo/slabs/[id]/page.tsx
++++ b/src/app/robo/slabs/[id]/page.tsx
+@@ -8,6 +8,7 @@ import { canEditRoboSetup } from "@/lib/rbac";
+ import { slabStatusClass, slabStatusLabel, machineLabel } from "@/lib/robo/utils";
+ import { productionDateOf } from "@/lib/robo/productionDate";
+ import { roboThicknessOf } from "@/lib/robo/thickness";
++import { sequenceNumbersById } from "@/lib/robo/slabSequence";
+ 
+ export const dynamic = "force-dynamic";
+ export const metadata: Metadata = { title: "Slab Details | Pacific ERP" };
+@@ -53,6 +54,23 @@ export default async function SlabCompleteDetailsPage({ params }: { params: Prom
+   });
+   if (!record) notFound();
+ 
++  /* S.No. is the slab's position within its batch by physical slab number — the
++     authoritative production order — not the stored serialNumber, which was
++     mistyped on old runs (see slabSequence.ts). Rank this slab among its batch's
++     slabs; a slab with no batch has no in-batch position. */
++  let seqNo: number | null = null;
++  if (record.batchRecipeId) {
++    const mates = await prisma.roboProductionRecord.findMany({
++      where: { batchRecipeId: record.batchRecipeId },
++      select: { id: true, slabNumber: true, createdAt: true },
++    });
++    seqNo =
++      sequenceNumbersById(
++        mates.map((m) => ({ id: m.id, slabNumber: m.slabNumber, createdAtMs: m.createdAt.getTime() })),
++        () => "batch",
++      ).get(record.id) ?? null;
++  }
++
+   const setup = record.batchRecipe;
+   /* Same gate the Edit setup tab uses, so this page cannot offer a button that
+      lands on a screen refusing to open. It is deliberately wider than the slab
+@@ -180,7 +198,7 @@ export default async function SlabCompleteDetailsPage({ params }: { params: Prom
+         {/* ── 3. Slab Information ── */}
+         <SectionCard title="3. Slab Information">
+           <div className="grid grid-cols-1 gap-x-8 md:grid-cols-2">
+-            <Field label="S.No." value={dash(record.serialNumber)} />
++            <Field label="S.No." value={dash(seqNo)} />
+             <Field label="Slab Number" value={dash(record.slabNumber)} />
+             <Field label="In Time" value={dash(record.inTime)} />
+             <Field label="Out Time" value={dash(record.outTime)} />
+diff --git a/src/components/robo/SlabsBrowser.tsx b/src/components/robo/SlabsBrowser.tsx
+index 9fc8b19..b6b678b 100644
+--- a/src/components/robo/SlabsBrowser.tsx
++++ b/src/components/robo/SlabsBrowser.tsx
+@@ -9,6 +9,10 @@ import { DESIGN_SUGGESTIONS } from "@/lib/robo/design-presets";
+ interface SlabRecord {
+   id: string;
+   serialNumber: number | null;
++  /** S.No. = the slab's 1..N position in its batch by physical slab number,
++   *  computed server-side (change #3). Present when the list is a whole batch
++   *  (a Batch No. search); null otherwise, since a partial set has no batch rank. */
++  seqNo?: number | null;
+   slabNumber: string;
+   /** The slab's own production date, when it has one (a batch past midnight).
+    *  Highest precedence in productionDateOf — see productionDate.ts. */
+@@ -213,7 +217,7 @@ export function SlabsBrowser({ canDelete = false }: {
+           <table className="w-full text-sm">
+             <thead className="border-b border-gray-200 bg-slate-50">
+               <tr>
+-                {["Production Date", "Design Name", "Batch No.", "Slab Number", "In Time", "Out Time", "Status", "Remarks", "Action"].map((h, i, arr) => (
++                {["S.No.", "Production Date", "Design Name", "Batch No.", "Slab Number", "In Time", "Out Time", "Status", "Remarks", "Action"].map((h, i, arr) => (
+                   <th key={h} className={`whitespace-nowrap px-4 py-3 text-xs font-semibold uppercase tracking-wide text-gray-500 ${i === arr.length - 1 ? "text-right" : "text-left"}`}>{h}</th>
+                 ))}
+               </tr>
+@@ -221,13 +225,17 @@ export function SlabsBrowser({ canDelete = false }: {
+             <tbody>
+               {!loading && results.length === 0 && (
+                 <tr>
+-                  <td colSpan={9} className="px-4 py-12 text-center text-gray-400">
++                  <td colSpan={10} className="px-4 py-12 text-center text-gray-400">
+                     {applied ? "No slabs match these filters." : "No production records yet."}
+                   </td>
+                 </tr>
+               )}
+               {results.map(r => (
+                 <tr key={r.id} className="border-b border-gray-50 transition hover:bg-slate-50">
++                  {/* S.No. — the slab's 1..N position in its batch, computed from
++                      the physical slab-number order (change #3). Shown when a Batch
++                      No. is searched (the whole batch is in view); "-" otherwise. */}
++                  <td className="whitespace-nowrap px-4 py-3 font-medium text-gray-700">{r.seqNo ?? "-"}</td>
+                   {/* The date the operator entered on the setup, not the shift's
+                       own — that one is the day the tablet was open, so a
+                       register caught up on Monday showed Monday for every slab
+diff --git a/src/lib/robo/productionExport.ts b/src/lib/robo/productionExport.ts
+index 838e2c5..18e2d41 100644
+--- a/src/lib/robo/productionExport.ts
++++ b/src/lib/robo/productionExport.ts
+@@ -83,15 +83,18 @@ const dash = (v: string | number | null | undefined): string | number =>
+ /**
+  * One row, keyed by exactly the columns above.
+  *
+- * `fallbackSerial` is used only when the slab carries no S.No. of its own — the
+- * row's position in the sheet, so the column is never blank.
++ * `seqNo` is the slab's S.No. — its 1…N position in its batch, computed by the
++ * caller from the authoritative slab-number order (see slabSequence.ts). The
++ * stored `serialNumber` is deliberately NOT used: it was mistyped on old runs
++ * (a batch numbered 1…36 then restarting at 24), so trusting it showed
++ * duplicates and stopped short of the real slab count.
+  */
+ export function productionRecordRow(
+   r: ProductionRowInput,
+-  fallbackSerial: number,
++  seqNo: number,
+ ): ProductionRecordRow {
+   return {
+-    "S.No.":                  r.serialNumber ?? fallbackSerial,
++    "S.No.":                  seqNo,
+     "Production Date":        dash(r.productionDate),
+     "Design Name":            dash(r.designName),
+     "Thickness (cm)":         dash(r.thickness),
+diff --git a/src/lib/robo/productionGrouping.ts b/src/lib/robo/productionGrouping.ts
+index f1563d3..2f534cb 100644
+--- a/src/lib/robo/productionGrouping.ts
++++ b/src/lib/robo/productionGrouping.ts
+@@ -15,11 +15,16 @@
+  *    at 1, and the group is closed by blank rows and a "Total: X records" line
+  *    before the next batch begins.
+  *
+- * The S.No. reset is DISPLAY ONLY. The stored serialNumber and the register's
+- * running sequence are never touched — the reset is just this sheet numbering
+- * the rows it chose to show for one batch.
++ * S.No. is COMPUTED, not read from the stored serialNumber. Within each batch
++ * the slabs are ranked by their physical slab number — the authoritative
++ * production order — and numbered 1…N (see slabSequence.ts). That is what fixes
++ * the old mistyped runs (a batch numbered 1…36 then restarting at 24, appearing
++ * to end far short of its real slab count): the sheet now always shows a clean
++ * 1…N for the batch, in slab-number order. The stored serialNumber is left
++ * untouched in the database — it is simply no longer what the sheet prints.
+  */
+ import { canonBatchNo } from "./batchNo.ts";
++import { sequencedByBatch } from "./slabSequence.ts";
+ import {
+   productionRecordRow,
+   type ProductionRecordRow,
+@@ -50,21 +55,24 @@ function totalRow(label: string, count: number): ProductionRecordRow {
+ }
+ 
+ /**
+- * Batch mode: one continuous list, stored S.No. preserved, no per-date breaks.
++ * Batch mode: one continuous list for the selected batch. Rows are laid out in
++ * slab-number order and numbered 1…N — the batch's real sequence, whatever the
++ * mistyped stored S.No. said.
+  */
+ export function assembleContinuous(records: readonly ExportRecord[]): ProductionRecordRow[] {
+-  const sorted = [...records].sort(chrono);
+-  // fallbackSerial (i+1) is used ONLY when a row carries no stored S.No.; a real
+-  // serialNumber wins, so the register's own numbers show through unchanged.
+-  const rows: ProductionRecordRow[] = sorted.map((r, i) => productionRecordRow(r, i + 1));
++  const rows: ProductionRecordRow[] = sequencedByBatch(records).map(({ slab, seqNo }) =>
++    productionRecordRow(slab, seqNo),
++  );
+   rows.push({});
+-  rows.push(totalRow("TOTAL", sorted.length));
++  rows.push(totalRow("TOTAL", records.length));
+   return rows;
+ }
+ 
+ /**
+- * Date mode: group by batch, restart S.No. at 1 per group (display only), and
+- * close each group with blank rows + a total before the next.
++ * Date mode: group by batch, number each group 1…N by slab-number order, and
++ * close each group with blank rows + a total before the next. Groups appear in
++ * the order their earliest record was produced; the rows INSIDE a group run in
++ * slab-number order so the S.No. reads 1…N.
+  */
+ export function assembleByBatch(records: readonly ExportRecord[]): ProductionRecordRow[] {
+   const sorted = [...records].sort(chrono);
+@@ -86,10 +94,10 @@ export function assembleByBatch(records: readonly ExportRecord[]): ProductionRec
+   const groupList = [...groups.values()];
+   groupList.forEach((g, gi) => {
+     rows.push(batchHeaderRow(g.label, g.design));
+-    // S.No. restarts at 1 for the group: drop the stored serial so
+-    // productionRecordRow falls back to the group-local position. The stored
+-    // value is untouched in the database — this is the sheet's own numbering.
+-    g.items.forEach((r, i) => rows.push(productionRecordRow({ ...r, serialNumber: null }, i + 1)));
++    // Number the group 1…N by slab-number order (slabSequence.ts), not by the
++    // stored S.No. and not by row position — so a batch whose operator S.No. was
++    // mistyped still reads a clean 1…N. The stored value is untouched.
++    sequencedByBatch(g.items).forEach(({ slab, seqNo }) => rows.push(productionRecordRow(slab, seqNo)));
+     rows.push({}, {}); // 2 blank rows after the batch's records
+     rows.push(totalRow("Total", g.items.length));
+     if (gi < groupList.length - 1) rows.push({}, {}); // spacing before the next batch
+diff --git a/src/lib/robo/slabSequence.ts b/src/lib/robo/slabSequence.ts
+new file mode 100644
+index 0000000..93d3ab3
+--- /dev/null
++++ b/src/lib/robo/slabSequence.ts
+@@ -0,0 +1,109 @@
++/**
++ * The S.No. shown for a slab — computed, not trusted.
++ *
++ * Pure and alias-free so `node --test` can reach it, the same split
++ * productionDate.ts / slabSearch.ts use.
++ *
++ * ── WHY THIS EXISTS ────────────────────────────────────────────────────────
++ * S.No. is the slab's position in its batch — 1, 2, 3, … up to the batch's slab
++ * count. It was read straight off the stored `serialNumber`, the number the
++ * operator typed on the tablet (or the old paper register's own column, on an
++ * import). That column is not reliable: on old runs the numbers were mistyped —
++ * a batch would go 1…36 and then start again at 24 — so the sheet showed
++ * duplicates and appeared to stop short of the real slab count (a 92-slab batch
++ * ending at S.No. 36). The Batch Numbers were mistyped alongside them, so the
++ * S.No. cannot be repaired from the S.No.
++ *
++ * So S.No. is no longer stored-and-trusted; it is DERIVED from the one ordering
++ * in the register that is authoritative: the physical SLAB NUMBER. Slabs are
++ * numbered by the plant as they are produced (…148774, 148775, 148776…), so
++ * within a batch, ascending slab number IS the production sequence. Rank the
++ * batch's slabs by it and the S.No. is 1…N by construction — correct for the old
++ * mistyped runs and for every run from here on, with no column to keep in step.
++ *
++ * `serialNumber` is left in the database untouched; it is simply no longer what
++ * anyone is shown. Nothing here reads or writes it.
++ */
++
++/** A slab reduced to what the ordering needs. `slabNumber` is the plant's
++ *  physical number (usually all digits); `createdAtMs`/`id` only ever break a
++ *  tie, so the order is deterministic when two slabs share a number or a slab
++ *  number carries no digits. */
++export interface SeqSlab {
++  slabNumber: string | null | undefined;
++  /** createdAt as epoch ms — entry order, the tiebreak when slab numbers tie. */
++  createdAtMs?: number | null;
++  /** A stable final tiebreak so equal rows never reorder between runs. */
++  id?: string | null;
++}
++
++/**
++ * The numeric value of a slab number's leading digits, for ordering.
++ *
++ * The register is almost all plain numbers, and those must sort as numbers, not
++ * as text — "9" before "10", "148775" before "148776" — so a bare string sort
++ * (where "10" precedes "9") is wrong. Leading digits are read as an integer;
++ * leading zeros are part of the value, not the ordering ("00042" → 42). A number
++ * that does not start with a digit (the odd "A-12", or a blank) has no numeric
++ * position, so it sorts AFTER every real number and is ordered among its kind by
++ * the createdAt/id tiebreaks — it never jumps to the front of a batch.
++ */
++export function slabNumberValue(slabNumber: string | null | undefined): number {
++  const m = /^\s*(\d+)/.exec((slabNumber ?? "").trim());
++  return m ? Number(m[1]) : Number.MAX_SAFE_INTEGER;
++}
++
++/**
++ * Order two slabs by the authoritative sequence: physical slab number ascending,
++ * then entry order, then id. Total and deterministic.
++ */
++export function compareSlabOrder(a: SeqSlab, b: SeqSlab): number {
++  const va = slabNumberValue(a.slabNumber);
++  const vb = slabNumberValue(b.slabNumber);
++  if (va !== vb) return va - vb;
++  // Same numeric value (e.g. two non-numeric, or a genuine duplicate) — fall to
++  // entry order, then the slab-number text, then id, so the result is stable.
++  const ca = a.createdAtMs ?? 0;
++  const cb = b.createdAtMs ?? 0;
++  if (ca !== cb) return ca - cb;
++  const sa = (a.slabNumber ?? "").trim();
++  const sb = (b.slabNumber ?? "").trim();
++  if (sa !== sb) return sa < sb ? -1 : 1;
++  return (a.id ?? "").localeCompare(b.id ?? "");
++}
++
++/**
++ * A batch's slabs in authoritative order, each paired with its S.No. (1…N).
++ * The input is one batch's slabs; the caller groups by batch first.
++ */
++export function sequencedByBatch<T extends SeqSlab>(slabs: readonly T[]): { slab: T; seqNo: number }[] {
++  return [...slabs].sort(compareSlabOrder).map((slab, i) => ({ slab, seqNo: i + 1 }));
++}
++
++/**
++ * S.No. for every slab across several batches, keyed by id.
++ *
++ * Slabs are grouped by `batchKey` (the batch they belong to — normally the
++ * batch-recipe id), each group is ranked on its own, and the result maps a
++ * slab's id to its 1…N position in its batch. A caller that only has part of a
++ * batch loaded would get a partial ranking, so this is used where a WHOLE batch
++ * is in hand (an export of one batch, a batch-filtered list); a single slab's
++ * S.No. is found the same way, over its batch's slabs.
++ */
++export function sequenceNumbersById<T extends SeqSlab & { id: string }>(
++  slabs: readonly T[],
++  batchKey: (slab: T) => string,
++): Map<string, number> {
++  const groups = new Map<string, T[]>();
++  for (const s of slabs) {
++    const k = batchKey(s);
++    let g = groups.get(k);
++    if (!g) { g = []; groups.set(k, g); }
++    g.push(s);
++  }
++  const out = new Map<string, number>();
++  for (const g of groups.values()) {
++    for (const { slab, seqNo } of sequencedByBatch(g)) out.set(slab.id, seqNo);
++  }
++  return out;
++}
+diff --git a/tests/roboProductionExport.test.ts b/tests/roboProductionExport.test.ts
+index 52f019d..6b90441 100644
+--- a/tests/roboProductionExport.test.ts
++++ b/tests/roboProductionExport.test.ts
+@@ -120,7 +120,11 @@ test("a blank cell is a dash, and zero is not blank", () => {
+   assert.equal(productionRecordRow(input({ thickness: 0 }), 1)["Thickness (cm)"], 0);
+ });
+ 
+-test("a slab with no S.No. falls back to its row number", () => {
++test("S.No. is the computed sequence number, never the stored serialNumber", () => {
++  // change #3: the stored serialNumber was mistyped on old runs, so it is ignored
++  // entirely — the row shows the 1..N position the caller computed from the
++  // slab-number order (slabSequence.ts), whatever the old column said.
+   assert.equal(productionRecordRow(input({ serialNumber: null }), 7)["S.No."], 7);
+-  assert.equal(productionRecordRow(input({ serialNumber: 36 }), 7)["S.No."], 36);
++  assert.equal(productionRecordRow(input({ serialNumber: 36 }), 7)["S.No."], 7); // 36 ignored
++  assert.equal(productionRecordRow(input({ serialNumber: 999 }), 1)["S.No."], 1);
+ });
+diff --git a/tests/roboProductionGrouping.test.ts b/tests/roboProductionGrouping.test.ts
+index b27eac9..20e530e 100644
+--- a/tests/roboProductionGrouping.test.ts
++++ b/tests/roboProductionGrouping.test.ts
+@@ -3,11 +3,12 @@ import assert from "node:assert/strict";
+ 
+ import { assembleContinuous, assembleByBatch, type ExportRecord } from "../src/lib/robo/productionGrouping.ts";
+ 
+-/* The Complete Production sheet's two layouts (change 6):
+-   • a batch chosen → one continuous list, stored S.No. preserved;
+-   • only a date filter → grouped by batch, S.No. restarting per group with
+-     blank rows and a total between them.
+-   The S.No. reset is display-only — nothing here touches the stored value. */
++/* The Complete Production sheet's two layouts:
++   • a batch chosen → one continuous list;
++   • only a date filter → grouped by batch, with blank rows and a total between.
++   In BOTH, S.No. is computed 1..N per batch in slab-number order (change #3),
++   never read from the mistyped stored serialNumber. Nothing here touches the
++   stored value. */
+ 
+ const rec = (o: Partial<ExportRecord>): ExportRecord => ({
+   serialNumber: null,
+@@ -27,27 +28,27 @@ const rec = (o: Partial<ExportRecord>): ExportRecord => ({
+ 
+ /* ── continuous (a batch is selected) ─────────────────────────────────────── */
+ 
+-test("continuous keeps the stored S.No. and flows dates together with no blanks", () => {
+-  // One batch, 18 Jul then 19 Jul — the change (6) example: S.No. 121 → 18 Jul,
+-  // 122 → 19 Jul, straight on.
+-  const s121 = rec({ serialNumber: 121, slabNumber: "A121", productionDate: "2026-07-18", createdAtMs: 100 });
+-  const s122 = rec({ serialNumber: 122, slabNumber: "A122", productionDate: "2026-07-19", createdAtMs: 200 });
+-  const rows = assembleContinuous([s122, s121]); // deliberately out of order
++test("continuous numbers 1..N in slab-number order and flows dates together with no blanks", () => {
++  // One batch across 18→19 Jul. Slab numbers 148901/148902 are the real order;
++  // the operator's stored S.No. (500, 499) is mistyped and must be ignored.
++  const s1 = rec({ serialNumber: 500, slabNumber: "148901", productionDate: "2026-07-18", createdAtMs: 100 });
++  const s2 = rec({ serialNumber: 499, slabNumber: "148902", productionDate: "2026-07-19", createdAtMs: 200 });
++  const rows = assembleContinuous([s2, s1]); // deliberately out of order
+ 
+   assert.equal(rows.length, 4); // two records, a blank, a total
+-  assert.equal(rows[0]["S.No."], 121);
++  assert.equal(rows[0]["S.No."], 1); // 148901 first → S.No. 1, NOT the stored 500
+   assert.equal(rows[0]["Production Date"], "2026-07-18");
+-  assert.equal(rows[1]["S.No."], 122);
++  assert.equal(rows[1]["S.No."], 2); // 148902 → S.No. 2
+   assert.equal(rows[1]["Production Date"], "2026-07-19");
+-  // No blank row BETWEEN the two records, and no S.No. reset — continuous.
++  // No blank row BETWEEN the two records — continuous.
+   assert.deepEqual(rows[2], {});
+   assert.equal(rows[3]["Slab No."], "TOTAL");
+   assert.equal(rows[3]["Remarks"], "2 records");
+ });
+ 
+-test("continuous shows a slab's own S.No. even when it carries none (position fallback)", () => {
++test("continuous numbers a lone slab 1, never blank", () => {
+   const rows = assembleContinuous([rec({ serialNumber: null, slabNumber: "X", createdAtMs: 1 })]);
+-  assert.equal(rows[0]["S.No."], 1); // fallback to position, never blank
++  assert.equal(rows[0]["S.No."], 1);
+ });
+ 
+ /* ── grouped by batch (only a date filter) ─────────────────────────────────── */
+diff --git a/tests/roboSlabSequence.test.ts b/tests/roboSlabSequence.test.ts
+new file mode 100644
+index 0000000..14cc261
+--- /dev/null
++++ b/tests/roboSlabSequence.test.ts
+@@ -0,0 +1,90 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++
++import {
++  slabNumberValue,
++  compareSlabOrder,
++  sequencedByBatch,
++  sequenceNumbersById,
++  type SeqSlab,
++} from "../src/lib/robo/slabSequence.ts";
++
++/* S.No. is derived from the physical slab number (the authoritative production
++   sequence), never from the mistyped stored serialNumber. */
++
++test("slab numbers sort as numbers, not as text", () => {
++  assert.equal(slabNumberValue("9"), 9);
++  assert.equal(slabNumberValue("10"), 10);
++  assert.equal(slabNumberValue("148775"), 148775);
++  // leading zeros are value, not order
++  assert.equal(slabNumberValue("00042"), 42);
++  // no leading digit → sorts after every real number
++  assert.equal(slabNumberValue("A-12"), Number.MAX_SAFE_INTEGER);
++  assert.equal(slabNumberValue(""), Number.MAX_SAFE_INTEGER);
++  assert.equal(slabNumberValue(null), Number.MAX_SAFE_INTEGER);
++});
++
++test("a batch with mistyped S.No. still numbers 1..N by slab number", () => {
++  // The reported case: slab numbers run clean 148775.. even though the operator's
++  // S.No. went 1..3 then restarted. Delivered shuffled to prove order comes from
++  // the slab number, not input order.
++  const slabs: (SeqSlab & { id: string; serial?: number })[] = [
++    { id: "c", slabNumber: "148777", serial: 1 },  // operator restarted S.No. at 1
++    { id: "a", slabNumber: "148775", serial: 1 },
++    { id: "b", slabNumber: "148776", serial: 2 },
++  ];
++  const seq = sequencedByBatch(slabs);
++  assert.deepEqual(seq.map((x) => x.slab.id), ["a", "b", "c"]);
++  assert.deepEqual(seq.map((x) => x.seqNo), [1, 2, 3]);
++});
++
++test("numeric ordering beats string ordering across a digit-count boundary", () => {
++  const slabs: (SeqSlab & { id: string })[] = [
++    { id: "x", slabNumber: "100" },
++    { id: "y", slabNumber: "99" },
++  ];
++  assert.deepEqual(sequencedByBatch(slabs).map((s) => s.slab.id), ["y", "x"]); // 99 before 100
++});
++
++test("ties (equal / non-numeric numbers) fall to entry order then id, deterministically", () => {
++  const slabs: (SeqSlab & { id: string })[] = [
++    { id: "b", slabNumber: "A", createdAtMs: 200 },
++    { id: "a", slabNumber: "A", createdAtMs: 100 },
++    { id: "c", slabNumber: "A", createdAtMs: 100 }, // same time as a → id breaks it
++  ];
++  const order = sequencedByBatch(slabs).map((s) => s.slab.id);
++  assert.deepEqual(order, ["a", "c", "b"]); // 100/a, 100/c, then 200/b
++  // stable across a reshuffle
++  const reshuffled = sequencedByBatch([slabs[2], slabs[0], slabs[1]]).map((s) => s.slab.id);
++  assert.deepEqual(reshuffled, order);
++});
++
++test("compareSlabOrder is a total order usable directly in sort()", () => {
++  const arr: (SeqSlab & { id: string })[] = [
++    { id: "3", slabNumber: "300" },
++    { id: "1", slabNumber: "100" },
++    { id: "2", slabNumber: "200" },
++  ];
++  assert.deepEqual([...arr].sort(compareSlabOrder).map((s) => s.id), ["1", "2", "3"]);
++});
++
++test("sequenceNumbersById numbers each batch on its own, 1..N", () => {
++  const slabs = [
++    { id: "a1", slabNumber: "500", batch: "A" },
++    { id: "a2", slabNumber: "501", batch: "A" },
++    { id: "b1", slabNumber: "800", batch: "B" },
++    { id: "a3", slabNumber: "502", batch: "A" },
++    { id: "b2", slabNumber: "799", batch: "B" }, // lower number → B's first
++  ];
++  const m = sequenceNumbersById(slabs, (s) => s.batch);
++  assert.equal(m.get("a1"), 1);
++  assert.equal(m.get("a2"), 2);
++  assert.equal(m.get("a3"), 3);
++  assert.equal(m.get("b2"), 1); // 799 < 800
++  assert.equal(m.get("b1"), 2);
++});
++
++test("empty input yields no rows and no ranks", () => {
++  assert.deepEqual(sequencedByBatch([]), []);
++  assert.equal(sequenceNumbersById([], () => "x").size, 0);
++});
+-- 
+2.43.0
+

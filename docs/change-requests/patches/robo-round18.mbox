@@ -1,0 +1,850 @@
+From 67ac2eb04be1b2d13d49fdb8580ef079ecfd3a69 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 8 Sep 2026 09:34:28 +0000
+Subject: [PATCH] =?UTF-8?q?robo(downloads):=20Reference=20Sheet=20?=
+ =?UTF-8?q?=E2=80=94=20a=20design's=20latest=20run,=20summarised?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds a separate "Reference Sheet" section to the Downloads page: one Design
+Name field that finds the design's LATEST production run and downloads a
+one-page Excel summary — the reference to check before running that design
+again. Existing Complete Production / Delay List downloads are untouched.
+
+Design matching is by name only, thickness ignored: "Costa 2 cm" and
+"Costa 3 cm" are one design (Costa), while "Bellagio Green" and "Bellagio
+Grey" stay distinct (designMatchKey strips only a trailing thickness token).
+No production for the design → "No previous production record found".
+
+The sheet is a summary, one item per row: Production Date (first slab),
+Batch Number, Design Name, Thickness, Total Slabs, Total Production Time,
+Total Delays, Avg Slabs/hour, Robo Program Names (only Robos actually set up
+for the run) and Robot Delays (the G-category delays that occurred, blank if
+none). Total Slabs / Total Production Time / Total Delays reuse the exact
+Reports helpers (count, productionSpanMinutes, summed durationMinutes) over
+the run's slabs, so they equal what Reports shows for that run.
+
+Avg Slabs/hour uses the approved Reference-Sheet formula with delays
+SUBTRACTED: Total Slabs ÷ (batch duration − actual delay time), where the
+actual delay time is the UNION of the delay intervals (mergedDelayMinutes)
+so overlapping downtime is not removed twice. This is the one figure that
+intentionally differs from the Reports KPI, which leaves delays in.
+
+Pure, tested helpers (referenceSheet.ts: designMatchKey, mergedDelayMinutes,
+avgSlabsPerHourNet — 16 node --test cases); the DB half (referenceData.ts)
+is shared by the preview API and the Excel export so screen and file can
+never diverge. stampMinutes is exported from productionSpan.ts for the delay
+interval anchoring. No schema or DB change.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SPqDFZ7o6eq1utS7hzoQsF
+---
+ src/app/api/robo/exports/reference/route.ts | 107 ++++++++++
+ src/app/api/robo/reference/summary/route.ts |  27 +++
+ src/components/robo/DownloadsClient.tsx     | 105 ++++++++++
+ src/lib/robo/productionSpan.ts              |   2 +-
+ src/lib/robo/referenceData.ts               | 221 ++++++++++++++++++++
+ src/lib/robo/referenceSheet.ts              | 137 ++++++++++++
+ tests/roboReferenceSheet.test.ts            | 119 +++++++++++
+ 7 files changed, 717 insertions(+), 1 deletion(-)
+ create mode 100644 src/app/api/robo/exports/reference/route.ts
+ create mode 100644 src/app/api/robo/reference/summary/route.ts
+ create mode 100644 src/lib/robo/referenceData.ts
+ create mode 100644 src/lib/robo/referenceSheet.ts
+ create mode 100644 tests/roboReferenceSheet.test.ts
+
+diff --git a/src/app/api/robo/exports/reference/route.ts b/src/app/api/robo/exports/reference/route.ts
+new file mode 100644
+index 0000000..75a8880
+--- /dev/null
++++ b/src/app/api/robo/exports/reference/route.ts
+@@ -0,0 +1,107 @@
++import { NextRequest, NextResponse } from "next/server";
++import * as XLSX from "xlsx-js-style";
++import { buildReferenceSummary } from "@/lib/robo/referenceData";
++import { formatDate, fmtDurationLong } from "@/lib/robo/utils";
++
++export const dynamic = "force-dynamic";
++export const revalidate = 0;
++
++/** Filesystem-safe design name for the download file name. */
++function safeName(name: string): string {
++  return name.replace(/[\\/:*?"<>|]+/g, " ").replace(/\s+/g, " ").trim() || "Design";
++}
++
++/**
++ * GET /api/robo/exports/reference?design=<Design Name>
++ *
++ * The one-page Reference Sheet for a design's LATEST production run, as an Excel
++ * summary — one information item per row, not slab-by-slab. Values come from
++ * buildReferenceSummary (the same source the on-screen preview uses), so the file
++ * and the preview always agree, and Total Slabs / Total Production Time / Total
++ * Delays match Reports. 404 when the design has no production on record.
++ */
++export async function GET(req: NextRequest) {
++  const design = req.nextUrl.searchParams.get("design")?.trim() || "";
++  const summary = design ? await buildReferenceSummary(design) : null;
++  if (!summary) {
++    return NextResponse.json({ error: "No previous production record found" }, { status: 404 });
++  }
++
++  const dash = (v: string | number | null | undefined) =>
++    v === null || v === undefined || v === "" ? "-" : String(v);
++
++  const programsText = summary.programs.length
++    ? summary.programs.map((p) => `${p.robo}: ${p.program}`).join(", ")
++    : "-";
++
++  // Robot Delays: applicable G-category delays, else BLANK (the operator's rule —
++  // an empty field, not a dash).
++  const robotDelaysText = summary.robotDelays.length
++    ? summary.robotDelays
++        .map((d) => `${d.code} — ${d.description}${d.events > 1 ? ` (${d.events}×)` : ""}`)
++        .join("; ")
++    : "";
++
++  // The ten items, each on its own row: label in column A, value in column B.
++  const items: [string, string][] = [
++    ["Production Date", summary.productionDate ? formatDate(summary.productionDate) : "-"],
++    ["Batch Number", dash(summary.batchNo)],
++    ["Design Name", dash(summary.designName)],
++    ["Thickness of Slabs", summary.thickness != null ? `${summary.thickness} cm` : "-"],
++    ["Total Slabs Produced", String(summary.totalSlabs)],
++    ["Total Production Time", summary.productionTimeMinutes != null ? fmtDurationLong(summary.productionTimeMinutes) : "-"],
++    ["Total Delays", fmtDurationLong(summary.totalDelayMins)],
++    ["Avg Slabs/hour", summary.avgSlabsPerHour != null ? String(summary.avgSlabsPerHour) : "-"],
++    ["Robo Program Names", programsText],
++    ["Robot Delays", robotDelaysText],
++  ];
++
++  const title = `Reference Sheet — ${summary.designName}`;
++  const note =
++    "Avg Slabs/hour = Total Slabs ÷ (Total Production Time − actual delay time, overlapping delays counted once). Total Delays above is the Reports total (overlaps included).";
++
++  const aoa: (string | number)[][] = [
++    [title],
++    [],
++    ...items,
++    [],
++    ["Note", note],
++  ];
++
++  const ws = XLSX.utils.aoa_to_sheet(aoa);
++  ws["!cols"] = [{ wch: 22 }, { wch: 70 }];
++
++  // Styling: bold title, bold labels down column A, wrapped note.
++  const titleCell = ws["A1"];
++  if (titleCell) titleCell.s = { font: { bold: true, sz: 14 } };
++
++  const firstItemRow = 2; // 0-based row index of the first item (after title + blank)
++  for (let i = 0; i < items.length; i++) {
++    const addr = XLSX.utils.encode_cell({ r: firstItemRow + i, c: 0 });
++    const cell = ws[addr];
++    if (cell) cell.s = { font: { bold: true }, alignment: { vertical: "top" } };
++    const valAddr = XLSX.utils.encode_cell({ r: firstItemRow + i, c: 1 });
++    const valCell = ws[valAddr];
++    if (valCell) valCell.s = { alignment: { vertical: "top", wrapText: true } };
++  }
++  // Note row: label bold, text wrapped and greyed.
++  const noteRow = firstItemRow + items.length + 1;
++  const noteLabel = ws[XLSX.utils.encode_cell({ r: noteRow, c: 0 })];
++  if (noteLabel) noteLabel.s = { font: { bold: true, italic: true, color: { rgb: "6B7280" } }, alignment: { vertical: "top" } };
++  const noteText = ws[XLSX.utils.encode_cell({ r: noteRow, c: 1 })];
++  if (noteText) noteText.s = { font: { italic: true, color: { rgb: "6B7280" } }, alignment: { vertical: "top", wrapText: true } };
++
++  const wb = XLSX.utils.book_new();
++  XLSX.utils.book_append_sheet(wb, ws, "Reference Sheet");
++
++  const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
++  const filename = `Reference Sheet - ${safeName(summary.designName)}.xlsx`;
++
++  return new NextResponse(buf, {
++    status: 200,
++    headers: {
++      "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
++      "Content-Disposition": `attachment; filename="${filename}"`,
++    },
++  });
++}
+diff --git a/src/app/api/robo/reference/summary/route.ts b/src/app/api/robo/reference/summary/route.ts
+new file mode 100644
+index 0000000..275f575
+--- /dev/null
++++ b/src/app/api/robo/reference/summary/route.ts
+@@ -0,0 +1,27 @@
++import { NextRequest, NextResponse } from "next/server";
++import { buildReferenceSummary } from "@/lib/robo/referenceData";
++
++// Live aggregation, never cached — the same reason reports/summary is
++// force-dynamic: a stale Reference Sheet is how "the numbers changed later"
++// happens. Always computed fresh from the current rows.
++export const dynamic = "force-dynamic";
++export const revalidate = 0;
++
++/**
++ * GET /api/robo/reference/summary?design=<Design Name>
++ *
++ * The preview behind the Downloads "Reference Sheet" section. Matches the design
++ * by name only (thickness ignored — see designMatchKey), finds its latest
++ * production run and returns the same summary the Excel export writes, so the
++ * screen and the file agree. `found:false` means no production exists for that
++ * design → the UI shows "No previous production record found".
++ */
++export async function GET(req: NextRequest) {
++  const design = req.nextUrl.searchParams.get("design")?.trim() || "";
++  if (!design) return NextResponse.json({ found: false });
++
++  const summary = await buildReferenceSummary(design);
++  if (!summary) return NextResponse.json({ found: false });
++
++  return NextResponse.json({ found: true, ...summary });
++}
+diff --git a/src/components/robo/DownloadsClient.tsx b/src/components/robo/DownloadsClient.tsx
+index eb53f0d..aa338be 100644
+--- a/src/components/robo/DownloadsClient.tsx
++++ b/src/components/robo/DownloadsClient.tsx
+@@ -11,6 +11,21 @@ interface Preview {
+   delayEvents: number;
+ }
+ 
++/** The Reference Sheet preview — the latest run's summary the API returns. */
++interface RefPreview {
++  found: boolean;
++  designName: string;
++  batchNo: string | null;
++  productionDate: string;
++  thickness: number | null;
++  totalSlabs: number;
++  productionTimeMinutes: number | null;
++  totalDelayMins: number;
++  avgSlabsPerHour: number | null;
++  programs: { robo: string; program: string }[];
++  robotDelays: { code: string; description: string; minutes: number; events: number }[];
++}
++
+ function download(url: string) {
+   const a = document.createElement("a");
+   a.href = url;
+@@ -18,6 +33,16 @@ function download(url: string) {
+   a.click();
+ }
+ 
++/** One label/value pair in the Reference Sheet preview grid. */
++function Field({ label, value }: { label: string; value: string }) {
++  return (
++    <div>
++      <p className="text-xs uppercase tracking-wide text-gray-500">{label}</p>
++      <p className="mt-0.5 font-semibold text-gray-800">{value}</p>
++    </div>
++  );
++}
++
+ export function DownloadsClient() {
+   const [mode, setMode] = useState<ReportMode>("ALL");
+   const [date, setDate] = useState<string>(todayStr());
+@@ -29,6 +54,28 @@ export function DownloadsClient() {
+   const [preview, setPreview] = useState<Preview | null>(null);
+   const [loading, setLoading] = useState(true);
+ 
++  // ── Reference Sheet: a design-name lookup independent of the filters above ──
++  const [refDesign, setRefDesign] = useState("");
++  const [refLoading, setRefLoading] = useState(false);
++  const [refResult, setRefResult] = useState<RefPreview | null>(null);
++  const [refSearched, setRefSearched] = useState(false);
++
++  const searchRef = useCallback(async () => {
++    const q = refDesign.trim();
++    if (!q) return;
++    setRefLoading(true);
++    setRefSearched(true);
++    try {
++      const res = await fetch(`/api/robo/reference/summary?design=${encodeURIComponent(q)}`);
++      const data: RefPreview | null = res.ok ? await res.json() : null;
++      setRefResult(data && data.found ? data : null);
++    } catch {
++      setRefResult(null);
++    } finally {
++      setRefLoading(false);
++    }
++  }, [refDesign]);
++
+   const loadPreview = useCallback(async (qs: string) => {
+     setLoading(true);
+     const res = await fetch(`/api/robo/reports/summary${qs}`);
+@@ -123,6 +170,64 @@ export function DownloadsClient() {
+           )}
+         </Card>
+       </div>
++
++      {/* ── Reference Sheet: a design's latest run, summarised ──────────────── */}
++      <Card className="flex flex-col">
++        <div className="mb-2 flex items-center gap-2">
++          <span className="text-xl">📋</span>
++          <h2 className="font-semibold text-gray-800">Reference Sheet</h2>
++        </div>
++        <p className="mb-3 text-xs text-gray-500">
++          A one-page summary of a design&rsquo;s <span className="font-medium">latest production run</span> — the
++          reference to check before running it again. Matches by design name only; thickness is ignored
++          (&ldquo;Costa 2 cm&rdquo; and &ldquo;Costa 3 cm&rdquo; are the same design, but &ldquo;Bellagio Green&rdquo;
++          and &ldquo;Bellagio Grey&rdquo; are not).
++        </p>
++
++        <div className="flex flex-col gap-2 sm:flex-row">
++          <input
++            type="text"
++            value={refDesign}
++            onChange={(e) => { setRefDesign(e.target.value); setRefSearched(false); setRefResult(null); }}
++            onKeyDown={(e) => { if (e.key === "Enter") searchRef(); }}
++            placeholder="Design Name (e.g. Costa)"
++            className="flex-1 rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-brand focus:outline-none"
++          />
++          <button
++            onClick={searchRef}
++            disabled={!refDesign.trim() || refLoading}
++            className="rounded-lg bg-brand px-5 py-2.5 text-sm font-semibold tracking-wide text-white transition hover:bg-brand/90 disabled:cursor-not-allowed disabled:opacity-50">
++            {refLoading ? "Searching…" : "🔍 Search"}
++          </button>
++        </div>
++
++        {refSearched && !refLoading && !refResult && (
++          <p className="mt-4 rounded-lg border border-amber-100 bg-amber-50 px-3 py-2 text-sm text-amber-700">
++            No previous production record found
++          </p>
++        )}
++
++        {refResult && (
++          <div className="mt-4 space-y-3">
++            <div className="rounded-lg border border-gray-100 bg-slate-50 p-3">
++              <p className="text-xs uppercase tracking-wide text-gray-500">Latest production run</p>
++              <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-2 text-sm sm:grid-cols-3">
++                <Field label="Design" value={refResult.designName} />
++                <Field label="Batch No." value={refResult.batchNo ?? "-"} />
++                <Field label="Production Date" value={refResult.productionDate ? formatDate(refResult.productionDate) : "-"} />
++                <Field label="Total Slabs" value={String(refResult.totalSlabs)} />
++                <Field label="Production Time" value={refResult.productionTimeMinutes != null ? fmtDurationLong(refResult.productionTimeMinutes) : "-"} />
++                <Field label="Avg Slabs/hour" value={refResult.avgSlabsPerHour != null ? String(refResult.avgSlabsPerHour) : "-"} />
++              </div>
++            </div>
++            <button
++              onClick={() => download(`/api/robo/exports/reference?design=${encodeURIComponent(refDesign.trim())}`)}
++              className="w-full rounded-lg bg-indigo-600 px-5 py-2.5 text-sm font-semibold tracking-wide text-white transition hover:bg-indigo-700">
++              📥 DOWNLOAD REFERENCE SHEET
++            </button>
++          </div>
++        )}
++      </Card>
+     </div>
+   );
+ }
+diff --git a/src/lib/robo/productionSpan.ts b/src/lib/robo/productionSpan.ts
+index 2bc4714..d462b5e 100644
+--- a/src/lib/robo/productionSpan.ts
++++ b/src/lib/robo/productionSpan.ts
+@@ -37,7 +37,7 @@ export interface SpanSlab {
+  * unparseable, so a slab with no date, or no In (or no Out) time, is simply
+  * skipped rather than counted as midnight.
+  */
+-function stampMinutes(date: string, time: string | null | undefined): number | null {
++export function stampMinutes(date: string, time: string | null | undefined): number | null {
+   const d = (date ?? "").trim();
+   const t = (time ?? "").trim();
+   if (!d || !t) return null;
+diff --git a/src/lib/robo/referenceData.ts b/src/lib/robo/referenceData.ts
+new file mode 100644
+index 0000000..04ca531
+--- /dev/null
++++ b/src/lib/robo/referenceData.ts
+@@ -0,0 +1,221 @@
++/**
++ * Reference Sheet — the database half.
++ *
++ * Given ONE Design Name, this finds the design's latest production run and returns
++ * the one-page summary the Downloads "Reference Sheet" section previews and the
++ * Excel export writes. Both callers go through here so the number the operator sees
++ * on screen and the number in the file can never be computed two different ways.
++ *
++ * "Latest run" is a single RoboBatchRecipe — the recipe of the most recently
++ * produced slab whose design matches (thickness ignored, designMatchKey). Every
++ * figure is then taken over exactly that recipe's slabs, with the SAME helpers the
++ * Reports summary uses, so Total Slabs / Total Production Time / Total Delays equal
++ * what Reports shows when filtered to that run:
++ *
++ *   • Total Slabs        — a plain count of the run's slabs (no status filter, as
++ *                          Reports does not filter one either).
++ *   • Total Production   — productionSpanMinutes: earliest In → latest Out, dated
++ *     Time                 per slab so a run past midnight measures a real span.
++ *   • Total Delays       — SUM of every delay's stored durationMinutes, matching
++ *                          Reports (overlaps counted twice, by design).
++ *   • Avg Slabs/hour     — the Reference-Sheet formula, delays SUBTRACTED:
++ *                          Total Slabs ÷ (span − actual delay time), where the
++ *                          actual delay time is the UNION of the delay intervals
++ *                          (mergedDelayMinutes) so overlapping downtime is removed
++ *                          once. This is the one figure that intentionally differs
++ *                          from the Reports KPI (which leaves delays in).
++ *
++ * No wall clock is read anywhere — every value is a deterministic function of the
++ * stored rows, so the same run always yields the same sheet.
++ */
++
++import { prisma } from "@/lib/prisma";
++import { productionDateOf, delayProductionDateOf } from "@/lib/robo/productionDate";
++import { productionSpanMinutes, stampMinutes } from "@/lib/robo/productionSpan";
++import { delayTypesByCode } from "@/lib/robo/delayTypes";
++import { machineLabel } from "@/lib/robo/utils";
++import { designMatchKey, mergedDelayMinutes, avgSlabsPerHourNet } from "@/lib/robo/referenceSheet";
++
++/** Robo machine order for listing the programs, matching every other Robo export
++ *  (Robo1→Robo4 = Roycut-1, Roymix, Roycut-2, Roycut-3). */
++const MACHINE_ORDER = ["Roycut-1", "Roymix", "Roycut-2", "Roycut-3"];
++
++/** The trailing number of a delay code ("C13" → 13), so robot delays list in
++ *  master-list order (C1, C2, … C20) rather than by duration. */
++function codeNum(code: string): number {
++  const m = /(\d+)\s*$/.exec(code);
++  return m ? Number(m[1]) : Number.MAX_SAFE_INTEGER;
++}
++
++export interface ReferenceProgram {
++  robo: string;
++  program: string;
++}
++
++export interface ReferenceRobotDelay {
++  code: string;
++  description: string;
++  minutes: number;
++  events: number;
++}
++
++export interface ReferenceSummary {
++  /** The matched run's own stored design name (e.g. "Costa 2 cm"), for display
++   *  and the file name — the search matches on the thickness-stripped base. */
++  designName: string;
++  batchNo: string | null;
++  /** Production date of the first/starting slab (yyyy-mm-dd), or "" if unknown. */
++  productionDate: string;
++  thickness: number | null;
++  totalSlabs: number;
++  /** first In → last Out, minutes; null when nothing has completed. */
++  productionTimeMinutes: number | null;
++  /** Reports figure: SUM of delay durations (overlaps counted twice). */
++  totalDelayMins: number;
++  /** UNION of delay intervals — the actual downtime taken off the Avg denominator. */
++  actualDelayMins: number;
++  /** Total Slabs ÷ (span − actualDelayMins); null when there is no net run time. */
++  avgSlabsPerHour: number | null;
++  /** Programs of the Robos actually set up for the run, in Robo order. */
++  programs: ReferenceProgram[];
++  /** Robot-category (G) delays that occurred in the run; empty when none did. */
++  robotDelays: ReferenceRobotDelay[];
++}
++
++/**
++ * Build the Reference Sheet summary for a design, or null when the design has no
++ * production on record (unknown design, or known but never run) — the caller turns
++ * null into "No previous production record found".
++ */
++export async function buildReferenceSummary(designInput: string): Promise<ReferenceSummary | null> {
++  const key = designMatchKey(designInput);
++  if (!key) return null;
++
++  // 1) Every recipe whose design matches, thickness ignored. designName carries no
++  //    index that would help here and the strip cannot be expressed in SQL, so the
++  //    match is done in JS over the (small) set of recipe names.
++  const recipes = await prisma.roboBatchRecipe.findMany({
++    select: { id: true, designName: true },
++  });
++  const matchIds = recipes
++    .filter((r) => designMatchKey(r.designName) === key)
++    .map((r) => r.id);
++  if (matchIds.length === 0) return null;
++
++  // 2) The latest slab across those recipes decides the run: its recipe is "the
++  //    latest production run". Latest by production date, then In time, then the
++  //    insertion order — the same precedence the register sorts by.
++  const slabs = await prisma.roboProductionRecord.findMany({
++    where: { batchRecipeId: { in: matchIds } },
++    select: {
++      batchRecipeId: true,
++      productionDate: true,
++      inTime: true,
++      outTime: true,
++      thickness: true,
++      createdAt: true,
++      batchRecipe: { select: { productionDate: true } },
++      shift: { select: { date: true } },
++    },
++  });
++  if (slabs.length === 0) return null;
++
++  const sortKey = (s: (typeof slabs)[number]) =>
++    [productionDateOf(s), s.inTime ?? "", s.createdAt.getTime()] as const;
++  let latest = slabs[0];
++  let latestKey = sortKey(latest);
++  for (const s of slabs) {
++    const k = sortKey(s);
++    if (k[0] > latestKey[0] || (k[0] === latestKey[0] && (k[1] > latestKey[1] || (k[1] === latestKey[1] && k[2] > latestKey[2])))) {
++      latest = s;
++      latestKey = k;
++    }
++  }
++  const runId = latest.batchRecipeId;
++  if (!runId) return null;
++
++  // 3) The run's slabs (already in memory) and its recipe / delays.
++  const runSlabs = slabs.filter((s) => s.batchRecipeId === runId);
++
++  const recipe = await prisma.roboBatchRecipe.findUnique({
++    where: { id: runId },
++    include: { shift: true, entries: { include: { machine: true } } },
++  });
++  if (!recipe) return null;
++
++  const delays = await prisma.roboDelayLog.findMany({
++    where: { productionRecord: { batchRecipeId: runId } },
++    select: {
++      durationMinutes: true,
++      startTime: true,
++      delayCode: { select: { code: true, description: true, category: true } },
++      productionRecord: {
++        select: { productionDate: true, batchRecipe: { select: { productionDate: true } } },
++      },
++      shift: { select: { date: true } },
++    },
++  });
++
++  // ── The figures ──────────────────────────────────────────────────────────
++  const totalSlabs = runSlabs.length;
++
++  const productionTimeMinutes = productionSpanMinutes(
++    runSlabs.map((s) => ({ productionDate: productionDateOf(s), inTime: s.inTime, outTime: s.outTime })),
++  );
++
++  // First/starting slab's production date: earliest by (date, In time).
++  const firstSlab = [...runSlabs].sort((a, b) => {
++    const da = productionDateOf(a);
++    const db = productionDateOf(b);
++    if (da !== db) return da < db ? -1 : 1;
++    return (a.inTime ?? "").localeCompare(b.inTime ?? "");
++  })[0];
++  const productionDate = firstSlab ? productionDateOf(firstSlab) : "";
++
++  const totalDelayMins = delays.reduce((sum, d) => sum + (Number.isFinite(d.durationMinutes) ? d.durationMinutes : 0), 0);
++
++  // Actual downtime = union of delay intervals, each delay's clock start paired
++  // with its own production date so overlaps and midnight are handled right.
++  const actualDelayMins = mergedDelayMinutes(
++    delays.map((d) => ({
++      startAbs: stampMinutes(delayProductionDateOf(d), d.startTime),
++      minutes: d.durationMinutes,
++    })),
++  );
++
++  const avgSlabsPerHour = avgSlabsPerHourNet(totalSlabs, productionTimeMinutes, actualDelayMins);
++
++  // Programs of the Robos actually used = setup entries that carry a program name,
++  // in Robo order. A configured machine with no program set was not really run.
++  const programs: ReferenceProgram[] = [...recipe.entries]
++    .filter((e) => (e.programName ?? "").trim())
++    .sort((a, b) => MACHINE_ORDER.indexOf(a.machine.name) - MACHINE_ORDER.indexOf(b.machine.name))
++    .map((e) => ({ robo: machineLabel(e.machine.name), program: (e.programName as string).trim() }));
++
++  // Thickness: the run's setup value, falling back to the first slab that carries
++  // its own (a batch that changed thickness mid-run records it per slab).
++  const thickness =
++    recipe.thickness ?? runSlabs.map((s) => s.thickness).find((t) => t !== null && t !== undefined) ?? null;
++
++  // Robot delays = the G-category delays that occurred, grouped by code with the
++  // SAME tested aggregation the Delay Analysis chart uses, then narrowed to ROBOT
++  // and ordered like the master list (C1…C20). Empty when none occurred.
++  const robotDelays: ReferenceRobotDelay[] = delayTypesByCode(delays)
++    .filter((t) => t.category === "ROBOT")
++    .map((t) => ({ code: t.code, description: t.description, minutes: t.minutes, events: t.events }))
++    .sort((a, b) => codeNum(a.code) - codeNum(b.code));
++
++  return {
++    designName: recipe.designName || designInput.trim(),
++    batchNo: recipe.batchNo,
++    productionDate,
++    thickness,
++    totalSlabs,
++    productionTimeMinutes,
++    totalDelayMins,
++    actualDelayMins,
++    avgSlabsPerHour,
++    programs,
++    robotDelays,
++  };
++}
+diff --git a/src/lib/robo/referenceSheet.ts b/src/lib/robo/referenceSheet.ts
+new file mode 100644
+index 0000000..6dcb6d4
+--- /dev/null
++++ b/src/lib/robo/referenceSheet.ts
+@@ -0,0 +1,137 @@
++/**
++ * Reference Sheet — the pure part.
++ *
++ * The Downloads "Reference Sheet" section takes ONE Design Name, finds the design's
++ * latest production run and hands back a one-page summary to check before running
++ * that design again. Three decisions in that flow have to be exactly right and are
++ * worth testing on their own, away from Prisma so `node --test` can reach them:
++ *
++ *   1. WHICH designs count as the same design. Matching is by design name only,
++ *      NOT thickness — "Costa 2 cm" and "Costa 3 cm" are one design (Costa), while
++ *      "Bellagio Green" and "Bellagio Grey" are two. designMatchKey() strips a
++ *      trailing thickness token and normalises, so both sides of the match compare
++ *      the same way.
++ *
++ *   2. The ACTUAL delay time to take off the batch duration for Avg Slabs/hour.
++ *      Two delays that overlap in time are one stretch of downtime, not two, so the
++ *      same minute must not be subtracted twice — mergedDelayMinutes() unions the
++ *      intervals. This is deliberately DIFFERENT from the "Total Delays" figure on
++ *      the sheet, which matches Reports by SUMMING every delay's stored duration
++ *      (overlaps counted twice, as Reports does); the union is only the denominator
++ *      adjustment the operator asked for.
++ *
++ *   3. Avg Slabs/hour itself — Total Slabs ÷ (Batch Duration − actual delay time),
++ *      the operator's approved Reference-Sheet formula (delays SUBTRACTED here,
++ *      unlike the Reports KPI which leaves them in). avgSlabsPerHourNet() owns the
++ *      divide-by-zero and negative-denominator guards.
++ *
++ * The route (referenceData.ts) owns the Prisma reads and pairs each delay's clock
++ * start with its production date into an absolute minute (stampMinutes) before
++ * handing the spans here; this module never touches a database or a wall clock.
++ */
++
++/**
++ * The design's identity for matching: its name with a trailing thickness removed,
++ * lower-cased and whitespace-collapsed. So "Costa 2 cm", "Costa 3cm" and "costa"
++ * all key as "costa", while "Bellagio Green" and "Bellagio Grey" stay apart
++ * (neither ends in a thickness, so nothing is stripped).
++ *
++ * Only a thickness token is removed, and only at the END: a number followed by
++ * cm or mm (with optional space and an optional trailing dot). A name that merely
++ * ends in a number ("Statuario 5") keeps it — that is not a thickness and dropping
++ * it would merge two real designs. Matching is case- and space-insensitive because
++ * a design typed by hand is not a database key.
++ */
++export function designMatchKey(name: string | null | undefined): string {
++  return (name ?? "")
++    // drop a trailing thickness like "2 cm", "3cm", "20 mm", "18mm."
++    .replace(/\s*\d+(?:\.\d+)?\s*(?:cm|mm)\.?\s*$/i, "")
++    // tidy any separator the strip left dangling ("Costa -" → "Costa")
++    .replace(/[\s\-_]+$/, "")
++    .replace(/\s+/g, " ")
++    .trim()
++    .toLowerCase();
++}
++
++/** One delay reduced to what the union needs: its start as an absolute minute
++ *  (date already folded in by the caller, null when the delay has no start time)
++ *  and its stored duration in minutes. */
++export interface DelaySpanInput {
++  startAbs: number | null;
++  minutes: number;
++}
++
++/**
++ * The ACTUAL total downtime across a set of delays, counting overlapping delays
++ * once. Delays that carry a start time are placed on the timeline as
++ * [start, start+duration] and their union is measured; a delay with no start time
++ * cannot be placed, so its duration is simply added (nothing to overlap it with —
++ * not counting it would understate the downtime).
++ *
++ * The end is start+duration rather than the stored end time on purpose: the stored
++ * durationMinutes was computed cross-midnight-aware when the delay was saved, so
++ * adding it steps past midnight correctly without a second date lookup. Absolute
++ * minutes are only ever compared to each other here, so the caller's date anchor
++ * cancels and no timezone enters. A zero/negative/NaN duration contributes nothing.
++ */
++export function mergedDelayMinutes(spans: readonly DelaySpanInput[]): number {
++  const intervals: [number, number][] = [];
++  let loose = 0;
++  for (const s of spans) {
++    const mins = Number.isFinite(s.minutes) && s.minutes > 0 ? s.minutes : 0;
++    if (mins <= 0) continue;
++    if (s.startAbs === null || !Number.isFinite(s.startAbs)) {
++      loose += mins;
++      continue;
++    }
++    intervals.push([s.startAbs, s.startAbs + mins]);
++  }
++  intervals.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
++
++  let merged = 0;
++  let curStart: number | null = null;
++  let curEnd: number | null = null;
++  for (const [st, en] of intervals) {
++    if (curEnd === null) {
++      curStart = st;
++      curEnd = en;
++    } else if (st <= curEnd) {
++      // Overlapping or touching — extend the current stretch, do not re-count.
++      if (en > curEnd) curEnd = en;
++    } else {
++      // A gap: close the current stretch and open a new one.
++      merged += curEnd - (curStart as number);
++      curStart = st;
++      curEnd = en;
++    }
++  }
++  if (curEnd !== null) merged += curEnd - (curStart as number);
++
++  return merged + loose;
++}
++
++/**
++ * Avg Slabs/hour for the Reference Sheet — the operator's approved formula:
++ * Total Slabs ÷ (Batch Duration − actual delay time), in slabs per hour, rounded
++ * to one decimal.
++ *
++ * DELAYS ARE SUBTRACTED here, which is the deliberate difference from the Reports
++ * KPI (productionSpan.avgSlabsPerHour), where they are left in. `spanMinutes` is
++ * the batch duration (first In → last Out); `delayMinutes` is the union from
++ * mergedDelayMinutes so the same downtime is not removed twice.
++ *
++ * Returns null — the sheet shows "-" — when there is no duration to divide by
++ * (nothing completed), or when delays meet or exceed the duration so the net
++ * running time is zero or negative, rather than dividing by zero or inventing a
++ * rate. A negative delay figure is floored at zero so it can never inflate the net.
++ */
++export function avgSlabsPerHourNet(
++  totalSlabs: number,
++  spanMinutes: number | null,
++  delayMinutes: number,
++): number | null {
++  if (spanMinutes === null || !Number.isFinite(spanMinutes)) return null;
++  const net = spanMinutes - Math.max(0, delayMinutes);
++  if (net <= 0) return null;
++  return Math.round((totalSlabs / (net / 60)) * 10) / 10;
++}
+diff --git a/tests/roboReferenceSheet.test.ts b/tests/roboReferenceSheet.test.ts
+new file mode 100644
+index 0000000..6aec8ea
+--- /dev/null
++++ b/tests/roboReferenceSheet.test.ts
+@@ -0,0 +1,119 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++
++import {
++  designMatchKey,
++  mergedDelayMinutes,
++  avgSlabsPerHourNet,
++  type DelaySpanInput,
++} from "../src/lib/robo/referenceSheet.ts";
++
++/* ── designMatchKey — match on design, not thickness ─────────────────────── */
++
++test("thickness is stripped so 2 cm and 3 cm of one design match", () => {
++  assert.equal(designMatchKey("Costa 2 cm"), "costa");
++  assert.equal(designMatchKey("Costa 3 cm"), "costa");
++  assert.equal(designMatchKey("Costa 2 cm"), designMatchKey("Costa 3 cm"));
++  // spacing and case do not matter, mm as well as cm, a stray trailing dot
++  assert.equal(designMatchKey("costa 3cm"), "costa");
++  assert.equal(designMatchKey("COSTA 18mm."), "costa");
++});
++
++test("designs that differ by name, not thickness, stay different", () => {
++  assert.notEqual(designMatchKey("Bellagio Green"), designMatchKey("Bellagio Grey"));
++  assert.equal(designMatchKey("Bellagio Green"), "bellagio green");
++  assert.equal(designMatchKey("Bellagio Grey"), "bellagio grey");
++});
++
++test("a trailing number that is not a thickness is kept", () => {
++  // no cm/mm unit → not a thickness, must not be dropped
++  assert.equal(designMatchKey("Statuario 5"), "statuario 5");
++  assert.notEqual(designMatchKey("Statuario 5"), designMatchKey("Statuario 7"));
++});
++
++test("null/blank design keys to empty string (no run can match it)", () => {
++  assert.equal(designMatchKey(null), "");
++  assert.equal(designMatchKey("   "), "");
++});
++
++/* ── mergedDelayMinutes — actual downtime, overlaps counted once ─────────── */
++
++test("non-overlapping delays add up", () => {
++  const spans: DelaySpanInput[] = [
++    { startAbs: 600, minutes: 30 }, // 10:00–10:30
++    { startAbs: 720, minutes: 15 }, // 12:00–12:15
++  ];
++  assert.equal(mergedDelayMinutes(spans), 45);
++});
++
++test("overlapping delays are unioned, not double-counted", () => {
++  // 10:00–10:30 and 10:15–10:45 → real downtime 10:00–10:45 = 45, not 60
++  const spans: DelaySpanInput[] = [
++    { startAbs: 600, minutes: 30 },
++    { startAbs: 615, minutes: 30 },
++  ];
++  assert.equal(mergedDelayMinutes(spans), 45);
++});
++
++test("a delay fully inside another counts once", () => {
++  const spans: DelaySpanInput[] = [
++    { startAbs: 600, minutes: 60 }, // 10:00–11:00
++    { startAbs: 615, minutes: 10 }, // 10:15–10:25, inside
++  ];
++  assert.equal(mergedDelayMinutes(spans), 60);
++});
++
++test("touching intervals merge with no gap", () => {
++  const spans: DelaySpanInput[] = [
++    { startAbs: 600, minutes: 30 }, // 10:00–10:30
++    { startAbs: 630, minutes: 30 }, // 10:30–11:00
++  ];
++  assert.equal(mergedDelayMinutes(spans), 60);
++});
++
++test("a delay with no start time still contributes its duration", () => {
++  const spans: DelaySpanInput[] = [
++    { startAbs: 600, minutes: 30 },
++    { startAbs: null, minutes: 20 }, // unplaceable → added
++  ];
++  assert.equal(mergedDelayMinutes(spans), 50);
++});
++
++test("zero and negative durations are ignored", () => {
++  const spans: DelaySpanInput[] = [
++    { startAbs: 600, minutes: 0 },
++    { startAbs: 700, minutes: -5 },
++    { startAbs: 800, minutes: 10 },
++  ];
++  assert.equal(mergedDelayMinutes(spans), 10);
++});
++
++test("empty input is zero downtime", () => {
++  assert.equal(mergedDelayMinutes([]), 0);
++});
++
++/* ── avgSlabsPerHourNet — delays subtracted, guarded ─────────────────────── */
++
++test("delays are subtracted from the duration before dividing", () => {
++  // 46 slabs, 460 min span, 60 min actual delay → 46 ÷ (400/60) = 6.9
++  assert.equal(avgSlabsPerHourNet(46, 460, 60), 6.9);
++});
++
++test("no delay reduces to plain slabs ÷ hours", () => {
++  // 46 ÷ (460/60) = 6.0, matching the batch-duration rate when nothing is lost
++  assert.equal(avgSlabsPerHourNet(46, 460, 0), 6.0);
++});
++
++test("null span (nothing completed) → null, shown as a dash", () => {
++  assert.equal(avgSlabsPerHourNet(46, null, 0), null);
++});
++
++test("delays meeting or exceeding the span → null, never a divide by zero", () => {
++  assert.equal(avgSlabsPerHourNet(46, 460, 460), null);
++  assert.equal(avgSlabsPerHourNet(46, 460, 500), null);
++});
++
++test("a negative delay figure cannot inflate the rate", () => {
++  // floored at 0 → same as no delay
++  assert.equal(avgSlabsPerHourNet(46, 460, -100), 6.0);
++});
+-- 
+2.43.0
+

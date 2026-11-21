@@ -1,0 +1,2407 @@
+"use client";
+// TRIAL SLAB ENTRY (CR-003, 20 Nov 2026) — a copy of RoboEntryForm (the Slab
+// Entry page), kept as a separate file so the regular Slab Entry stays exactly
+// as it was. Same flow: Batch setup, then Slab entry, then Recent slabs. What
+// differs, all marked "CR-003" below:
+//   * every trial slab has its OWN batch setup — once its slab is saved the
+//     page opens a fresh setup, with "Copy from previous record";
+//   * Liquid and Powder each carry a Setting (Normal / Define), a hand-typed
+//     Name and, for Define, a required reference photo (camera or gallery,
+//     with the crop / annotate editor) — in the same cells as before;
+//   * Batch No. stays optional; Recent slabs shows it ("--" when none);
+//   * a larger Remarks box;
+//   * setups and slabs are read from /api/robo/trial/*, and the next numbers
+//     count on from trial slabs.
+// A trial slab is an ordinary production record: it counts in every total,
+// report and download, and Slab Records shows it as "D-1506 (Trial Slab)".
+//
+// The original header of RoboEntryForm follows.
+//
+// One smart form for the robo line: batch setup (collapses once saved) + slab
+// logging against the active batch. The RoboShift row the schema requires is
+// still created and rolled over per day silently on batch save and has no UI —
+// it is plumbing. The Shift the operator picks on a slab (A/B/C) is a separate,
+// per-slab field; see lib/robo/productionShift.ts for why the two are not the
+// same thing. Robo doesn’t run in every production, so everything here is opt-in.
+//
+// The same component also EDITS an existing slab. Pass `recordId` and it drops
+// the batch-setup half, loads that record (with the batch setup and the delays
+// it was saved against) and PATCHes instead of creating. That is deliberately
+// one component and not a second form: the fields, the delay logging and the
+// validation an operator learned on the tablet must behave identically when
+// the in-charge corrects a slab a week later, and two forms drift apart.
+import { useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import Link from "next/link";
+import { Card, Badge, Empty } from "@/components/ui";
+import { SearchableSelect, type SsOption } from "../SearchableSelect";
+import { useFieldAdvance } from "../useFieldAdvance";
+import { TimeInput } from "../TimeInput";
+import { TrialConsumableField, type PhotoRef } from "./TrialConsumableField";
+import {
+  NO_BATCH, SETTING_NORMAL, parseSetting, trialSetupProblem, type ConsumableSetting, type PhotoKind,
+} from "@/lib/robo/trial";
+import { isValidTime } from "@/lib/robo/time";
+import { CATEGORY_META, CATEGORY_ORDER, guessCategory, defaultRobotSpecific } from "@/lib/robo/delayCategories";
+import { findDesignPreset, presetFieldsFor } from "@/lib/robo/design-presets";
+import { nextSlabNumber } from "@/lib/robo/nextNumbers";
+import { SETUP_EDIT_WINDOW_DAYS, daysBetween, describeAge, isSetupStale } from "@/lib/robo/setupAge";
+import { productionDateOf } from "@/lib/robo/productionDate";
+import { SHIFT_WINDOWS, productionShiftOf, shiftFromTime } from "@/lib/robo/productionShift";
+import { roboThicknessOf } from "@/lib/robo/thickness";
+import { splitMachineNames, joinMachineNames, firstMachineName } from "@/lib/robo/delayMachines";
+import { SLAB_IN_PROCESSING, formatSlabRemarks, slabStatusClass, slabStatusLabel, machineLabel } from "@/lib/robo/utils";
+import { PlantSlabList, usePlantSlabs } from "../PlantSlabList";
+import { PlantBatchPicker } from "../PlantBatchPicker";
+import { nextPlantSlab, plainSlabNo, plantRowDate, plantRowFor, plantTimeWarnings, plantWindowWords, thicknessWords, type PlantSlabRow } from "@/lib/robo/plantSlabs";
+
+const MACHINE_ORDER = ["Roycut-1", "Roymix", "Roycut-2", "Roycut-3"];
+
+const CATEGORY_COLOR: Record<string, string> = {
+  ROBOT: "bg-blue-100 text-blue-700", MAINTENANCE: "bg-orange-100 text-orange-700",
+  ROYMIX: "bg-emerald-100 text-emerald-700", LINE: "bg-slate-100 text-slate-700",
+  DISTRIBUTOR: "bg-purple-100 text-purple-700", PRESS: "bg-rose-100 text-rose-700",
+  GENERAL: "bg-gray-100 text-gray-700", POWERCUT: "bg-red-100 text-red-700", LINE_START: "bg-teal-100 text-teal-700",
+};
+
+interface Machine { id: string; name: string; type: string }
+interface Design { id: string; name: string }
+interface Program { id: string; name: string; design?: { name: string } | null }
+interface Named { id: string; name: string }
+interface DelayCode { id: string; code: string; description: string; category: string; isRobotSpecific: boolean }
+interface BatchEntry {
+  machine: { name: string };
+  programName: string | null; toolName: string | null; liquidName: string | null;
+  powderName: string | null; rollerHeight: string | null; targetCycleTime: number | null;
+  /** CR-003: Normal / Define, per consumable. */
+  liquidSetting?: string | null; powderSetting?: string | null;
+  machineId?: string;
+}
+/** CR-003: a stored reference photo, as the trial routes describe it. */
+interface PhotoMetaLite { id: string; machineId: string | null; kind: string | null; hasEdited: boolean; notes: string | null; edits: unknown }
+interface BatchRecipe { id: string; productionDate: string | null; batchNo: string | null; designName: string; thickness: number | null; targetSlabs: number | null; notes: string | null; entries: BatchEntry[]; photos?: PhotoMetaLite[] }
+interface ProdRecord {
+  id: string; serialNumber: number | null; slabNumber: string;
+  /** Which batch setup this slab was logged against — so Close Batch can count
+   *  a batch's own still-open slabs. Nullable: a slab may have no batch. */
+  batchRecipeId?: string | null;
+  /** The slab's own production date, when it has one (a batch past midnight). */
+  productionDate?: string | null;
+  /** The slab's own thickness, when it has one (a batch that changed thickness
+   *  mid-run). Falls back to the batch setup — see roboThicknessOf. */
+  thickness?: number | null;
+  inTime: string | null; outTime: string | null; roymixCycleTime: number | null;
+  roymixBodyWeight: number | null; status: string; remarks: string | null; createdAt: string;
+  /** The delays logged against this slab. Present so the Recent slabs table
+   *  can show the same Remarks text Slabs Records does — see that column. */
+  delayLogs?: SavedDelay[];
+  /** CR-003: the trial setup's batch, for Recent slabs' Batch No. column. */
+  batchRecipe?: { batchNo: string | null } | null;
+}
+interface ActiveShift {
+  /** CR-003: null when no shift is running yet (/api/robo/trial/active still
+   *  returns the latest trial slabs then). */
+  id: string | null; shiftNumber: number | null; date: string | null; operatorName?: string;
+  batchRecipes: BatchRecipe[]; productionRecords: ProdRecord[];
+}
+/** A delay already saved against the record being edited. Loaded into an
+ *  editable DelayRow so it can be corrected or removed — delayCodeId drives the
+ *  code picker, machineName may name one Robo or several. */
+interface SavedDelay {
+  id: string; delayCodeId: string; durationMinutes: number;
+  startTime: string | null; endTime: string | null;
+  machineName: string | null; remarks: string | null;
+  delayCode: { code: string; description: string; category: string } | null;
+}
+/** GET /api/robo/production/[id] — the record plus the setup it ran under. */
+interface FullRecord extends ProdRecord {
+  shiftId: string;
+  shift: { id: string; shiftNumber: number; date: string; status: string } | null;
+  batchRecipe: BatchRecipe | null;
+  delayLogs: SavedDelay[];
+}
+/** One editable delay row. Existing delays carry their DB `id` (so a save
+ *  updates them in place, never duplicates them); a newly added one has none and
+ *  is created. `machineNames` is the set of canonical machine names, because a
+ *  single delay can name more than one Robo. */
+interface DelayRow {
+  key: string;
+  id?: string;
+  delayCodeId: string;
+  machineNames: string[];
+  startTime: string;
+  endTime: string;
+  remarks: string;
+}
+
+/**
+ * A robot is in this run only when its Program Name was filled in the batch
+ * setup. Every machine is ticked by default there, so a card left without a
+ * program means "not in use for this run".
+ *
+ * Program Name is deliberately the only signal. Tool, liquid and powder get
+ * written by the design reference sheet, so judging a robot by those made it
+ * appear and disappear depending on which design was picked and in what order
+ * the card was filled in — Robo2 (Roymix) most of all, since the sheet does
+ * not cover it. Target cycle time had the same problem from the other side: a
+ * Roycut with a CT typed but no program counted as running, which changed the
+ * machine names printed on the In/Out labels and the → chain in the context
+ * bar. A program name is only ever typed by the operator, so it says exactly
+ * what the operator meant.
+ */
+function isConfigured(e: BatchEntry): boolean {
+  return Boolean(e.programName?.trim());
+}
+
+/** Duration between two HH:MM[:SS] strings, or null when the range is invalid.
+ * An end before the start is treated as crossing midnight (night shift logging
+ * 23:50 → 00:10), capped at 12h so an inverted typo still reads as invalid. */
+function calcDuration(start: string, end: string): { minutes: number; seconds: number } | null {
+  if (!start || !end) return null;
+  const [h1, m1, s1 = 0] = start.split(":").map(Number);
+  const [h2, m2, s2 = 0] = end.split(":").map(Number);
+  // Typed text can be anything now that these are text fields; NaN would slip
+  // straight past the `diff <= 0` guard below and store a delay of nothing.
+  if (![h1, m1, s1, h2, m2, s2].every(Number.isFinite)) return null;
+  let diff = h2 * 3600 + m2 * 60 + s2 - (h1 * 3600 + m1 * 60 + s1);
+  if (diff < 0) diff += 24 * 3600;
+  if (diff <= 0 || diff > 12 * 3600) return null;
+  return { minutes: Math.floor(diff / 60), seconds: diff % 60 };
+}
+function fmtDuration(d: { minutes: number; seconds: number } | null): string {
+  if (!d) return "—";
+  if (d.minutes === 0) return `${d.seconds}s`;
+  if (d.seconds === 0) return `${d.minutes}m`;
+  return `${d.minutes}m ${d.seconds}s`;
+}
+/** RM1, RM2, …, RM10 instead of RM1, RM10, RM2. */
+function naturalCompare(a: string, b: string): number {
+  const re = /(\d+)|(\D+)/g;
+  const ap = a.match(re) || [], bp = b.match(re) || [];
+  for (let i = 0; i < Math.max(ap.length, bp.length); i++) {
+    if (i >= ap.length) return -1;
+    if (i >= bp.length) return 1;
+    const an = /^\d+$/.test(ap[i]), bn = /^\d+$/.test(bp[i]);
+    if (an && bn) { const d = Number(ap[i]) - Number(bp[i]); if (d !== 0) return d; }
+    else { const c = ap[i].localeCompare(bp[i]); if (c !== 0) return c; }
+  }
+  return 0;
+}
+/** Catalogue order: by group, then by code read the way a person reads it. */
+function sortDelayCodes(list: DelayCode[]): DelayCode[] {
+  return [...list].sort((a, b) => {
+    const ca = CATEGORY_ORDER.indexOf(a.category), cb = CATEGORY_ORDER.indexOf(b.category);
+    if (ca !== cb) return (ca === -1 ? 999 : ca) - (cb === -1 ? 999 : cb);
+    return naturalCompare(a.code, b.code);
+  });
+}
+const nowHM = () => { const d = new Date(); return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`; };
+/** Local calendar date — toISOString() would flip to the next day mid-night-shift. */
+const localDate = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; };
+/** Fetch JSON, falling back instead of throwing so one bad lookup can't hang the form. */
+/** Every read here is live register state — the next S.No. and slab number,
+ *  the running shift, a slab-number check — so the browser is never allowed to
+ *  answer from its cache: after a refresh the form must show what the database
+ *  says NOW. */
+async function getJson<T>(url: string, fallback: T): Promise<T> {
+  try { const r = await fetch(url, { cache: "no-store" }); return r.ok ? await r.json() : fallback; } catch { return fallback; }
+}
+/** Default shift number from wall clock: 1 = 06–14, 2 = 14–22, 3 = night. */
+const shiftFromClock = () => { const h = new Date().getHours(); return h >= 6 && h < 14 ? "1" : h >= 14 && h < 22 ? "2" : "3"; };
+
+const inp = "w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm shadow-sm transition focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20 disabled:bg-gray-50 disabled:text-gray-400";
+const label = "mb-1 block text-xs font-medium text-gray-600";
+/** `inp` with less side padding, for the three boxes of a delay's time row —
+ *  a phone gives each about 80px, and "HH:MM" at the touch font size needs
+ *  the room. */
+const inpNarrow = inp.replace("px-3", "px-2.5");
+const btnPrimary = "rounded-lg bg-brand px-6 py-2.5 text-sm font-medium text-white transition hover:bg-brand/90 disabled:opacity-60";
+const btnGhost = "rounded-lg border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 transition hover:bg-gray-50";
+
+// CR-003: each consumable also carries its Setting (Normal / Define).
+type MachineEntry = { programName: string; toolName: string; liquidName: string; powderName: string; rollerHeight: string; targetCycleTime: string; liquidSetting: ConsumableSetting; powderSetting: ConsumableSetting };
+const emptyEntry = (): MachineEntry => ({ programName: "", toolName: "", liquidName: "", powderName: "", rollerHeight: "", targetCycleTime: "", liquidSetting: SETTING_NORMAL, powderSetting: SETTING_NORMAL });
+/** CR-003: the key a reference photo is held under on the page. */
+const photoKey = (machineId: string, kind: PhotoKind) => `${machineId}:${kind}`;
+/** CR-003: a saved setup's photos as the form holds them. */
+const photosFrom = (list: readonly PhotoMetaLite[]): Record<string, PhotoRef | null> => {
+  const out: Record<string, PhotoRef | null> = {};
+  for (const p of list) {
+    if (p.machineId && (p.kind === "LIQUID" || p.kind === "POWDER")) {
+      out[photoKey(p.machineId, p.kind)] = { id: p.id, hasEdited: p.hasEdited, notes: p.notes, edits: p.edits };
+    }
+  }
+  return out;
+};
+
+const emptySlab = () => ({ serialNumber: "", slabNumber: "", productionDate: "", productionShift: "", thickness: "", inTime: "", outTime: "", roymixCycleTime: "", roymixBodyWeight: "", remarks: "", batchNo: "", designName: "", targetSlabs: "" });
+/** Toggle a machine name in a delay's set — add it if absent, drop it if
+ *  present. Order is kept so the first stays first (that is what machineId
+ *  resolves from). */
+const toggleMachineName = (names: string[], name: string): string[] =>
+  names.includes(name) ? names.filter((n) => n !== name) : [...names, name];
+
+/**
+ * The Robo picker for a delay — one delay can name several. Multi-select toggle
+ * buttons over the shift's machines (the same four Robos), highlighted when on.
+ * Shown only for a delay code that is robot-specific; a general delay has none.
+ */
+function MachinePicker({ machines, selected, onToggle }: {
+  machines: { id: string; name: string }[];
+  selected: string[];
+  onToggle: (name: string) => void;
+}) {
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {machines.map((m) => {
+        const on = selected.includes(m.name);
+        return (
+          <button
+            key={m.id}
+            type="button"
+            aria-pressed={on}
+            onClick={() => onToggle(m.name)}
+            className={`rounded-lg border px-2.5 py-1.5 text-xs font-medium transition ${
+              on
+                ? "border-amber-500 bg-amber-100 text-amber-800"
+                : "border-gray-200 bg-white text-gray-500 hover:border-gray-300"
+            }`}
+          >
+            {machineLabel(m.name)}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/**
+ * The delay-code picker for one delay row — the same searchable box that used to
+ * live in the "+ Add" form, now self-contained so it can sit on every row. Type
+ * to filter, pick a code, or add a brand-new code without leaving the slab (the
+ * created code is handed back up via onCreated so every row's list has it). Its
+ * search / open / new-code state is entirely local, so several rows each carry
+ * their own picker without interfering.
+ */
+function DelayCodePicker({ value, codes, onSelect, onCreated }: {
+  value: string;
+  codes: DelayCode[];
+  onSelect: (id: string) => void;
+  onCreated: (code: DelayCode) => void;
+}) {
+  const [search, setSearch] = useState("");
+  const [open, setOpen] = useState(false);
+  const [newForm, setNewForm] = useState({ open: false, code: "", description: "", category: "GENERAL", isRobotSpecific: true });
+  const [newError, setNewError] = useState("");
+  const [saving, setSaving] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const h = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
+    document.addEventListener("mousedown", h);
+    return () => document.removeEventListener("mousedown", h);
+  }, []);
+
+  const selected = codes.find((c) => c.id === value) ?? null;
+  const q = search.trim().toLowerCase();
+  const filtered = q
+    ? codes.filter((c) => c.code.toLowerCase().includes(q) || c.description.toLowerCase().includes(q) || c.category.toLowerCase().includes(q))
+    : codes;
+  const typed = search.trim();
+  const canAdd = typed.length > 0 && !codes.some((c) => c.code.toLowerCase() === typed.toLowerCase());
+
+  const startNew = (t: string) => {
+    const code = t.trim().toUpperCase();
+    const category = guessCategory(code);
+    setNewForm({ open: true, code, description: "", category, isRobotSpecific: defaultRobotSpecific(category) });
+    setNewError("");
+    setOpen(false);
+  };
+  const saveNew = async () => {
+    const code = newForm.code.trim().toUpperCase();
+    const description = newForm.description.trim();
+    setNewError("");
+    if (!code) { setNewError("Enter a delay code."); return; }
+    if (!description) { setNewError("Enter a short description for this delay code."); return; }
+    if (codes.some((c) => c.code.toLowerCase() === code.toLowerCase())) { setNewError(`${code} already exists — pick it from the list instead.`); return; }
+    setSaving(true);
+    try {
+      const res = await fetch("/api/robo/delay-codes", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code, description, category: newForm.category, isRobotSpecific: newForm.isRobotSpecific }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) { setNewError((data as { error?: string } | null)?.error || "Could not save the delay code."); return; }
+      const created = data as DelayCode;
+      onCreated(created);
+      onSelect(created.id);
+      setSearch("");
+      setNewForm((p) => ({ ...p, open: false }));
+    } catch {
+      setNewError("Could not save the delay code. Check the connection and try again.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (selected) {
+    /* The chosen code reads in full, in the list's own order — code,
+       description, category: "C10 Bowl Dry Cleaning ROBOT". A description too
+       long for the row wraps onto a second line rather than being cut to
+       "C10 B…"; the box grows with it. */
+    return (
+      <div className="flex items-center gap-1.5">
+        <div className="flex min-h-[38px] min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border border-gray-300 bg-white px-3 py-2 shadow-sm [@media_screen_and_(pointer:coarse)]:min-h-[44px]">
+          <span className="shrink-0 text-sm font-bold text-gray-800">{selected.code}</span>
+          {/* At least 8rem before anything shares its line: on a phone the
+              category drops beneath a long description instead of squeezing
+              it into a column of single words. */}
+          <span className="min-w-[8rem] flex-1 break-words text-sm text-gray-700">{selected.description}</span>
+          <span className={`shrink-0 rounded px-1.5 py-0.5 text-xs ${CATEGORY_COLOR[selected.category] || "bg-gray-100 text-gray-600"}`}>{selected.category}</span>
+        </div>
+        <button type="button" aria-label="Change code" onClick={() => { onSelect(""); setSearch(""); }}
+          className="tap-area shrink-0 rounded-md px-1.5 py-1 text-xs text-gray-400 hover:bg-gray-100 hover:text-red-500">✕</button>
+      </div>
+    );
+  }
+  if (newForm.open) {
+    return (
+      <div className="space-y-3 rounded-lg border border-amber-300 bg-white p-3">
+        <p className="text-xs font-semibold uppercase tracking-wide text-amber-700">New delay code</p>
+        {newError && <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">{newError}</div>}
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <div>
+            <span className={label}>Code <span className="text-red-500">*</span></span>
+            <input value={newForm.code} onChange={(e) => setNewForm((p) => ({ ...p, code: e.target.value.toUpperCase() }))} placeholder="e.g. M16" className={inp} autoComplete="off" />
+          </div>
+          <div>
+            <span className={label}>Category <span className="text-red-500">*</span></span>
+            <select value={newForm.category} onChange={(e) => setNewForm((p) => ({ ...p, category: e.target.value, isRobotSpecific: defaultRobotSpecific(e.target.value) }))} className={inp}>
+              {CATEGORY_META.map((c) => <option key={c.key} value={c.key}>{c.label}</option>)}
+            </select>
+          </div>
+        </div>
+        <div>
+          <span className={label}>Description <span className="text-red-500">*</span></span>
+          <input value={newForm.description} onChange={(e) => setNewForm((p) => ({ ...p, description: e.target.value }))} placeholder="What the delay was, in a few words" className={inp} autoComplete="off" />
+        </div>
+        <label className="flex items-center gap-2 text-xs text-gray-600">
+          <input type="checkbox" checked={newForm.isRobotSpecific} onChange={(e) => setNewForm((p) => ({ ...p, isRobotSpecific: e.target.checked }))} className="h-4 w-4 rounded border-gray-300 text-brand focus:ring-brand/30" />
+          Belongs to one robot (asks which machine when logging the delay)
+        </label>
+        <div className="flex flex-wrap items-center gap-2 pt-1">
+          <button type="button" onClick={saveNew} disabled={saving} className="rounded-lg bg-amber-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-amber-700 disabled:opacity-60">{saving ? "Saving…" : "Save & use"}</button>
+          <button type="button" onClick={() => { setNewForm((p) => ({ ...p, open: false })); setNewError(""); }} className={btnGhost}>Cancel</button>
+          <span className="text-xs text-gray-400">Also added to Master Lists → Delay Codes</span>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div ref={ref} className="relative">
+      <input value={search} onChange={(e) => { setSearch(e.target.value); setOpen(true); }} onFocus={() => setOpen(true)} placeholder="Search a code, or type a new one…" className={inp} autoComplete="off" />
+      {open && (
+        <div className="absolute z-20 mt-1 max-h-64 w-full overflow-y-auto overscroll-contain rounded-lg border border-gray-200 bg-white shadow-lg">
+          {filtered.map((dc) => (
+            <button key={dc.id} type="button" onClick={() => { onSelect(dc.id); setSearch(""); setOpen(false); }}
+              className="flex w-full items-center gap-2 border-b border-gray-50 px-3 py-2 text-left transition last:border-0 hover:bg-brand/5">
+              <span className="w-12 shrink-0 text-sm font-bold text-gray-800">{dc.code}</span>
+              <span className="min-w-0 flex-1 break-words text-sm text-gray-600">{dc.description}</span>
+              <span className={`shrink-0 rounded px-1.5 py-0.5 text-xs ${CATEGORY_COLOR[dc.category] || "bg-gray-100 text-gray-600"}`}>{dc.category}</span>
+            </button>
+          ))}
+          {canAdd ? (
+            <button type="button" onClick={() => startNew(typed)}
+              className="sticky bottom-0 flex w-full items-center gap-2 border-t border-amber-200 bg-amber-50 px-3 py-3 text-left transition hover:bg-amber-100">
+              <span className="shrink-0 text-base font-bold text-amber-700">+</span>
+              <span className="min-w-0 flex-1 break-words text-sm text-amber-800">Add &ldquo;{typed.toUpperCase()}&rdquo; as a new delay code</span>
+            </button>
+          ) : filtered.length === 0 ? (
+            <div className="px-3 py-2 text-xs text-gray-400">No matching delay codes.</div>
+          ) : null}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** What the Recent slabs table prints under Remarks: the slab's own note AND
+ *  its delays, through the same formatter Slabs Records uses, with this
+ *  table's em-dash for nothing rather than the formatter's hyphen. */
+const slabRemarkText = (r: ProdRecord): string => {
+  const text = formatSlabRemarks(r.remarks, r.delayLogs);
+  return text === "-" ? "—" : text;
+};
+
+/**
+ * Everything the Edit setup screen needs, resolved on the server so the cards
+ * are filled on first paint and the form never has to reach for an active
+ * shift it must not touch. See RoboEntryForm's `setupEdit` prop.
+ */
+export interface SetupEditContext {
+  /** The setup as stored. Seeds the machine cards from the prop rather than a
+   *  second round trip — the form still waits on the machine and master lists
+   *  before it can draw them, but it never fetches the setup itself. */
+  setup: BatchRecipe;
+  /** How many slabs were logged against it. Editing changes what all of them
+   *  say they ran under, which is the one thing this screen must be loud about. */
+  slabCount: number;
+  /** Its production date, or its shift's — for the age line. */
+  date: string | null;
+  /** Today, from the server, so the age does not depend on the tablet's clock. */
+  today: string;
+  /** Where Cancel and a saved correction go back to. */
+  backHref: string;
+}
+
+export function TrialEntryForm({ recordId, setupEdit, canDelete = false }: {
+  /** Set by /robo/slabs/[id]/edit — edits that slab instead of logging a new one. */
+  recordId?: string;
+  /**
+   * Set by /robo/slabs/[id]/edit?section=setup — edits the SETUP that slab was
+   * logged against, however old it is, instead of the slab itself.
+   *
+   * The mirror image of `recordId`: that prop drops the batch-setup half and
+   * keeps the slab half, this one does the opposite. Both are modes of this
+   * component rather than separate forms, for the reason in the file header —
+   * the fields and the validation an operator learned on the tablet have to
+   * behave identically when an in-charge corrects a run a month later, and two
+   * forms drift apart. The batch-setup half was previously reachable only for
+   * the run the active shift is on, which meant a setup logged under the wrong
+   * design could not be corrected at all once the day rolled over.
+   */
+  setupEdit?: SetupEditContext;
+  /** Whether the signed-in user may delete a slab. A courtesy so a ROBO
+   *  operator never meets a button that 403s; the real gate is in the route
+   *  handler (see canDeleteRoboSlab in src/lib/rbac.ts). */
+  canDelete?: boolean;
+}) {
+  const router = useRouter();
+  /* Hands the cursor to the next EMPTY field as each one is finished, so a
+     slab is logged on a tablet without a tap between every box. Touch screens
+     only; on a desktop Enter still submits. See useFieldAdvance. */
+  const { formRef: slabFormRef, advanceProps, advanceOnComplete } = useFieldAdvance();
+  /** Page-level edit: the whole form is about one existing slab. Distinct from
+   *  `editingId`, which is also set when finishing an In-Processing slab from
+   *  the Recent slabs table below. */
+  const isPageEdit = Boolean(recordId);
+  /** Page-level setup edit: the whole form is about one existing SETUP. */
+  const isSetupEdit = Boolean(setupEdit);
+
+  // ---- lookups ----
+  const [machines, setMachines] = useState<Machine[]>([]);
+  const [designs, setDesigns] = useState<Design[]>([]);
+  const [programs, setPrograms] = useState<Program[]>([]);
+  const [tools, setTools] = useState<Named[]>([]);
+  const [liquids, setLiquids] = useState<Named[]>([]);
+  const [powders, setPowders] = useState<Named[]>([]);
+  const [delayCodes, setDelayCodes] = useState<DelayCode[]>([]);
+
+  const [shift, setShift] = useState<ActiveShift | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [flash, setFlash] = useState("");
+
+  // ---- batch setup ----
+  const [batchOpen, setBatchOpen] = useState(false);
+  // "Close Batch" (Robo Entry): drop the running batch to none for this session
+  // without touching the record. Cleared when the next batch is saved; a refresh
+  // clears it too, which is the accepted trade-off for a no-DB-change close.
+  const [batchClosed, setBatchClosed] = useState(false);
+  const [batchError, setBatchError] = useState("");
+  const [batchSaving, setBatchSaving] = useState(false);
+  const [batch, setBatch] = useState({ productionDate: localDate(), batchNo: "", designName: "", targetSlabs: "", thickness: "", notes: "" });
+  const [activeMachines, setActiveMachines] = useState<Record<string, boolean>>({});
+  const [entries, setEntries] = useState<Record<string, MachineEntry>>({});
+  /** Set while the batch-setup half is REOPENING a saved setup to correct it,
+   *  rather than configuring a new run. Save then PATCHes that setup instead
+   *  of POSTing a second one — see saveBatch. On the Edit setup screen it is
+   *  set from the start, because correcting is all that screen does. */
+  const [editingBatchId, setEditingBatchId] = useState<string | null>(setupEdit?.setup.id ?? null);
+  /** CR-003: each Liquid / Powder reference photo on the form, by photoKey(). */
+  const [photos, setPhotos] = useState<Record<string, PhotoRef | null>>({});
+  /** CR-003: "Copy from previous record" — loading, and which slab it came from. */
+  const [copying, setCopying] = useState(false);
+  const [copiedFrom, setCopiedFrom] = useState("");
+
+  // ---- slab entry ----
+  const [slab, setSlab] = useState(emptySlab());
+  const [slabError, setSlabError] = useState("");
+  const [slabSaving, setSlabSaving] = useState(false);
+  const [slabTaken, setSlabTaken] = useState(false);
+  /** Edit-only: carry the Production Date / Thickness change forward across the
+   *  batch — this slab and every following one that shares its value, up to the
+   *  next change. Off by default, so an ordinary correction touches one slab.
+   *  Reset whenever a different slab is loaded, or the edit is left. */
+  const [applyDateForward, setApplyDateForward] = useState(false);
+  const [applyThicknessForward, setApplyThicknessForward] = useState(false);
+  // Batch-split "apply forward" toggles — Batch No. / Design / Target Slabs. Ticking
+  // one moves this slab + the following ones to that batch (see saveSlab).
+  const [applyBatchNoForward, setApplyBatchNoForward] = useState(false);
+  const [applyDesignForward, setApplyDesignForward] = useState(false);
+  const [applyTargetSlabsForward, setApplyTargetSlabsForward] = useState(false);
+  /** The slab's Production Date / Thickness as loaded, so a save only writes a
+   *  per-slab override when the operator actually changed the value (or ticked
+   *  "apply forward"). An untouched field is left off the request, so the slab
+   *  keeps falling back to the batch instead of getting a copy pinned onto it. */
+  const loaded = useRef<{ productionDate: string; thickness: string }>({ productionDate: "", thickness: "" });
+  /** Bumped when the form needs the server to restate where the register ends:
+   *  a slab deleted, a correction saved, a save refused as a duplicate, or a
+   *  save this form could not count on from itself. An ordinary save does NOT
+   *  bump it — that path already knows the answer.
+   *
+   *  The numbering effect used to key off `records.length` instead, which stops
+   *  moving: /api/robo/shifts/active returns `take: 25` production records, so
+   *  on the 26th slab of a shift the length is 25 before the save and 25 after,
+   *  the effect never re-ran, and the operator was left with the S.No. from
+   *  slab 25 and a slab-number field that had just been cleared. A count that
+   *  saturates is not an event. */
+  const [registerVersion, setRegisterVersion] = useState(0);
+  /** Moves when the running batch's plant slab list should be read again: a
+   *  save, a delete, a tap on Refresh (components/robo/PlantSlabList). */
+  const [plantVersion, setPlantVersion] = useState(0);
+  /** Set while an existing slab is loaded into the form — save PATCHes that
+   *  record instead of creating a duplicate. */
+  const [editingId, setEditingId] = useState<string | null>(recordId ?? null);
+  /** The loaded record behind `editingId`: its own batch setup and its
+   *  already-saved delays, neither of which the active shift can supply. */
+  const [editRecord, setEditRecord] = useState<FullRecord | null>(null);
+  const [editLoading, setEditLoading] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [actionError, setActionError] = useState("");
+
+  // ---- delays inside the slab entry ----
+  const [delayRows, setDelayRows] = useState<DelayRow[]>([]);
+  const delayKeySeq = useRef(0);
+  const nextDelayKey = () => `new-${++delayKeySeq.current}`;
+  const blankDelayRow = (): DelayRow => ({ key: nextDelayKey(), delayCodeId: "", machineNames: [], startTime: "", endTime: "", remarks: "" });
+  const rowIsBlank = (r: DelayRow) => !r.delayCodeId && !r.startTime && !r.endTime && !r.remarks && r.machineNames.length === 0;
+  const updateDelayRow = (key: string, patch: Partial<DelayRow>) =>
+    setDelayRows((rows) => rows.map((r) => (r.key === key ? { ...r, ...patch } : r)));
+  const removeDelayRow = (key: string) =>
+    setDelayRows((rows) => rows.filter((r) => r.key !== key));
+  // Keep exactly one empty row at the end, so a delay is entered simply by
+  // filling that row in — no "+ Add" to remember. The moment the last row gains
+  // a code (or anything), a fresh blank row appears beneath it for the next
+  // delay. Empty rows are dropped on save. Returning the same array when nothing
+  // needs adding stops this from looping.
+  useEffect(() => {
+    setDelayRows((rows) => {
+      const last = rows[rows.length - 1];
+      return last && rowIsBlank(last) ? rows : [...rows, blankDelayRow()];
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [delayRows]);
+
+  const refetchShift = async () => {
+    // CR-003: the trial view of the running shift — its trial setups still
+    // waiting for their slab, and the latest trial slabs.
+    const s = await getJson<ActiveShift | null>("/api/robo/trial/active", null);
+    setShift(s);
+    return s;
+  };
+
+  /** Pull one slab in for editing: its own setup drives the machine list and
+   *  its saved delays are shown above the pending ones. */
+  const loadRecord = async (id: string) => {
+    setEditLoading(true);
+    const rec = await getJson<FullRecord | null>(`/api/robo/production/${id}`, null);
+    if (rec) {
+      setEditRecord(rec);
+      // A slab opened for correction keeps the Shift it is shown with: the
+      // operator is fixing one thing, and the In Time they may also be fixing
+      // must not quietly move the Shift under them.
+      shiftTouched.current = true;
+      setSlab({
+        serialNumber: rec.serialNumber != null ? String(rec.serialNumber) : "",
+        slabNumber: rec.slabNumber ?? "",
+        // The slab's effective production date and thickness, editable — its own
+        // if it has one, else the setup's (thickness) or the setup/shift's
+        // (date). With the "apply forward" toggle off, correcting either changes
+        // only this slab; on, it carries across the batch — see saveSlab.
+        productionDate: productionDateOf(rec),
+        // The slab's shift: the stored one, else what its In Time says — the
+        // same reading every other screen shows for it, so opening a slab to
+        // correct something else and saving does not silently change it.
+        productionShift: productionShiftOf(rec),
+        thickness: roboThicknessOf(rec) != null ? String(roboThicknessOf(rec)) : "",
+        inTime: rec.inTime ?? "",
+        outTime: rec.outTime ?? "",
+        roymixCycleTime: rec.roymixCycleTime != null ? String(rec.roymixCycleTime) : "",
+        roymixBodyWeight: rec.roymixBodyWeight != null ? String(rec.roymixBodyWeight) : "",
+        remarks: rec.remarks ?? "",
+        // The batch this slab currently sits in — Batch No. / Design / Target Slabs.
+        // Editing these and ticking "apply forward" SPLITS the run: this slab and the
+        // ones after it move to that batch (see saveSlab / the API). Pre-filled from
+        // the current batch so a split starts from the truth.
+        batchNo: rec.batchRecipe?.batchNo ?? "",
+        designName: rec.batchRecipe?.designName ?? "",
+        targetSlabs: rec.batchRecipe?.targetSlabs != null ? String(rec.batchRecipe.targetSlabs) : "",
+      });
+      // Remember what was loaded, so the save can tell an untouched Date /
+      // Thickness (leave it alone) from a real correction (write it).
+      loaded.current = {
+        productionDate: productionDateOf(rec),
+        thickness: roboThicknessOf(rec) != null ? String(roboThicknessOf(rec)) : "",
+      };
+    }
+    setSlabError("");
+    setSlabTaken(false);
+    // A freshly loaded slab starts with the range toggles off, so opening a slab
+    // to fix one thing can never carry a stale forward-apply into the save.
+    setApplyDateForward(false);
+    setApplyThicknessForward(false);
+    setApplyBatchNoForward(false);
+    setApplyDesignForward(false);
+    setApplyTargetSlabsForward(false);
+    // The slab's existing delays load as editable rows — each keeps its DB id so
+    // a save corrects it in place, and its machine set is unpacked from the
+    // (possibly multi-Robo) machineName. Add / edit / remove all happen here.
+    setDelayRows((rec?.delayLogs ?? []).map((d) => ({
+      key: d.id,
+      id: d.id,
+      delayCodeId: d.delayCodeId ?? "",
+      machineNames: splitMachineNames(d.machineName),
+      startTime: d.startTime ?? "",
+      endTime: d.endTime ?? "",
+      remarks: d.remarks ?? "",
+    })));
+    setEditLoading(false);
+    return rec;
+  };
+
+  useEffect(() => {
+    (async () => {
+      // Each of the three modes loads only what its half of the form renders.
+      //
+      // The active shift in particular is deliberately NOT fetched on the Edit
+      // setup screen: the setup being corrected belongs to the shift it was
+      // made in, which may have closed weeks ago, and pulling today's shift in
+      // would only give the code something wrong to reach for. The setup
+      // itself arrives already resolved, on `setupEdit`, from the server.
+      const shiftLoad = isPageEdit || isSetupEdit ? Promise.resolve(null) : refetchShift();
+      // The master lists feed the batch-setup half's comboboxes.
+      const masterLoads = isPageEdit ? [] : [
+        getJson<Design[]>("/api/robo/designs", []).then(setDesigns),
+        getJson<Program[]>("/api/robo/programs", []).then(setPrograms),
+        getJson<Named[]>("/api/robo/tools", []).then(setTools),
+        getJson<Named[]>("/api/robo/liquids", []).then(setLiquids),
+        getJson<Named[]>("/api/robo/powders", []).then(setPowders),
+      ];
+      // Delay codes belong to the slab half only.
+      const delayLoad = isSetupEdit ? Promise.resolve(null) :
+        getJson<DelayCode[]>("/api/robo/delay-codes", []).then((codes) => setDelayCodes(sortDelayCodes(codes)));
+      const [s] = await Promise.all([
+        shiftLoad,
+        recordId ? loadRecord(recordId) : Promise.resolve(null),
+        getJson<Machine[]>("/api/robo/machines", []).then((ms) =>
+          setMachines([...ms].sort((a, b) => MACHINE_ORDER.indexOf(a.name) - MACHINE_ORDER.indexOf(b.name)))),
+        delayLoad,
+        ...masterLoads,
+      ]);
+      setBatchOpen(isSetupEdit || (!isPageEdit && !(s?.batchRecipes?.length)));
+      setLoading(false);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const latestBatch = shift?.batchRecipes?.[shift.batchRecipes.length - 1] ?? null;
+  // The batch currently being logged to. "Close Batch" sets batchClosed, which
+  // drops this to null so the page reads "No batch running" and the slab form
+  // stops accepting entries — the batch record itself is untouched. The next
+  // New batch (its save) clears batchClosed; so does a refresh, by design.
+  const runningBatch = batchClosed ? null : latestBatch;
+  const records = shift?.productionRecords ?? [];
+  /* The running batch's slabs as the plant has them, less those already
+     entered (lib/robo/plantSlabs). An offer for NEW slabs on the entry screen
+     only: the two edit screens never ask, and when it cannot be read the form
+     below works exactly as it did before the list existed. */
+  const plant = usePlantSlabs(!isPageEdit && !isSetupEdit ? runningBatch?.id ?? null : null, plantVersion, runningBatch?.batchNo ?? null);
+
+  /**
+   * Fills the batch-setup half once the machine list is in.
+   *
+   * Reopening a saved setup starts from exactly what was stored, so the design,
+   * the targets, the notes and all four robots open editable and already filled
+   * in. Machines are matched by NAME, because a name is what the saved setup
+   * carries; a saved setup also only holds the machines that were ticked at the
+   * time, so an entry it has no row for opens unticked.
+   *
+   * Keyed on the setup id, not the setup object: `shift` is replaced wholesale
+   * by every refetchShift(), and re-seeding from the new object would throw
+   * away what the operator is part-way through typing.
+   */
+  useEffect(() => {
+    if (machines.length === 0) return;
+    // On the Edit setup screen the setup comes from the server on a prop, not
+    // from the active shift — that shift is not the one this setup is in, and
+    // is not even fetched. Everywhere else it is the one being reopened.
+    const saved = isSetupEdit
+      ? setupEdit!.setup
+      : editingBatchId ? shift?.batchRecipes?.find((b) => b.id === editingBatchId) ?? null : null;
+    const e: Record<string, MachineEntry> = {}, a: Record<string, boolean> = {};
+    for (const m of machines) {
+      const row = saved?.entries.find((x) => x.machine.name === m.name);
+      e[m.id] = row
+        ? {
+            programName: row.programName ?? "",
+            toolName: row.toolName ?? "",
+            liquidName: row.liquidName ?? "",
+            powderName: row.powderName ?? "",
+            rollerHeight: row.rollerHeight ?? "",
+            targetCycleTime: row.targetCycleTime != null ? String(row.targetCycleTime) : "",
+            liquidSetting: parseSetting(row.liquidSetting),
+            powderSetting: parseSetting(row.powderSetting),
+          }
+        : emptyEntry();
+      a[m.id] = saved ? Boolean(row) : true;
+    }
+    setEntries(e);
+    setActiveMachines(a);
+    // CR-003: the reopened setup's reference photos, by machine and consumable.
+    setPhotos(photosFrom(saved?.photos ?? []));
+    setBatch(saved
+      ? {
+          // A setup saved before these two existed has neither. The batch
+          // number stays empty rather than inventing one; the date falls back
+          // so the field is never blank on a correction — but to WHICH day
+          // depends on which run is being corrected.
+          //
+          // In the shift, today is right: the run being corrected is the one
+          // happening now. On the Edit setup screen it would be a lie. That
+          // setup may be from May, and since the form sends every field back
+          // whether or not it was touched, merely opening it and pressing Save
+          // would stamp a May run as produced today. Older setups genuinely
+          // have no production date — the field postdates them and the
+          // importer never sets it — so this is the common case there, not the
+          // rare one. It falls back to the run's own shift date instead.
+          //
+          // What is STORED wins over that fallback, even when it is not a date
+          // this code can read: setupEdit.date is resolved for arithmetic and
+          // discards anything that is not yyyy-mm-dd, and seeding the field
+          // from it would quietly replace a hand-entered value with the shift
+          // date on the next save.
+          productionDate: (isSetupEdit ? saved.productionDate ?? setupEdit!.date ?? "" : saved.productionDate ?? localDate()),
+          batchNo: saved.batchNo ?? "",
+          designName: saved.designName ?? "",
+          targetSlabs: saved.targetSlabs != null ? String(saved.targetSlabs) : "",
+          thickness: saved.thickness != null ? String(saved.thickness) : "",
+          notes: saved.notes ?? "",
+        }
+      : { productionDate: localDate(), batchNo: "", designName: "", targetSlabs: "", thickness: "", notes: "" });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [machines, editingBatchId]);
+
+  /** Reopen the running setup to correct it. */
+  const startEditBatch = () => {
+    if (!latestBatch) return;
+    setBatchError("");
+    setEditingBatchId(latestBatch.id);
+    setBatchOpen(true);
+  };
+  /**
+   * Empty the batch-setup half — every field blank, every machine ticked on
+   * and cleared. This is what the seeding effect above already does for a run
+   * with no saved setup, but that effect is keyed on `editingBatchId`, and
+   * opening a new batch straight after saving one is a null → null transition:
+   * React sees no change, the effect never re-fires, and the design, thickness,
+   * targets and all four machine cards from the batch just saved were still on
+   * screen. So the new run is seeded here explicitly, the same way the delay
+   * picker is cleared between slabs.
+   */
+  const seedBlankBatch = () => {
+    const e: Record<string, MachineEntry> = {};
+    const a: Record<string, boolean> = {};
+    for (const m of machines) { e[m.id] = emptyEntry(); a[m.id] = true; }
+    setEntries(e);
+    setActiveMachines(a);
+    setBatch({ productionDate: localDate(), batchNo: "", designName: "", targetSlabs: "", thickness: "", notes: "" });
+    setPhotos({});
+    setCopiedFrom("");
+  };
+  /**
+   * CR-003: "Copy from previous record" — fill this trial's setup with the
+   * complete setup of the most recently entered trial slab: batch, design,
+   * thickness, target, notes, every robot's program, tool, liquid and powder
+   * (settings and names) and the reference photos. Everything stays editable.
+   * Nothing is written until Save: the photos are then COPIED onto the new
+   * setup (an edited copy is a new photo), so the previous trial keeps its
+   * own setup exactly as it was. The production date is left as it is on the
+   * form (today's), because a new trial is produced now.
+   */
+  const copyFromPrevious = async () => {
+    setBatchError("");
+    setCopying(true);
+    try {
+      const prev = await getJson<{ slabNumber: string; setup: BatchRecipe } | null>("/api/robo/trial/setups/latest", null);
+      if (!prev) { setBatchError("There is no previous trial slab to copy from yet."); return; }
+      const s = prev.setup;
+      const e: Record<string, MachineEntry> = {}, a: Record<string, boolean> = {};
+      for (const m of machines) {
+        const row = s.entries.find((x) => x.machine.name === m.name);
+        e[m.id] = row
+          ? {
+              programName: row.programName ?? "",
+              toolName: row.toolName ?? "",
+              liquidName: row.liquidName ?? "",
+              powderName: row.powderName ?? "",
+              rollerHeight: row.rollerHeight ?? "",
+              targetCycleTime: row.targetCycleTime != null ? String(row.targetCycleTime) : "",
+              liquidSetting: parseSetting(row.liquidSetting),
+              powderSetting: parseSetting(row.powderSetting),
+            }
+          : emptyEntry();
+        a[m.id] = Boolean(row);
+      }
+      setEntries(e);
+      setActiveMachines(a);
+      setBatch((p) => ({
+        productionDate: p.productionDate || localDate(),
+        batchNo: s.batchNo ?? "",
+        designName: s.designName ?? "",
+        targetSlabs: s.targetSlabs != null ? String(s.targetSlabs) : "",
+        thickness: s.thickness != null ? String(s.thickness) : "",
+        notes: s.notes ?? "",
+      }));
+      setPhotos(photosFrom(s.photos ?? []));
+      setCopiedFrom(prev.slabNumber);
+    } finally {
+      setCopying(false);
+    }
+  };
+  /** Configure a genuinely different run — a second design in the same shift. */
+  const startNewBatch = () => {
+    setBatchError("");
+    setEditingBatchId(null);
+    // Nothing of the batch just saved is carried into the next one.
+    seedBlankBatch();
+    setBatchOpen(true);
+  };
+  /** Close the batch half; leaving edit mode re-seeds the cards blank. */
+  const closeBatchForm = () => {
+    setBatchError("");
+    setEditingBatchId(null);
+    setBatchOpen(false);
+  };
+  /**
+   * "Close Batch" — end the running batch for this session. No DB write: the
+   * batch record and every slab on it are left exactly as they are; the entry
+   * page simply drops to "No batch running" so nothing more is logged to it
+   * until the operator starts the next run with New batch. A page refresh clears
+   * this (the batch is still the shift's most recent), the trade-off for keeping
+   * the action free of any database change.
+   *
+   * Slabs still In-Processing don't block the close — they stay fully editable in
+   * Slabs Records, exactly as a closed shift already allows — but the operator is
+   * warned first, because closing mid-slab is more often a mis-tap than a choice.
+   */
+  const closeBatch = () => {
+    if (!latestBatch) return;
+    const openSlabs = (shift?.productionRecords ?? []).filter(
+      (r) => r.batchRecipeId === latestBatch.id && r.status === SLAB_IN_PROCESSING,
+    ).length;
+    const name = latestBatch.designName?.trim() || latestBatch.batchNo?.trim() || "this batch";
+    const message =
+      openSlabs > 0
+        ? `${openSlabs} slab${openSlabs > 1 ? "s" : ""} in ${name} ${openSlabs > 1 ? "are" : "is"} still In-Processing (no Out time). They stay editable in Slabs Records. Close the batch anyway?`
+        : `Close ${name}? You’ll start the next run with New batch. Nothing is deleted — the batch and its slabs stay in the records.`;
+    if (!confirm(message)) return;
+    setBatchError("");
+    setEditingBatchId(null);
+    setBatchOpen(false);
+    setBatchClosed(true);
+  };
+
+  /**
+   * Suggest the next S.No. and slab number — but never while an existing slab
+   * is loaded for editing, where the fields hold that record's own numbers.
+   *
+   * Both come from the server (/api/robo/production/next-number), and both are
+   * one past what is on the LAST SAVED SLAB — S.No. 19 / slab 43567 offers 20 /
+   * 43568. They used to be worked out here from `shift.productionRecords`, i.e.
+   * from the ACTIVE SHIFT ONLY, and a shift row is created silently once per
+   * day — so every morning the S.No. restarted at 1 against a register sitting
+   * at 34, and the slab number came up blank because there was no earlier
+   * record in that shift to add one to. Neither is a per-day count: the S.No. is
+   * the register's running row number and the slab number is the plant's.
+   *
+   * THIS IS THE OPENING SUGGESTION, NOT THE RUNNING ONE. After a slab is
+   * saved, saveSlab counts on from the slab it just wrote, in the browser,
+   * without asking anyone — see the block there. So this runs on a fresh page,
+   * on a shift change, on leaving edit mode, after a delete, after a 409, and
+   * when saveSlab had nothing to count from (a blank S.No., a slab number like
+   * 140748-A). `registerVersion` is what those cases bump; `loading` keeps it
+   * from firing once against a half-loaded form and again the moment the shift
+   * arrives, throwing the first answer away.
+   *
+   * NEITHER FIELD OVERWRITES WHAT THE OPERATOR TYPED. The slab number never did
+   * (`p.slabNumber ||`). The S.No. used to be replaced outright, which was
+   * survivable while it was computed in the browser in the same tick — but it
+   * is a round trip now, so a corrected S.No. could be wiped seconds later by
+   * an answer already in flight, or by the effect re-firing after a delete.
+   * `suggested` remembers what this effect last put there; anything else in the
+   * box was typed by a person and is left alone.
+   */
+  /**
+   * The production date NEW slabs default to for the running batch.
+   *
+   * A batch can run past midnight: slabs 1-80 on the 1st, slab 81 at 00:03 on
+   * the 2nd. The operator changes the Production Date field ONCE for slab 81 and
+   * every slab after it carries the new day — that persistence lives here, in a
+   * ref, so it survives a save (which clears the rest of the row) and even an
+   * edit interlude (correcting an earlier slab does not move it). It re-seeds to
+   * the batch's own setup date only when the RUNNING BATCH itself changes,
+   * tracked by seededBatchId so an ordinary re-render never resets the day the
+   * operator has moved on to.
+   */
+  const workingDate = useRef<string>("");
+  const seededBatchId = useRef<string | null>(null);
+  /**
+   * Has the operator set the Shift by hand for the slab on screen?
+   *
+   * Until they do, the Shift follows the In Time they type — 22:10 in means
+   * Shift C, whatever the tablet was showing before. That is the whole reason
+   * this field exists rather than reading RoboShift.shiftNumber, which is
+   * stamped once a day from the wall clock and so says "A" on a slab made at
+   * 23:40. Once they choose one it stands, for this slab; a save clears the
+   * flag so the next slab follows its own In Time again, and a handover
+   * corrects itself without anybody remembering to change a dropdown.
+   */
+  const shiftTouched = useRef(false);
+  /** The same for the Production Date: set by hand for the slab on screen, it
+   *  stands; until then a slab the plant lists carries the plant's day. */
+  const dateTouched = useRef(false);
+  /**
+   * The plant's row for the slab number on the form, when the running batch's
+   * list holds it: picked from the list, offered after a save, or typed.
+   * Never while an existing slab is being corrected.
+   */
+  const plantRow = !editingId && plant.state === "ok" ? plantRowFor(plant.rows, slab.slabNumber) : null;
+  /**
+   * Set while the plant has dated the slab on screen: which slab, and the Shift
+   * the form held before. The plant's day and shift belong to THAT slab only.
+   * They never move the working day (a save does, below), and when the NUMBER
+   * on the form becomes another one the plant does not list (overtyped, or an
+   * offered number another tablet took) they leave with it: the date goes back
+   * to the working day and the Shift to what it was, exactly as the form
+   * behaved before the list existed. While the number stays, what the plant
+   * said of it stays too, even if a re-read of the list no longer holds it.
+   */
+  const plantFilled = useRef<{ shift: string; slabNo: number } | null>(null);
+  useEffect(() => {
+    if (editingId) { plantFilled.current = null; return; }
+    if (!plantRow) {
+      const back = plantFilled.current;
+      if (!back) return;
+      if (plainSlabNo(slab.slabNumber) === back.slabNo) return;
+      plantFilled.current = null;
+      setSlab((p) => {
+        const d = dateTouched.current ? p.productionDate : (workingDate.current || p.productionDate);
+        const sh = shiftTouched.current || isValidTime(p.inTime) ? p.productionShift : (back.shift || p.productionShift);
+        return d === p.productionDate && sh === p.productionShift ? p : { ...p, productionDate: d, productionShift: sh };
+      });
+      return;
+    }
+    plantFilled.current = { shift: plantFilled.current?.shift ?? slab.productionShift, slabNo: plantRow.slabNo };
+    // The plant's day (across midnight it follows the In time typed) and, until
+    // an In time says otherwise, the plant's shift. Either one set by hand stands.
+    const date = dateTouched.current ? "" : plantRowDate(plantRow, slab.inTime);
+    const shiftCode = shiftTouched.current || isValidTime(slab.inTime) ? "" : plantRow.shift;
+    setSlab((p) => {
+      const d = date || p.productionDate, sh = shiftCode || p.productionShift;
+      return d === p.productionDate && sh === p.productionShift ? p : { ...p, productionDate: d, productionShift: sh };
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editingId, plantRow?.slabNo, plantRow?.date, plantRow?.dist, plantRow?.distDate, plantRow?.press, plantRow?.pressDate, plantRow?.shift, slab.inTime, slab.slabNumber]);
+  useEffect(() => {
+    if (loading || isPageEdit || isSetupEdit) return;
+    const bid = latestBatch?.id ?? null;
+    if (bid === seededBatchId.current) return; // same batch — keep the working day
+    seededBatchId.current = bid;
+    const seed = latestBatch?.productionDate?.trim() || localDate();
+    workingDate.current = seed;
+    // Don't stomp a slab loaded for editing — its own date is on screen.
+    if (!editingId) {
+      // The setup's day replaces what was on the form, a date set by hand for the
+      // slab on screen included, so that flag goes with it.
+      dateTouched.current = false;
+      setSlab((p) => ({ ...p, productionDate: seed, productionShift: p.productionShift || shiftFromTime(nowHM()) || "" }));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [latestBatch?.id, loading, editingId]);
+
+  const suggested = useRef<string>("");
+  useEffect(() => {
+    if (loading || editingId || isSetupEdit) return;
+    let ignore = false;
+    (async () => {
+      const next = await getJson<{ serialNumber: number | null; slabNumber: string }>(
+        "/api/robo/production/next-number?trial=1", // CR-003: counted on from trial slabs
+        { serialNumber: null, slabNumber: "" },
+      );
+      if (ignore || next.serialNumber == null) return;
+      const serial = String(next.serialNumber);
+      setSlab((p) => {
+        const mine = p.serialNumber === "" || p.serialNumber === suggested.current;
+        suggested.current = serial;
+        return {
+          ...p,
+          serialNumber: mine ? serial : p.serialNumber,
+          slabNumber: p.slabNumber || next.slabNumber || "",
+        };
+      });
+    })();
+    return () => { ignore = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loading, shift?.id, registerVersion, editingId]);
+
+  /* The setup driving this slab: when editing, the record's OWN batch setup —
+     not the shift's latest. A slab logged under the morning's design must keep
+     showing that design's machines even after a new batch was started, or the
+     In/Out labels name robots that were not running when it was made. */
+  const activeBatch: BatchRecipe | null = editingId ? editRecord?.batchRecipe ?? null : runningBatch;
+
+  const activeMachineNames = activeBatch
+    ? activeBatch.entries
+        .filter(isConfigured)
+        .map((e) => e.machine.name)
+        .sort((a, b) => MACHINE_ORDER.indexOf(a) - MACHINE_ORDER.indexOf(b))
+    : [];
+  // firstMachine / lastMachine went with the In time (Robo3) / Out time (Robo3)
+  // suffixes — the labels are plain now, so the first and last configured
+  // roycut of the run are no longer needed. hasRoymix stays: it decides whether
+  // the Robo2 body-weight and cycle-time fields appear, which is a real
+  // difference in what the slab records.
+  const hasRoymix = activeMachineNames.includes("Roymix");
+
+  // A delay row's duration in whole minutes, rounded up like the stored value —
+  // derived from the (editable) times, and the single source for the badge, the
+  // running total and the save.
+  const rowMinutes = (r: { startTime: string; endTime: string }) => {
+    const d = calcDuration(r.startTime, r.endTime);
+    return d ? d.minutes + (d.seconds > 0 ? 1 : 0) : 0;
+  };
+  const totalDelay = delayRows.reduce((s, r) => s + rowMinutes(r), 0);
+
+  const say = (msg: string) => { setFlash(msg); window.setTimeout(() => setFlash(""), 4000); };
+
+  // ---- master add-new handlers (shared by the comboboxes) ----
+  const post = async (url: string, body: unknown) => {
+    const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if (!r.ok) throw new Error("create failed");
+    return r.json();
+  };
+  const ensureDesignId = async (): Promise<string> => {
+    const name = batch.designName.trim();
+    if (!name) throw new Error("no design");
+    const hit = designs.find((d) => d.name.toLowerCase() === name.toLowerCase());
+    if (hit) return hit.id;
+    const created: Design = await post("/api/robo/designs", { name });
+    setDesigns((p) => [...p, created]);
+    return created.id;
+  };
+  const addDesign = async (name: string) => { const d: Design = await post("/api/robo/designs", { name }); setDesigns((p) => [...p, d]); };
+  const addProgram = async (name: string) => {
+    if (!batch.designName.trim()) { setBatchError("Pick the design first — new programs are filed under it."); throw new Error("design first"); }
+    setBatchError("");
+    const designId = await ensureDesignId();
+    const created: Program = await post("/api/robo/programs", { name, designId });
+    setPrograms((p) => [...p, created]);
+  };
+  const addTool = async (name: string) => { const t: Named = await post("/api/robo/tools", { name }); setTools((p) => [...p, t]); };
+  const addLiquid = async (name: string) => { const l: Named = await post("/api/robo/liquids", { name }); setLiquids((p) => [...p, l]); };
+  const addPowder = async (name: string) => { const w: Named = await post("/api/robo/powders", { name }); setPowders((p) => [...p, w]); };
+
+  const setEntry = (machineId: string, field: keyof MachineEntry, value: string) =>
+    setEntries((p) => ({ ...p, [machineId]: { ...(p[machineId] ?? emptyEntry()), [field]: value } }));
+
+  /**
+   * Design picked → set tool/liquid/powder per machine from the plant
+   * in-charge's reference sheet. Never program, CT or roller height (those vary
+   * run to run), and everything stays editable — the preset is a head start,
+   * not a rule.
+   *
+   * IT STATES THE WHOLE PICTURE, blanks included, across every machine. The
+   * sheet lists all four robots per design and writes "-" or "na" where one is
+   * not used, so applying a design has to write those blanks too. It used to
+   * only fill in what the design mentioned, which is what produced the wrong
+   * mappings on the card: correcting BELLAGIO GOLD to BANYAN left BELLAGIO's
+   * DVCT4 on Robo3, because BANYAN's row has no powder there — and switching to
+   * ALABASTER, which uses neither Robo1 nor Robo2, left the previous design's
+   * entire Robo1 row in place. The card then showed two designs mixed together
+   * and saved as if it were one recipe. See presetFieldsFor.
+   *
+   * A design the sheet does not list changes nothing at all: there is no
+   * reference for it, the operator fills the card by hand, and clearing would
+   * throw that away.
+   *
+   * ON THE EDIT SETUP SCREEN IT ONLY FILLS BLANKS. That screen exists mainly to
+   * fix a batch saved against the wrong design, so picking the right one is the
+   * first thing anyone does on it — and the reference sheet would then write
+   * over the tool, liquid and powder the run ACTUALLY used, for a batch that
+   * finished weeks ago, on every slab in it. What a past run used is recorded
+   * fact; a reference sheet is what a future run should use, and it does not
+   * get to overwrite the first. A blank field has no fact to lose, so those are
+   * still filled.
+   *
+   * In the shift the sheet still wins, unchanged: the run is in front of the
+   * operator, the numbers are being set rather than recalled, and re-priming
+   * the cards after a design correction is the point of the feature.
+   *
+   * Only machines whose value actually changed are counted, so the flash cannot
+   * claim to have filled a card it left alone.
+   */
+  const applyDesignPreset = (designName: string) => {
+    setBatch((p) => ({ ...p, designName }));
+    const preset = findDesignPreset(designName);
+    if (!preset) return;
+    const fillOnly = isSetupEdit;
+    let touched = 0;
+    setEntries((prev) => {
+      const next = { ...prev };
+      for (const m of machines) {
+        const sheet = presetFieldsFor(preset, m.name);
+        const cur = next[m.id] ?? emptyEntry();
+        // fillOnly keeps anything already recorded and writes only into the
+        // blanks — see the note above about correcting a finished run.
+        const pick = (from: string, existing: string) => (fillOnly && existing.trim() ? existing : from);
+        const row = {
+          ...cur,
+          toolName: pick(sheet.toolName, cur.toolName),
+          liquidName: pick(sheet.liquidName, cur.liquidName),
+          powderName: pick(sheet.powderName, cur.powderName),
+        };
+        if (row.toolName !== cur.toolName || row.liquidName !== cur.liquidName || row.powderName !== cur.powderName) {
+          next[m.id] = row;
+          touched += 1;
+        }
+      }
+      return next;
+    });
+    if (touched > 0) {
+      say(fillOnly
+        ? `Filled the empty tool, liquid and powder fields on ${touched} machine(s) from the ${preset.design} reference. What this run already recorded was left as it is — change it by hand if it is wrong.`
+        : `Tool, liquid and powder set for ${touched} machine(s) from the ${preset.design} reference — machines that design does not use were cleared. Check and adjust as needed.`);
+    }
+  };
+
+  // ---- the shift row is pure plumbing (schema requires it): reuse today's,
+  // silently close a stale one from a previous day, create fresh as needed ----
+  const ensureShiftId = async (): Promise<string> => {
+    // CR-003: the trial view's shift fields are null when no shift is running.
+    if (shift?.id && shift.date === localDate()) return shift.id;
+    if (shift?.id) {
+      // day rolled over — close yesterday's grouping row without any UI
+      await fetch(`/api/robo/shifts/${shift.id}`, {
+        method: "PATCH", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: "CLOSED", endTime: nowHM() }),
+      }).catch(() => null);
+    }
+    const res = await fetch("/api/robo/shifts", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        date: localDate(),
+        shiftNumber: shiftFromClock(),
+        startTime: nowHM(),
+        operatorName: "",
+      }),
+    });
+    if (res.status === 409) { const s = await refetchShift(); if (s?.id) return s.id; }
+    if (!res.ok) throw new Error("shift create failed");
+    const s = await res.json();
+    return s.id as string;
+  };
+
+  const saveBatch = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBatchError("");
+    if (!batch.designName.trim()) { setBatchError("Design is required."); return; }
+    const activeList = machines.filter((m) => activeMachines[m.id]);
+    if (activeList.length === 0) { setBatchError("At least one machine must be active."); return; }
+    /* The save rebuilds the per-machine rows from the cards on screen, and the
+       cards are built by matching the stored setup's machine NAMES against the
+       current machine list. A stored entry with no card — a robot since renamed
+       or dropped from the list — would therefore be deleted without ever having
+       been shown. Refuse instead. On the run in progress that is a nuisance; on
+       one from three months ago it is the only warning anyone would get, so
+       both edit paths check it. */
+    const editing = isSetupEdit ? setupEdit!.setup : editingBatchId ? shift?.batchRecipes?.find((b) => b.id === editingBatchId) : null;
+    if (editing) {
+      const known = new Set(machines.map((m) => m.name));
+      const missing = editing.entries.map((e) => e.machine.name).filter((n) => !known.has(n));
+      if (missing.length > 0) {
+        setBatchError(
+          `This setup records ${missing.join(", ")}, which ${missing.length === 1 ? "is" : "are"} not in the machine list any more, ` +
+          `so ${missing.length === 1 ? "it has" : "they have"} no card above and saving would drop ${missing.length === 1 ? "it" : "them"} from the run. ` +
+          `Restore the machine in Masters → Machines first.`,
+        );
+        return;
+      }
+    }
+    // CR-003: a Liquid or Powder set to Define needs its reference photo.
+    const photoProblem = trialSetupProblem(activeList.map((m) => ({
+      machineName: m.name,
+      hasPowder: m.name !== "Roymix",
+      liquidSetting: entries[m.id]?.liquidSetting,
+      powderSetting: entries[m.id]?.powderSetting,
+      liquidPhoto: Boolean(photos[photoKey(m.id, "LIQUID")]),
+      powderPhoto: Boolean(photos[photoKey(m.id, "POWDER")]),
+    })), machineLabel);
+    if (photoProblem) { setBatchError(photoProblem); return; }
+    setBatchSaving(true);
+    try {
+      /* Editing corrects the setup this shift is already running on, so it
+         PATCHes that row and keeps its id — every slab logged so far points at
+         it. Posting a new setup instead would leave the shift with two, the
+         slabs attached to the older one, and the design linked to a spare setup
+         that then blocks the design from ever being deleted. See the PATCH
+         handler for the full reasoning.
+
+         ensureShiftId() is skipped on an edit for the same reason the API
+         ignores shiftId: the setup belongs to the shift it was made in, and
+         calling it here could roll a stale shift over mid-correction. */
+      const isEdit = Boolean(editingBatchId);
+      const shiftId = isEdit ? null : await ensureShiftId();
+      // CR-003: a trial setup is saved through the trial routes (settings + photos).
+      const res = await fetch(isEdit ? `/api/robo/trial/setups/${editingBatchId}` : "/api/robo/trial/setups", {
+        method: isEdit ? "PATCH" : "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...(shiftId ? { shiftId } : {}),
+          productionDate: batch.productionDate || null,
+          batchNo: batch.batchNo.trim() || null,
+          designName: batch.designName.trim(),
+          targetSlabs: batch.targetSlabs ? Number(batch.targetSlabs) : null,
+          thickness: batch.thickness ? Number(batch.thickness) : null,
+          notes: batch.notes || null,
+          entries: activeList.map((m) => ({
+            machineId: m.id,
+            programName: entries[m.id]?.programName || "",
+            toolName: entries[m.id]?.toolName || "",
+            liquidName: entries[m.id]?.liquidName || "",
+            powderName: entries[m.id]?.powderName || "",
+            rollerHeight: entries[m.id]?.rollerHeight || "",
+            targetCycleTime: entries[m.id]?.targetCycleTime ? Number(entries[m.id].targetCycleTime) : null,
+            liquidSetting: entries[m.id]?.liquidSetting ?? SETTING_NORMAL,
+            powderSetting: m.name === "Roymix" ? SETTING_NORMAL : entries[m.id]?.powderSetting ?? SETTING_NORMAL,
+          })),
+          // CR-003: the reference photos on the form, for consumables set to Define.
+          photos: activeList.flatMap((m) => (["LIQUID", "POWDER"] as const)
+            .filter((kind) => (kind === "LIQUID" ? entries[m.id]?.liquidSetting : entries[m.id]?.powderSetting) === "DEFINE")
+            .filter((kind) => kind === "LIQUID" || m.name !== "Roymix")
+            .map((kind) => ({ machineId: m.id, kind, photoId: photos[photoKey(m.id, kind)]?.id ?? "" }))
+            .filter((p) => p.photoId)),
+        }),
+      });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        setBatchError(d.error || (isEdit ? "Failed to save the setup." : "Failed to save the trial setup."));
+        return;
+      }
+      setCopiedFrom("");
+      // The Edit setup screen has no shift to refetch and no second half to
+      // return to — it goes back to the slab it was opened from, refreshed so
+      // the corrected design is what that page shows.
+      if (isSetupEdit) {
+        router.push(setupEdit!.backHref);
+        router.refresh();
+        return;
+      }
+      await refetchShift();
+      setEditingBatchId(null);
+      setBatchOpen(false);
+      // The newly saved batch is now the running one — clear any Close Batch
+      // state from before it so the page shows it as running, not closed.
+      setBatchClosed(false);
+      say(isEdit
+        ? `Trial setup updated — ${batch.designName.trim()}.`
+        : `Trial setup saved — ${batch.designName.trim()}. Enter its trial slab below.`);
+    } catch {
+      setBatchError(editingBatchId ? "Failed to save the setup — try again." : "Failed to save the batch — try again.");
+    } finally {
+      setBatchSaving(false);
+    }
+  };
+
+  /**
+   * Warns about a slab number another record already holds, on blur rather
+   * than on save. `excludeId` keeps a slab being edited from clashing with
+   * itself. The API enforces the same rule with a 409, so this is only the
+   * earlier, friendlier half of the check.
+   *
+   * Returns whether the number is free, for the one caller that acts on the
+   * answer rather than just showing it — saveSlab, checking the number it just
+   * suggested for itself.
+   */
+  const checkSlabNumber = async (value: string): Promise<boolean> => {
+    const n = value.trim();
+    if (!n) { setSlabTaken(false); return true; }
+    const qs = new URLSearchParams({ slabNumber: n });
+    if (editingId) qs.set("excludeId", editingId);
+    const data = await getJson<{ available: boolean }>(`/api/robo/production/check-slab?${qs.toString()}`, { available: true });
+    setSlabTaken(!data.available);
+    return data.available;
+  };
+
+  /** Load a slab from the Recent table back into the form (finish it, or fix it). */
+  const editRecordFromTable = async (r: ProdRecord) => {
+    setEditingId(r.id);
+    setActionError("");
+    await loadRecord(r.id);
+  };
+  const cancelEdit = () => {
+    if (isPageEdit && recordId) { router.push(`/robo/slabs/${recordId}`); return; }
+    setEditingId(null);
+    setEditRecord(null);
+    setDelayRows([]);
+    setSlabTaken(false);
+    // Back to a blank NEW slab, on the day the operator is logging under — not
+    // the edited slab's own date, and not empty. The Shift starts from the
+    // clock again and follows the next In Time typed.
+    shiftTouched.current = false;
+    dateTouched.current = false;
+    setSlab({ ...emptySlab(), productionDate: workingDate.current, productionShift: shiftFromTime(nowHM()) || "" });
+  };
+
+  /**
+   * A tap on a slab of the plant's list: its number, day and shift go into the
+   * form and the cursor into In time. Only for a NEW slab (the list is not
+   * shown while one is being corrected). The number is checked like a typed
+   * one, so a slab another tablet saved a moment ago says so at once.
+   */
+  const pickPlantSlab = (row: PlantSlabRow) => {
+    if (editingId) return;
+    dateTouched.current = false;
+    shiftTouched.current = false;
+    plantFilled.current = { shift: plantFilled.current?.shift ?? slab.productionShift, slabNo: row.slabNo };
+    const date = plantRowDate(row, slab.inTime);
+    setSlab((p) => ({
+      ...p,
+      slabNumber: row.slabNumber,
+      productionDate: date || p.productionDate,
+      productionShift: (isValidTime(p.inTime) ? shiftFromTime(p.inTime) : null) ?? (row.shift || p.productionShift),
+    }));
+    void checkSlabNumber(row.slabNumber);
+    requestAnimationFrame(() => slabFormRef.current?.querySelector<HTMLInputElement>("[data-plant-in-time]")?.focus());
+  };
+
+  /**
+   * Permanently removes one slab and its delay logs, then refreshes.
+   * Admin-only server side; the button is hidden for everyone else, and the
+   * confirm names the slab because a row index is not something anyone can
+   * check against the paper register before saying yes.
+   */
+  const removeSlab = async (r: { id: string; slabNumber: string }) => {
+    if (!confirm(`Are you sure you want to delete this slab record?\n\nSlab No. ${r.slabNumber} — this cannot be undone.`)) return;
+    setActionError("");
+    setDeletingId(r.id);
+    const res = await fetch(`/api/robo/production/${r.id}`, { method: "DELETE" }).catch(() => null);
+    setDeletingId(null);
+    if (!res?.ok) {
+      const d = res ? await res.json().catch(() => ({})) : {};
+      setActionError(d.error || "Could not delete this slab record.");
+      return;
+    }
+    const body = await res.json().catch(() => ({}));
+    if (editingId === r.id) cancelEdit();
+    // A delete moves the register's last row too, so the suggestion is restated
+    // from whatever is now newest rather than counting on from a deleted slab.
+    setRegisterVersion((v) => v + 1);
+    setPlantVersion((v) => v + 1);
+    await refetchShift();
+    say(`Slab ${body.slabNumber ?? r.slabNumber} deleted${body.deletedDelayLogs ? ` with ${body.deletedDelayLogs} delay log(s)` : ""}.`);
+  };
+
+  const saveSlab = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSlabError("");
+    if (!editingId && !shift) { setSlabError("Save a batch setup first."); return; }
+    if (!slab.slabNumber.trim()) { setSlabError("Slab number is required."); return; }
+    if (slabTaken) { setSlabError("Duplicate Slab No. — this slab number already exists."); return; }
+    if (slab.inTime && !isValidTime(slab.inTime)) { setSlabError("In time must be HH:MM in 24-hour format, for example 09:30."); return; }
+    if (slab.outTime && !isValidTime(slab.outTime)) { setSlabError("Out time must be HH:MM in 24-hour format, for example 09:30."); return; }
+    setSlabSaving(true);
+    // Validate every delay row, then build the payload the server reconciles
+    // against. A row's machine set applies only when its code is robot-specific;
+    // its duration is derived from the (editable) times. A row with no code is an
+    // empty one the operator never filled — dropped, so it neither blocks the
+    // save nor is stored blank.
+    for (const r of delayRows) {
+      if (!r.delayCodeId) continue;
+      const code = delayCodes.find((c) => c.id === r.delayCodeId);
+      if (!r.startTime || !r.endTime || !isValidTime(r.startTime) || !isValidTime(r.endTime) || !calcDuration(r.startTime, r.endTime)) {
+        setSlabError(`Delay ${code?.code ?? ""} needs a valid Start and End time.`); setSlabSaving(false); return;
+      }
+      if (code?.isRobotSpecific && r.machineNames.length === 0) {
+        setSlabError(`Delay ${code.code} needs at least one machine.`); setSlabSaving(false); return;
+      }
+    }
+    const delayPayload = delayRows
+      .filter((r) => r.delayCodeId)
+      .map((r) => {
+        const code = delayCodes.find((c) => c.id === r.delayCodeId);
+        const names = code?.isRobotSpecific ? r.machineNames : [];
+        return {
+          id: r.id,                                   // undefined for a new row → created
+          delayCodeId: r.delayCodeId,
+          machineName: joinMachineNames(names) || null,
+          machineId: names.length ? (machines.find((m) => m.name === firstMachineName(names))?.id ?? null) : null,
+          durationMinutes: rowMinutes(r),
+          startTime: r.startTime || null,
+          endTime: r.endTime || null,
+          remarks: r.remarks || null,
+        };
+      });
+    // No status sent: the server derives it from Out time, so a slab still in
+    // the line saves as In-Processing and can be finished from the table below.
+    //
+    // Production Date and Thickness go on the request ONLY when the operator
+    // actually changed them, or ticked "apply forward" — an untouched field is
+    // omitted, so the slab keeps reading the batch's value rather than having a
+    // copy pinned onto it by an edit to something else. When present with the
+    // forward flag, the server carries the value across the batch (the PATCH
+    // handler's forwardRunIds).
+    const dateChanged = slab.productionDate.trim() !== loaded.current.productionDate.trim();
+    const thicknessChanged = slab.thickness.trim() !== loaded.current.thickness.trim();
+    const patchBody: Record<string, unknown> = {
+      serialNumber: slab.serialNumber ? Number(slab.serialNumber) : null,
+      slabNumber: slab.slabNumber.trim(),
+      // Always sent, unlike Date and Thickness: the Shift is the slab's own and
+      // never inherited from the batch, so there is no "leave it to fall back"
+      // state to protect — what the dropdown shows is what the slab gets.
+      productionShift: slab.productionShift || null,
+      inTime: slab.inTime || null,
+      outTime: slab.outTime || null,
+      roymixCycleTime: slab.roymixCycleTime ? Number(slab.roymixCycleTime) : null,
+      roymixBodyWeight: slab.roymixBodyWeight ? Number(slab.roymixBodyWeight) : null,
+      remarks: slab.remarks || null,
+      delays: delayPayload,
+    };
+    if (dateChanged || applyDateForward) {
+      patchBody.productionDate = slab.productionDate.trim() || null;
+      patchBody.applyProductionDateToRange = applyDateForward;
+    }
+    if (thicknessChanged || applyThicknessForward) {
+      patchBody.thickness = slab.thickness.trim() || null;
+      patchBody.applyThicknessToRange = applyThicknessForward;
+    }
+    // Batch split — sent ONLY when a box is ticked, so changing a field without
+    // ticking never moves a slab. The server re-parents this slab and the ones after
+    // it to the target batch (see the API route / batchSplit.ts).
+    if (applyBatchNoForward) {
+      patchBody.batchNo = slab.batchNo.trim() || null;
+      patchBody.applyBatchNoToRange = true;
+    }
+    if (applyDesignForward) {
+      patchBody.designName = slab.designName.trim();
+      patchBody.applyDesignToRange = true;
+    }
+    if (applyTargetSlabsForward) {
+      patchBody.targetSlabs = slab.targetSlabs.trim() || null;
+      patchBody.applyTargetSlabsToRange = true;
+    }
+    const res = await (editingId
+      ? fetch(`/api/robo/production/${editingId}`, {
+          method: "PATCH", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(patchBody),
+        })
+      : fetch("/api/robo/production", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            serialNumber: slab.serialNumber ? Number(slab.serialNumber) : null,
+            slabNumber: slab.slabNumber.trim(),
+            shiftId: shift!.id,
+            batchRecipeId: latestBatch?.id || null,
+            // The slab's own day. Falls back to the setup/shift when blank, so an
+            // untouched field behaves exactly as before this existed.
+            productionDate: slab.productionDate.trim() || null,
+            // The shift the operator picked (or the one the In Time implied).
+            productionShift: slab.productionShift || null,
+            inTime: slab.inTime || null,
+            outTime: slab.outTime || null,
+            roymixCycleTime: slab.roymixCycleTime ? Number(slab.roymixCycleTime) : null,
+            roymixBodyWeight: slab.roymixBodyWeight ? Number(slab.roymixBodyWeight) : null,
+            remarks: slab.remarks || null,
+            delays: delayPayload,
+          }),
+        })
+    ).catch(() => null);
+    if (!res?.ok) {
+      const d = res ? await res.json().catch(() => ({})) : {};
+      if (res?.status === 409) {
+        setSlabTaken(true);
+        // Somebody else took that number. The one in the box has been refused,
+        // so it is no longer a suggestion worth keeping — clear it and let the
+        // effect ask for a fresh one, rather than leaving the operator holding
+        // a number they have just been told is taken with no way forward but a
+        // reload.
+        setSlab((p) => ({ ...p, slabNumber: "" }));
+        setRegisterVersion((v) => v + 1);
+      }
+      setSlabError(d.error || (editingId ? "Failed to update the slab." : "Failed to save the slab."));
+      setSlabSaving(false);
+      return;
+    }
+    const saved = slab.slabNumber.trim();
+    const wasEdit = Boolean(editingId);
+    const finished = Boolean(slab.outTime);
+    setSlabSaving(false);
+    // A page-level edit ends by going back to Slab Records — the filtered list
+    // it was opened from, restored from the filters this tab kept (see
+    // SlabsBrowser) — so the operator can open the next slab, edit and save
+    // without retyping the filter. The in-page paths stay put so the operator
+    // can log the next slab.
+    if (isPageEdit && recordId) { router.push(`/robo/slabs`); router.refresh(); return; }
+    setEditingId(null);
+    setEditRecord(null);
+    setDelayRows([]);
+    setSlabTaken(false);
+
+    /*
+     * THE NEXT PAIR, COUNTED FROM THE SLAB JUST WRITTEN.
+     *
+     * This is the whole of "after saving each slab, the next entry uses the
+     * latest saved S.No. + 1 and Slab Number + 1", and it is done here rather
+     * than by asking the server because here we KNOW what the last slab was —
+     * we just wrote it. No round trip, nothing to go stale, and nothing for a
+     * dropped request on plant wifi to leave behind.
+     *
+     * The server is still asked when this cannot answer: a blank or
+     * non-numeric S.No., a slab number like 140748-A that nothing follows
+     * from, and every correction — see below.
+     */
+    const savedSerial = Number(slab.serialNumber);
+    const nextSerial = Number.isFinite(savedSerial) && savedSerial > 0 ? String(savedSerial + 1) : "";
+    // Same helper the server uses, so the width rule is the same one: 09999
+    // becomes 10000 and 00042 becomes 00043.
+    /* A slab saved FROM the plant's list is followed by the list's next one:
+       the next number the plant made in this batch that is not yet entered,
+       which skips a number the plant never made. A slab the list did not hold
+       counts on as before. */
+    const fromPlant = !wasEdit && plant.state === "ok" && plantRowFor(plant.rows, saved) ? nextPlantSlab(plant.rows, saved) : null;
+    const nextSlab = wasEdit ? "" : (fromPlant?.slabNumber ?? nextSlabNumber(saved));
+    const fromPlantDate = fromPlant ? plantRowDate(fromPlant) : "";
+    /* The working day follows the slab just SAVED. Without the list that is no
+       change (a new slab's date is the working day unless set by hand, which
+       moves it too). With it, a run entered from the list leaves the working
+       day on its last slab's day, so a slab typed next (its MIS hour not filed
+       yet) starts there and not back on the setup's date. A slab only offered
+       or tapped moves nothing. */
+    if (!wasEdit && slab.productionDate) workingDate.current = slab.productionDate;
+    plantFilled.current = fromPlant ? { shift: slab.productionShift, slabNo: fromPlant.slabNo } : null;
+
+    /* The next slab works its own Shift out again from the In Time it is given;
+       the one on screen carries forward until then, so a run inside one shift
+       never has to be re-picked and a handover sets itself right. */
+    shiftTouched.current = false;
+    dateTouched.current = false;
+    // The list is read again either way: a new slab leaves it, and a correction can change a slab's number.
+    setPlantVersion((v) => v + 1);
+
+    if (wasEdit) {
+      /* A correction says nothing about where the register ends — the slab
+         being fixed can be from any day. Counting on from it would offer the
+         number after THAT row, which is very likely one that already exists.
+         Both fields are emptied and the effect below fetches the real end of
+         the register. */
+      suggested.current = "";
+      setSlab((p) => ({ ...p, serialNumber: "", slabNumber: "", productionDate: workingDate.current, inTime: "", outTime: "", roymixCycleTime: "", roymixBodyWeight: "", remarks: "" }));
+      setRegisterVersion((v) => v + 1);
+    } else {
+      suggested.current = nextSerial;
+      // Production date carries forward on the working day — the whole point of
+      // the per-slab date: once the operator moves to the next day, every slab
+      // after it stays there until they move again.
+      setSlab((p) => ({ ...p, serialNumber: nextSerial, slabNumber: nextSlab, productionDate: fromPlantDate || workingDate.current, productionShift: fromPlant?.shift || p.productionShift, inTime: "", outTime: "", roymixCycleTime: "", roymixBodyWeight: "", remarks: "" }));
+      // Only when this could not work it out. Asking every time would let the
+      // server's answer overwrite a pair we know is right.
+      if (!nextSerial || !nextSlab) setRegisterVersion((v) => v + 1);
+      /* The server's suggestion skips numbers that already exist; counting on
+         from the last slab cannot. So it is checked, and if the plant has
+         already used it — an import filled the block above, another tablet got
+         there first — the field is emptied and the server asked for one that
+         skips. The operator never sees a number they will be refused, and the
+         guard on `p.slabNumber` means a number typed in the meantime wins. */
+      if (nextSlab) {
+        void (async () => {
+          if (await checkSlabNumber(nextSlab)) return;
+          setSlab((p) => (p.slabNumber === nextSlab ? { ...p, slabNumber: "" } : p));
+          // The taken number has left the form and its warning goes with it. Left
+          // standing, it sat under the next number offered, which is free, and
+          // refused its save until the operator retyped the number.
+          setSlabTaken(false);
+          setRegisterVersion((v) => v + 1);
+        })();
+      }
+    }
+    const after = await refetchShift();
+    // CR-003: a trial setup belongs to the one trial slab just saved, so the
+    // next trial slab starts from a fresh setup — offered with "Copy from
+    // previous record". (An edit changes nothing here.)
+    if (!wasEdit && !(after?.batchRecipes?.length)) {
+      setEditingBatchId(null);
+      seedBlankBatch();
+      setBatchOpen(true);
+    }
+    say(wasEdit
+      ? `Trial slab ${saved} updated${finished ? " and completed" : ""}.`
+      : `Trial slab ${saved} saved${finished ? "" : " as In-Processing — finish it from the table below"}. For the next trial slab, save its own setup (Copy from previous record).`);
+  };
+
+  if (loading) return <Empty>Loading robo line…</Empty>;
+  if (isPageEdit && !editLoading && !editRecord) {
+    return (
+      <Card>
+        <Empty>Slab record not found — it may have been deleted.</Empty>
+        <div className="mt-4 text-center">
+          <Link href="/robo/slabs" className={btnGhost}>Back to Slabs Records</Link>
+        </div>
+      </Card>
+    );
+  }
+
+  const programOptions: SsOption[] = programs.map((p) => ({ id: p.id, name: p.name, hint: p.design?.name ?? undefined }));
+  const canLogSlab = isPageEdit ? Boolean(editRecord) : Boolean(shift && activeBatch);
+  /** The plant's word on the In and Out typed for a listed slab (lib/robo/plantSlabs plantTimeWarnings). */
+  const plantTimeNotes = plantRow
+    ? plantTimeWarnings(plantRow, isValidTime(slab.inTime) ? slab.inTime : "", isValidTime(slab.outTime) ? slab.outTime : "")
+    : [];
+  const shiftClosed = editRecord?.shift?.status === "CLOSED";
+  /* How old the run being corrected is, and whether that is worth a sentence.
+     Both dates come from the server so the answer does not depend on how long
+     the tablet has had the page open, or on its clock being right. */
+  const setupAge = isSetupEdit ? daysBetween(setupEdit!.date, setupEdit!.today) : null;
+  const setupStale = isSetupStale(setupAge);
+
+  return (
+    <div className="space-y-5">
+      {flash && <div className="rounded-xl border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-800">{flash}</div>}
+      {actionError && <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{actionError}</div>}
+
+      {/* ---- context bar ---- */}
+      {isSetupEdit ? (
+        <Card className="flex flex-wrap items-center gap-x-4 gap-y-2">
+          <Badge tone="amber">Editing setup</Badge>
+          <span className="flex min-w-0 items-center gap-2 text-sm text-gray-600">
+            <span className="font-medium text-gray-900">{setupEdit!.setup.designName || "Untitled setup"}</span>
+            {setupEdit!.setup.batchNo && <span className="text-gray-400">Batch {setupEdit!.setup.batchNo}</span>}
+            <span className="text-gray-400">Run {describeAge(setupAge)}</span>
+          </span>
+          <Link href={setupEdit!.backHref} className={`${btnGhost} ml-auto`}>Cancel</Link>
+        </Card>
+      ) : isPageEdit ? (
+        <Card className="flex flex-wrap items-center gap-x-4 gap-y-2">
+          <Badge tone="amber">Editing slab</Badge>
+          <span className="flex min-w-0 items-center gap-2 text-sm text-gray-600">
+            <span className="font-medium text-gray-900">{editRecord?.slabNumber}</span>
+            {/* The production date, not the shift's — same reason as
+                Complete Details §1. See productionDate.ts. */}
+            {productionDateOf(editRecord) && <span className="text-gray-400">{productionDateOf(editRecord)}</span>}
+            {activeBatch && <span className="truncate text-gray-400">{activeBatch.designName}</span>}
+          </span>
+          {/* A closed shift is already reported on, so say so plainly rather
+              than blocking the edit — correcting a wrong slab AFTER the shift
+              closed is exactly what this page is for. */}
+          {shiftClosed && <Badge tone="red">Shift closed</Badge>}
+          <Link href={`/robo/slabs/${recordId}`} className={`${btnGhost} ml-auto`}>Cancel</Link>
+        </Card>
+      ) : (
+        <Card className="flex flex-wrap items-center gap-x-4 gap-y-2">
+          {runningBatch ? (
+            <>
+              {/* CR-003: a trial setup waits for its one trial slab. */}
+              <Badge tone="green">Trial setup ready</Badge>
+              {/* The design, and nothing else. The machine chain, the thickness
+                  and the running slab count were a status line the operator
+                  reads past — all three are on the setup card or the table
+                  below, and the chain in particular restated itself whenever a
+                  robot was ticked. */}
+              <span className="flex min-w-0 items-center gap-2 text-sm text-gray-600">
+                <span className="font-medium text-gray-900">{runningBatch.designName}</span>
+                <span className="text-gray-400">Batch {runningBatch.batchNo?.trim() || NO_BATCH}</span>
+              </span>
+              {/* Three distinct acts. "Edit setup" corrects the run in progress;
+                  "Close Batch" ends it for this session so nothing more is logged
+                  to it (no DB change — see closeBatch); "New batch" starts the
+                  next run. Offering only New batch is what made operators start a
+                  duplicate setup to fix a typo, or keep logging to a run that was
+                  really over. */}
+              <div className="ml-auto flex items-center gap-2">
+                {batchOpen ? (
+                  <button type="button" className={btnGhost} onClick={closeBatchForm}>
+                    {editingBatchId ? "Cancel edit" : "Hide batch setup"}
+                  </button>
+                ) : (
+                  <>
+                    {/* CR-003: no Close Batch — a trial setup is closed by saving
+                        its one slab. */}
+                    <button type="button" className={btnGhost} onClick={startEditBatch}>Edit setup</button>
+                    <button type="button" className={btnGhost} onClick={startNewBatch}>New trial setup</button>
+                  </>
+                )}
+              </div>
+            </>
+          ) : (
+            <>
+              <Badge tone="amber">No trial setup</Badge>
+              <span className="text-sm text-gray-500">
+                Each trial slab has its own batch setup — save it below, then enter the trial slab.
+              </span>
+              {/* After Close Batch the setup form is collapsed and the shift
+                  already has batches, so it will not reopen on its own — offer
+                  New batch here so the operator can start the next run. On a
+                  fresh shift the form is already open below, so this stays
+                  hidden. */}
+              {!batchOpen && (
+                <button type="button" className={`${btnGhost} ml-auto`} onClick={startNewBatch}>New trial setup</button>
+              )}
+            </>
+          )}
+        </Card>
+      )}
+
+      {/* ---- batch setup (one-time per run, collapses after save) ---- */}
+      {!isPageEdit && batchOpen && (
+        <Card>
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+            <h2 className="text-sm font-semibold text-gray-900">{editingBatchId ? "Edit trial batch setup" : "Trial batch setup"}</h2>
+            <div className="flex items-center gap-3">
+              {/* CR-003: start this trial's setup from the previous trial slab's. */}
+              {!editingBatchId && !isSetupEdit && (
+                <button type="button" onClick={copyFromPrevious} disabled={copying}
+                  className="rounded-lg border border-brand/40 bg-brand/5 px-3 py-1.5 text-xs font-semibold text-brand transition hover:bg-brand/10 disabled:opacity-60">
+                  {copying ? "Copying…" : "⧉ Copy from previous record"}
+                </button>
+              )}
+              <span className="text-xs text-gray-400">{machines.filter((m) => activeMachines[m.id]).length} of {machines.length} machines active</span>
+            </div>
+          </div>
+          {copiedFrom && !editingBatchId && (
+            <div className="mb-4 rounded-xl border border-brand/20 bg-brand/5 px-4 py-3 text-sm text-gray-700">
+              Copied from trial slab <span className="font-semibold">{copiedFrom}</span>. Change anything you need before saving —
+              the previous trial slab&rsquo;s own setup is not changed.
+            </div>
+          )}
+          {isSetupEdit ? (
+            <>
+              {/* One setup speaks for every slab of its run, so the count is
+                  said before the fields and not after the save. This is the
+                  difference between this screen and the in-shift Edit setup
+                  button: there the run is in front of the operator, here it
+                  may be a batch someone else logged weeks ago. */}
+              <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                Correcting the setup this slab was logged against.{" "}
+                {setupEdit!.slabCount === 1
+                  ? "It is this slab's own setup, and no other slab uses it."
+                  : <>It is shared by <span className="font-semibold">{setupEdit!.slabCount} slabs</span> — every one of them will read the corrected design, thickness and machines.</>}{" "}
+                Unticking a robot restates which machines the run used, so those slabs&rsquo; In/Out labels follow. The
+                slabs themselves — their numbers, times and remarks — are not touched.
+              </div>
+              {setupStale && (
+                <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                  This run was {describeAge(setupAge)}, outside the {SETUP_EDIT_WINDOW_DAYS}-day reporting period. It has
+                  most likely been through a monthly report and an export already, so a figure someone has circulated
+                  will stop matching the register. The correction still saves — check it is the right one.
+                </div>
+              )}
+            </>
+          ) : editingBatchId && (
+            <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+              Correcting the setup this shift is already running on. The slabs logged against it stay attached and
+              are not changed — but unticking a robot restates which machines this run used, so their In/Out
+              labels will follow. To start a different run instead, cancel and use New batch.
+            </div>
+          )}
+          {batchError && <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{batchError}</div>}
+
+          <form onSubmit={saveBatch} className="space-y-5">
+            {/* Two up, then Design across, then two up — the register's own
+                grouping, and what a tablet gets. The four-across desktop row
+                is unchanged; it just starts at lg (1024px) now instead of md
+                (768px), which was exactly iPad-portrait width, so every tablet
+                on the floor was being handed the desktop grid. */}
+            <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+              {/* A NEW setup can be filled from a batch the plant made (owner, 17 Nov
+                  2026). Not while correcting a setup: its slabs are already attached. */}
+              {!editingBatchId && !isSetupEdit && (
+                <PlantBatchPicker labelClass={label} inputClass={inp}
+                  onPick={(o) => setBatch((p) => ({
+                    ...p,
+                    batchNo: o.batch,
+                    productionDate: o.date || p.productionDate,
+                    thickness: o.thickness != null ? String(o.thickness) : p.thickness,
+                  }))} />
+              )}
+              <div>
+                <span className={label}>Production date</span>
+                <input type="date" value={batch.productionDate} onChange={(e) => setBatch((p) => ({ ...p, productionDate: e.target.value }))} className={inp} />
+              </div>
+              <div>
+                <span className={label}>Batch no.</span>
+                <input value={batch.batchNo} onChange={(e) => setBatch((p) => ({ ...p, batchNo: e.target.value }))} placeholder="e.g. B-1042" className={inp} />
+              </div>
+              <div className="col-span-2">
+                <span className={label}>Design <span className="text-red-500">*</span></span>
+                <SearchableSelect value={batch.designName} options={designs} placeholder="Search designs or add new…"
+                  onSelect={applyDesignPreset} onCreate={addDesign} />
+              </div>
+              <div>
+                <span className={label}>Thickness (cm)</span>
+                <input type="number" step="0.1" value={batch.thickness} onChange={(e) => setBatch((p) => ({ ...p, thickness: e.target.value }))} placeholder="e.g. 2" className={inp} />
+              </div>
+              <div>
+                <span className={label}>Target slabs</span>
+                <input type="number" value={batch.targetSlabs} onChange={(e) => setBatch((p) => ({ ...p, targetSlabs: e.target.value }))} placeholder="e.g. 120" className={inp} />
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              {machines.map((m) => {
+                const entry = entries[m.id] ?? emptyEntry();
+                const isRoymix = m.name === "Roymix";
+                const isRoycut3 = m.name === "Roycut-3";
+                const on = activeMachines[m.id] ?? true;
+                return (
+                  <div key={m.id} className={`rounded-xl border p-4 transition ${on ? "border-gray-200" : "border-gray-100 bg-gray-50 opacity-60"}`}>
+                    <div className="mb-3 flex items-center gap-3">
+                      <input type="checkbox" checked={on} onChange={() => setActiveMachines((p) => ({ ...p, [m.id]: !p[m.id] }))}
+                        className="h-4 w-4 rounded border-gray-300 text-brand focus:ring-brand/30" />
+                      <h3 className="text-sm font-medium text-gray-900">{machineLabel(m.name)}</h3>
+                      {/* The green "liquid optional" badge that used to sit
+                          here has moved onto the Liquid label itself — see
+                          the field below. */}
+                      {!on && <span className="ml-auto text-xs text-gray-400">Not in use</span>}
+                    </div>
+                    {on && (
+                      /*
+                       * Three layouts, one DOM.
+                       *
+                       * TABLET (sm–lg, which is every iPad in portrait): six
+                       * columns, laid out the way the line reads a machine —
+                       * the Program across the top, then the three consumables
+                       * together, then the numbers.
+                       *
+                       *   Robo1 / Robo3   Program
+                       *                   Tool · Liquid · Powder
+                       *                   Target cycle time · Roller height
+                       *   Robo2           Program
+                       *                   Liquid
+                       *   Robo4           Program
+                       *                   Tool · Liquid · Powder
+                       *                   Target cycle time
+                       *
+                       * PHONE (below sm): the same rows, but the consumables
+                       * stack one per line. Three dropdowns across 253px is
+                       * 76px each — narrower than the cell this whole change
+                       * exists to escape, and a dropdown that narrow is not a
+                       * control, it is a hazard. The two plain numbers still
+                       * pair up; they are three digits.
+                       *
+                       * DESKTOP (lg and up): the three-column grid exactly as
+                       * it was, restored by the `lg:order-*` classes.
+                       *
+                       * The DOM is in TABLET order, not desktop order, and the
+                       * reordering is spent on the desktop instead. Tab order
+                       * follows the DOM: on the tablet — the shop floor's
+                       * device, where somebody is going field by field through
+                       * a slab — what you tab to is what you see next. The
+                       * in-charge on a desktop gets the mismatch, on a two-row
+                       * grid where it is hard to get lost.
+                       *
+                       * The tablet/desktop split was at md (768px), which is
+                       * iPad-portrait width to the pixel, so tablets landed on
+                       * the desktop side of it and every dropdown was clipped
+                       * to a ~135px cell. SearchableSelect's own breakpoint
+                       * moved with this one; the two have to agree or a value
+                       * wraps in a cell that is no longer narrow, or worse,
+                       * does not in one that is.
+                       */
+                      <div className="grid grid-cols-2 gap-3 sm:grid-cols-6 lg:grid-cols-3">
+                        <div className={`col-span-2 sm:col-span-6 lg:order-1 ${isRoymix ? "lg:col-span-2" : "lg:col-span-1"}`}>
+                          <span className={label}>Program</span>
+                          <SearchableSelect value={entry.programName} options={programOptions} placeholder="Search programs or add new…"
+                            onSelect={(name) => setEntry(m.id, "programName", name)} onCreate={addProgram} />
+                        </div>
+                        {!isRoymix && (
+                          <div className="col-span-2 lg:order-2 lg:col-span-1">
+                            <span className={label}>Tool</span>
+                            <SearchableSelect value={entry.toolName} options={tools} placeholder="Search tools…"
+                              onSelect={(name) => setEntry(m.id, "toolName", name)} onCreate={addTool} />
+                          </div>
+                        )}
+                        {/* Robo2 takes liquid and nothing else, and the fact
+                            that it is optional belongs on the field — it used
+                            to be a green badge up in the card's title bar,
+                            where it read as being about the machine. */}
+                        {/* CR-003: the same two cells, now Setting · Name (typed by
+                            hand), and the reference photo below for Define. */}
+                        <div className={`lg:order-4 lg:col-span-1 ${isRoymix ? "col-span-2 sm:col-span-6" : "col-span-2"}`}>
+                          <TrialConsumableField label="Liquid" optional={isRoymix}
+                            setting={entry.liquidSetting} name={entry.liquidName} nameOptions={liquids}
+                            photo={photos[photoKey(m.id, "LIQUID")] ?? null} labelClass={label} inputClass={inp} placeholder="Liquid name"
+                            onSetting={(v) => setEntry(m.id, "liquidSetting", v)}
+                            onName={(v) => setEntry(m.id, "liquidName", v)}
+                            onPhoto={(p) => setPhotos((prev) => ({ ...prev, [photoKey(m.id, "LIQUID")]: p }))} />
+                        </div>
+                        {!isRoymix && (
+                          <div className="col-span-2 lg:order-5 lg:col-span-1">
+                            <TrialConsumableField label="Powder"
+                              setting={entry.powderSetting} name={entry.powderName} nameOptions={powders}
+                              photo={photos[photoKey(m.id, "POWDER")] ?? null} labelClass={label} inputClass={inp} placeholder="Powder name"
+                              onSetting={(v) => setEntry(m.id, "powderSetting", v)}
+                              onName={(v) => setEntry(m.id, "powderName", v)}
+                              onPhoto={(p) => setPhotos((prev) => ({ ...prev, [photoKey(m.id, "POWDER")]: p }))} />
+                          </div>
+                        )}
+                        {!isRoymix && (
+                          <div className="col-span-1 sm:col-span-3 lg:order-3 lg:col-span-1">
+                            <span className={label}>Target cycle time (sec)</span>
+                            <input type="number" value={entry.targetCycleTime} onChange={(e) => setEntry(m.id, "targetCycleTime", e.target.value)} placeholder="e.g. 214" className={inp} />
+                          </div>
+                        )}
+                        {!isRoymix && !isRoycut3 && (
+                          <div className="col-span-1 sm:col-span-3 lg:order-6 lg:col-span-1">
+                            <span className={label}>Roller height (mm)</span>
+                            <input value={entry.rollerHeight} onChange={(e) => setEntry(m.id, "rollerHeight", e.target.value)} placeholder="e.g. 20" className={inp} />
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="flex items-center justify-end gap-3">
+              <div className="mr-auto w-full max-w-sm">
+                <input value={batch.notes} onChange={(e) => setBatch((p) => ({ ...p, notes: e.target.value }))} placeholder="Batch notes (optional)" className={inp} />
+              </div>
+              {isSetupEdit
+                ? <Link href={setupEdit!.backHref} className={btnGhost}>Cancel</Link>
+                : latestBatch && <button type="button" className={btnGhost} onClick={closeBatchForm}>Cancel</button>}
+              <button type="submit" disabled={batchSaving} className={btnPrimary}>
+                {batchSaving ? "Saving…" : editingBatchId ? "Save changes" : "Save batch setup"}
+              </button>
+            </div>
+          </form>
+        </Card>
+      )}
+
+      {/* ---- slab entry (the fast, repeated action) ----
+           Not rendered on the Edit setup screen: that screen is about the run,
+           and the slab it was opened from is edited on the other tab. */}
+      {!isSetupEdit && (
+      <Card className={!canLogSlab ? "opacity-60" : ""}>
+        <div className="mb-4 flex items-center justify-between">
+          {/* The per-machine target cycle times used to be restated here as
+              chips. They are the setup's numbers, unchanged for the whole run
+              and already on the setup card — repeating them above every slab
+              was noise the operator cannot act on. Removed deliberately; the
+              values themselves are untouched. */}
+          <h2 className="text-sm font-semibold text-gray-900">{isPageEdit ? "Slab details" : "Slab entry"}</h2>
+        </div>
+
+        {editLoading ? (
+          <Empty>Loading slab…</Empty>
+        ) : !canLogSlab ? (
+          <Empty>No batch running. Save a batch setup above to start logging slabs.</Empty>
+        ) : (
+          <form ref={slabFormRef} onSubmit={saveSlab} className="space-y-4">
+            {!isPageEdit && !editingId && runningBatch && (
+              <PlantSlabList plant={plant} batchLabel={runningBatch.batchNo ?? ""} currentSlabNumber={slab.slabNumber}
+                onPick={pickPlantSlab} onRefresh={() => setPlantVersion((v) => v + 1)} />
+            )}
+            {editingId && !isPageEdit && (
+              <div className="flex items-center gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                <span>Editing slab <span className="font-semibold">{slab.slabNumber}</span>{editRecord?.status === SLAB_IN_PROCESSING ? " — add the Out time and save to complete it." : "."}</span>
+                <button type="button" onClick={cancelEdit} className="ml-auto text-xs font-medium text-amber-700 underline hover:text-amber-900">Cancel edit</button>
+              </div>
+            )}
+            {slabError && <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{slabError}</div>}
+            {editingId && !activeBatch && (
+              <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800">
+                This slab has no batch setup on record, so the machine names below are not shown. Everything else edits normally.
+              </div>
+            )}
+
+            {/* The Robo Entry slab layout, two-up on a tablet or desktop and
+                stacked on a phone. The order is deliberate: Production Date and
+                Shift lead at the top, then (when correcting) Thickness and the
+                batch's own fields, then the numbers, the times, the Roymix pair,
+                and Remarks last. Every row is a pair, with no hole beside a
+                field, at every combination:
+                  new slab                Date|Shift · S.No.|Slab · In|Out
+                  edit, in a batch        Date|Shift · Thickness|Batch ·
+                                          Design|Target · S.No.|Slab · In|Out
+                  edit, no batch setup    Date|Shift · Thickness (whole row) ·
+                                          S.No.|Slab · In|Out
+                An even count of half-width cells before S.No. is what keeps
+                S.No.|Slab and In|Out paired; a cell added up there needs a
+                partner or a full row. */}
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              {/* Row 1 — Production Date and Shift, side by side. The date
+                  defaults to the batch's day and carries forward slab after slab;
+                  the operator changes it only when a run crosses midnight, and
+                  from then on every new slab in the batch takes the new day. On
+                  an edit it can also carry the change across the rest of the
+                  batch (the box below). */}
+              <div>
+                <span className={label}>Production Date</span>
+                <input type="date" value={slab.productionDate}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    dateTouched.current = true;
+                    setSlab((p) => ({ ...p, productionDate: v }));
+                    // A new slab moves the working day for the ones after it; an
+                    // edit changes only the slab being corrected — unless the box
+                    // below is ticked to carry it forward.
+                    if (!editingId) workingDate.current = v;
+                  }}
+                  className={inp} />
+                {editingId && (
+                  <label className="mt-2 flex cursor-pointer items-start gap-2 text-xs">
+                    <input type="checkbox" checked={applyDateForward} onChange={(e) => setApplyDateForward(e.target.checked)} className="mt-0.5 h-4 w-4 shrink-0 rounded border-gray-300" />
+                    <span className="text-gray-600">Apply to <span className="font-medium text-gray-800">this slab and every following one</span> in the batch, up to the next change.</span>
+                  </label>
+                )}
+              </div>
+
+              {/* Shift — the second half of row 1. It follows the In Time typed
+                  below until the operator picks one by hand, and from then on
+                  stands for this slab; the next slab follows its own In Time
+                  again (shiftTouched). The hours are on the option itself so
+                  nobody has to remember which letter is which. */}
+              <div>
+                <span className={label}>Shift</span>
+                <select value={slab.productionShift}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    shiftTouched.current = true;
+                    setSlab((p) => ({ ...p, productionShift: v }));
+                  }}
+                  className={inpNarrow}>
+                  <option value="">Select shift</option>
+                  {SHIFT_WINDOWS.map((w) => <option key={w.code} value={w.code}>{w.label}</option>)}
+                </select>
+              </div>
+
+              {/* Thickness — only when correcting a slab. New production still
+                  takes one thickness from the batch setup; this is how a batch
+                  that changed thickness partway through gets fixed, forward from
+                  the slab where it changed. */}
+              {editingId && (
+                <div className={activeBatch ? "" : "sm:col-span-2"}>
+                  <span className={label}>Thickness (cm)</span>
+                  <input type="number" step="0.1" value={slab.thickness}
+                    onChange={(e) => setSlab((p) => ({ ...p, thickness: e.target.value }))}
+                    placeholder="e.g. 2" className={inp} />
+                  <label className="mt-2 flex cursor-pointer items-start gap-2 text-xs">
+                    <input type="checkbox" checked={applyThicknessForward} onChange={(e) => setApplyThicknessForward(e.target.checked)} className="mt-0.5 h-4 w-4 shrink-0 rounded border-gray-300" />
+                    <span className="text-gray-600">Apply to <span className="font-medium text-gray-800">this slab and every following one</span> in the batch, up to the next change.</span>
+                  </label>
+                </div>
+              )}
+
+              {/* Batch Number, Design and Target Slabs — shown INLINE with Production
+                  Date and Thickness, only on an edit and only when the slab is in a
+                  batch. Unlike Date/Thickness (which live on the slab), these live on
+                  the BATCH, so ticking "apply forward" MOVES this slab and the ones
+                  after it (up to the next batch change) into that batch — how two runs
+                  recorded as one (1372 Crystallo + 1404 Bellagio green, or 1384 + 1385)
+                  get separated: joined to that batch if it already exists in the shift,
+                  else created from this batch's setup. Same range mechanism (forwardRunIds)
+                  the server uses for Date/Thickness — see the PATCH route / batchSplit.ts.
+                  Leave a box off and nothing moves. */}
+              {editingId && activeBatch && (
+                <>
+                  <div>
+                    <span className={label}>Batch Number</span>
+                    <input value={slab.batchNo} onChange={(e) => setSlab((p) => ({ ...p, batchNo: e.target.value }))} placeholder="e.g. 1404" className={inp} />
+                    <label className="mt-2 flex cursor-pointer items-start gap-2 text-xs">
+                      <input type="checkbox" checked={applyBatchNoForward} onChange={(e) => setApplyBatchNoForward(e.target.checked)} className="mt-0.5 h-4 w-4 shrink-0 rounded border-gray-300" />
+                      <span className="text-gray-600">Apply to <span className="font-medium text-gray-800">this slab and every following one</span> in the batch, up to the next change.</span>
+                    </label>
+                  </div>
+
+                  <div>
+                    <span className={label}>Design</span>
+                    <input value={slab.designName} onChange={(e) => setSlab((p) => ({ ...p, designName: e.target.value }))}
+                      list="robo-split-designs" autoComplete="off" placeholder="e.g. Bellagio green" className={inp} />
+                    <datalist id="robo-split-designs">{designs.map((d) => <option key={d.id} value={d.name} />)}</datalist>
+                    <label className="mt-2 flex cursor-pointer items-start gap-2 text-xs">
+                      <input type="checkbox" checked={applyDesignForward} onChange={(e) => setApplyDesignForward(e.target.checked)} className="mt-0.5 h-4 w-4 shrink-0 rounded border-gray-300" />
+                      <span className="text-gray-600">Apply to <span className="font-medium text-gray-800">this slab and every following one</span> in the batch, up to the next change.</span>
+                    </label>
+                  </div>
+
+                  <div>
+                    <span className={label}>Target Slabs</span>
+                    <input type="number" value={slab.targetSlabs} onChange={(e) => setSlab((p) => ({ ...p, targetSlabs: e.target.value }))} placeholder="e.g. 120" className={inp} />
+                    <label className="mt-2 flex cursor-pointer items-start gap-2 text-xs">
+                      <input type="checkbox" checked={applyTargetSlabsForward} onChange={(e) => setApplyTargetSlabsForward(e.target.checked)} className="mt-0.5 h-4 w-4 shrink-0 rounded border-gray-300" />
+                      <span className="text-gray-600">Apply to <span className="font-medium text-gray-800">this slab and every following one</span> in the batch, up to the next change.</span>
+                    </label>
+                  </div>
+                </>
+              )}
+
+              {/* Row 2 — S.No. and Slab number. */}
+              <div>
+                <span className={label}>S.No.</span>
+                <input type="number" value={slab.serialNumber} onChange={(e) => setSlab((p) => ({ ...p, serialNumber: e.target.value }))} className={inp} {...advanceProps("slab")} />
+              </div>
+              <div>
+                <span className={label}>Slab number <span className="text-red-500">*</span></span>
+                <input value={slab.slabNumber}
+                  onChange={(e) => { setSlab((p) => ({ ...p, slabNumber: e.target.value })); if (slabTaken) setSlabTaken(false); }}
+                  onBlur={(e) => checkSlabNumber(e.target.value)}
+                  placeholder="e.g. 140748" className={inp} required {...advanceProps("slab")} />
+                {slabTaken && <p className="mt-1 text-xs font-medium text-red-600">Duplicate Slab No. — this slab number already exists.</p>}
+                {!slabTaken && plantRow && (
+                  <p className="mt-1 text-xs text-gray-500">
+                    {plantWindowWords(plantRow)}
+                    {plantRow.thickness != null ? ` Thickness ${thicknessWords(plantRow.thickness)}, saved with the slab.` : ""}
+                  </p>
+                )}
+              </div>
+
+              {/* Row 3 — In / Out time. Plain labels; the machine the clock was
+                  read off moved to the setup, so the column no longer renames
+                  itself between runs. */}
+              <div>
+                <span className={label}>In time</span>
+                {/* Typing the In Time sets the Shift, unless the operator has
+                    already picked one for this slab. 22:10 in is Shift C even
+                    if the tablet has been open since the morning. */}
+                <TimeInput value={slab.inTime} onChange={(v) => setSlab((p) => ({ ...p, inTime: v, productionShift: shiftTouched.current ? p.productionShift : (shiftFromTime(v) ?? p.productionShift) }))} onComplete={advanceOnComplete} className={inp} data-plant-in-time="" {...advanceProps("slab")} />
+              </div>
+              <div>
+                <span className={label}>Out time</span>
+                <TimeInput value={slab.outTime} onChange={(v) => setSlab((p) => ({ ...p, outTime: v }))} onComplete={advanceOnComplete} className={inp} {...advanceProps("slab")} />
+              </div>
+              {/* The plant's window for a listed slab: the robots work after it leaves the
+                  line head and before the press. A typed time outside it is a warning,
+                  never a refusal (owner, 17 Nov 2026: "warnings are good"). A full row,
+                  so the pairs above and below stay paired. */}
+              {plantTimeNotes.length > 0 && (
+                <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 sm:col-span-2">
+                  {plantTimeNotes.map((w) => <p key={w}>{w} Check the time.</p>)}
+                </div>
+              )}
+
+              {/* Row 4 — the Roymix pair, only when the running setup includes it. */}
+              {hasRoymix && (
+                <>
+                  <div>
+                    <span className={label}>Robo2 body weight (kg)</span>
+                    <input type="number" step="0.1" value={slab.roymixBodyWeight} onChange={(e) => setSlab((p) => ({ ...p, roymixBodyWeight: e.target.value }))} placeholder="e.g. 42.5" className={inp} {...advanceProps("slab")} />
+                  </div>
+                  <div>
+                    <span className={label}>Robo2 cycle time (sec)</span>
+                    <input type="number" value={slab.roymixCycleTime} onChange={(e) => setSlab((p) => ({ ...p, roymixCycleTime: e.target.value }))} placeholder="e.g. 185" className={inp} {...advanceProps("slab")} />
+                  </div>
+                </>
+              )}
+
+              {/* Last row — Remarks, full width. */}
+              <div className="sm:col-span-2">
+                <span className={label}>Remarks</span>
+                {/* CR-003: a much larger box for a trial's longer description.
+                    No field-advance here: Enter starts a new line. */}
+                <textarea value={slab.remarks} onChange={(e) => setSlab((p) => ({ ...p, remarks: e.target.value }))}
+                  placeholder="Describe the trial — what was changed, what was seen, what to try next" rows={6}
+                  className={`${inp} min-h-[9rem] resize-y leading-relaxed`} />
+              </div>
+            </div>
+
+            {/* Delay summary in the register's own wording, copyable straight
+                into the Remark field. Shown for newly added delays, recomputed
+                from start/end so the seconds show. */}
+            {delayRows.some((r) => !r.id && r.delayCodeId) && (
+              <div className="space-y-1">
+                <span className={label}>Delay summary</span>
+                {delayRows.filter((r) => !r.id && r.delayCodeId).map((r) => {
+                  const dur = calcDuration(r.startTime, r.endTime);
+                  const mins = dur ? dur.minutes : 0;
+                  const secs = dur ? dur.seconds : 0;
+                  const code = delayCodes.find((c) => c.id === r.delayCodeId);
+                  return (
+                    <p key={r.key} className="rounded border border-amber-200 bg-amber-50 px-2 py-1 text-sm text-amber-800">
+                      {code?.code ?? ""}-{mins} minutes{secs > 0 ? ` ${secs} seconds` : ""}[{r.startTime}-{r.endTime}]
+                    </p>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* delays — error codes straight in the dropdown, with descriptions */}
+            <div className="rounded-xl border border-amber-200/70 bg-amber-50/40 p-4">
+              <div className="mb-3 flex items-center gap-2">
+                <h3 className="text-xs font-semibold uppercase tracking-wider text-amber-800">Delays this slab</h3>
+                {delayRows.some((r) => r.delayCodeId) && <Badge tone="amber">{delayRows.filter((r) => r.delayCodeId).length} · {totalDelay} min</Badge>}
+              </div>
+
+              {/* Every delay on this slab, existing and new, fully editable —
+                  change the code, the machine(s), the times or the remark on any
+                  row, or remove it with ✕. Existing rows keep their DB id so a
+                  save corrects them in place (never a duplicate); a save persists
+                  the whole set, and a slab can be saved with no delays at all. */}
+              {delayRows.length > 0 && (
+                <div className="mb-3 space-y-2">
+                  {delayRows.map((row) => {
+                    const code = delayCodes.find((c) => c.id === row.delayCodeId) ?? null;
+                    const dur = calcDuration(row.startTime, row.endTime);
+                    const badTimes = Boolean(row.startTime && row.endTime && !dur);
+                    // One advance group per row: on a tablet, Enter/Next in a delay
+                    // field must step to the next box of THIS delay, not submit the
+                    // form (saving a half-entered slab) and not jump into the row below.
+                    const advance = advanceProps(`delay-${row.key}`);
+                    /* THREE ROWS AT EVERY SCREEN SIZE — the tablet and the phone are
+                       where this is used, so they get the same layout as a desk:
+                         1. Delay code, alone on its row — the code, its full
+                            description and its category are always readable
+                            ("C10 Bowl Dry Cleaning ROBOT"), never cut to
+                            "C10 B… ROBOT" by fields beside it;
+                         2. Start · End · Duration, three equal columns;
+                         3. Remarks, full width.
+                       A robot-specific code adds its Machine(s) picker between
+                       2 and 3. Remove sits on the code's label line, clear of
+                       all of them. Layout only: the fields, their order for
+                       the Next key, and everything they save are unchanged. */
+                    return (
+                      <div key={row.key} className="space-y-3 rounded-lg border border-amber-200 bg-white p-3 shadow-sm sm:p-4">
+                        <div>
+                          <div className="mb-1 flex items-center justify-between gap-2">
+                            <span className="text-xs font-medium text-gray-600">Delay code</span>
+                            {!rowIsBlank(row) && (
+                              <button type="button" onClick={() => removeDelayRow(row.key)} aria-label="Remove delay"
+                                className="shrink-0 rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-500 transition hover:border-red-300 hover:bg-red-50 hover:text-red-600">✕ Remove</button>
+                            )}
+                          </div>
+                          <DelayCodePicker value={row.delayCodeId} codes={delayCodes}
+                            onSelect={(id) => updateDelayRow(row.key, { delayCodeId: id })}
+                            onCreated={(c) => setDelayCodes((prev) => sortDelayCodes([...prev, c]))} />
+                        </div>
+                        <div className="grid grid-cols-3 gap-2 sm:gap-3">
+                          <div className="min-w-0">
+                            <span className={label}>Start</span>
+                            <TimeInput value={row.startTime} onChange={(v) => updateDelayRow(row.key, { startTime: v })} onComplete={advanceOnComplete} className={inpNarrow} {...advance} />
+                          </div>
+                          <div className="min-w-0">
+                            <span className={label}>End</span>
+                            <TimeInput value={row.endTime} onChange={(v) => updateDelayRow(row.key, { endTime: v })} onComplete={advanceOnComplete} className={inpNarrow} {...advance} />
+                          </div>
+                          <div className="min-w-0">
+                            <span className={label}>Duration</span>
+                            {/* The same height as the time boxes beside it, which
+                                grow to 44px on a touch screen (globals.css). */}
+                            <div className={`flex min-h-[38px] w-full items-center whitespace-nowrap rounded-lg border px-2.5 py-2 text-sm [@media_screen_and_(pointer:coarse)]:min-h-[44px] ${
+                              dur ? "border-green-200 bg-green-50 font-semibold text-green-800"
+                                : badTimes ? "border-red-200 bg-red-50 text-red-600"
+                                : "border-gray-200 bg-gray-50 text-gray-400"}`}>
+                              {dur ? fmtDuration(dur) : badTimes ? "Invalid" : "—"}
+                            </div>
+                          </div>
+                        </div>
+                        {code?.isRobotSpecific && (
+                          <div>
+                            <span className={label}>Machine(s)</span>
+                            <MachinePicker machines={machines} selected={row.machineNames}
+                              onToggle={(name) => updateDelayRow(row.key, { machineNames: toggleMachineName(row.machineNames, name) })} />
+                          </div>
+                        )}
+                        <div>
+                          <span className={label}>Remarks</span>
+                          <input value={row.remarks} onChange={(e) => updateDelayRow(row.key, { remarks: e.target.value })} placeholder="Optional" className={inp} {...advance} />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* No "+ Add": each delay is a row above, entered by filling it in.
+                  The blank row at the bottom is the next delay; typing into it
+                  makes a fresh blank appear, so many delays go in without a
+                  single button. Empty rows are dropped on save. */}
+            </div>
+
+            <div className="flex items-center justify-end gap-3">
+              {!editingId && !slab.outTime && slab.slabNumber && (
+                <span className="text-xs text-gray-400">No Out time — will save as In-Processing.</span>
+              )}
+              {isPageEdit && <Link href={`/robo/slabs/${recordId}`} className={btnGhost}>Cancel</Link>}
+              <button type="submit" disabled={slabSaving} className={btnPrimary}>
+                {slabSaving ? "Saving…" : editingId ? "Update slab" : "Save slab"}
+              </button>
+            </div>
+          </form>
+        )}
+      </Card>
+      )}
+
+      {/* ---- recently logged slabs ---- */}
+      {!isPageEdit && !isSetupEdit && records.length > 0 && (
+        <Card>
+          <h2 className="mb-3 text-xs font-semibold uppercase tracking-wider text-gray-400">Recent slabs · last {Math.min(records.length, 10)}</h2>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-gray-100 text-left text-xs uppercase tracking-wide text-gray-400">
+                  <th className="py-2 pr-4 font-medium">S.No.</th>
+                  <th className="py-2 pr-4 font-medium">Batch No.</th>
+                  <th className="py-2 pr-4 font-medium">Slab</th>
+                  <th className="py-2 pr-4 font-medium">Status</th>
+                  <th className="py-2 pr-4 font-medium">In → Out</th>
+                  <th className="py-2 pr-4 font-medium">Robo2 CT</th>
+                  <th className="py-2 pr-4 font-medium">Body wt</th>
+                  <th className="py-2 pr-4 font-medium">Remarks</th>
+                  <th className="py-2 font-medium"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {records.slice(0, 10).map((r) => (
+                  <tr key={r.id} className={`border-b border-gray-50 last:border-0 ${editingId === r.id ? "bg-amber-50/60" : ""}`}>
+                    <td className="py-2 pr-4 text-gray-400">{r.serialNumber ?? "—"}</td>
+                    {/* CR-003: the trial's batch, "--" when it has none. */}
+                    <td className="py-2 pr-4 whitespace-nowrap text-gray-600">{r.batchRecipe?.batchNo?.trim() || NO_BATCH}</td>
+                    <td className="py-2 pr-4 font-medium text-gray-900">{r.slabNumber}</td>
+                    <td className="py-2 pr-4">
+                      <span className={`rounded px-1.5 py-0.5 text-xs ${slabStatusClass(r.status)}`}>{slabStatusLabel(r.status)}</span>
+                      {r.status === SLAB_IN_PROCESSING && editingId !== r.id && (
+                        <button type="button" onClick={() => editRecordFromTable(r)}
+                          className="ml-2 text-xs font-medium text-brand hover:underline">finish →</button>
+                      )}
+                    </td>
+                    <td className="py-2 pr-4 text-gray-600">{r.inTime || "—"}{" → "}{r.outTime || "—"}</td>
+                    <td className="py-2 pr-4 text-gray-600">{r.roymixCycleTime ? `${r.roymixCycleTime}s` : "—"}</td>
+                    <td className="py-2 pr-4 text-gray-600">{r.roymixBodyWeight ? `${r.roymixBodyWeight} kg` : "—"}</td>
+                    {/* The same text Slabs Records shows: the slab's own
+                        remark AND its delays, through one formatter. This
+                        column used to print r.remarks alone, so a note typed
+                        into the delay panel — which is where most of them go —
+                        appeared on Slabs Records and left this cell blank, on
+                        the very screen the operator had just typed it. */}
+                    <td className="py-2 pr-4 text-gray-500">{slabRemarkText(r)}</td>
+                    <td className="py-2 text-right">
+                      <div className="flex items-center justify-end gap-2 whitespace-nowrap">
+                        {editingId !== r.id && (
+                          <button type="button" onClick={() => editRecordFromTable(r)}
+                            className="rounded-lg border border-gray-300 px-2.5 py-1 text-xs font-medium text-gray-700 transition hover:bg-gray-50">Edit</button>
+                        )}
+                        {canDelete && (
+                          <button type="button" onClick={() => removeSlab(r)} disabled={deletingId === r.id}
+                            className="rounded-lg border border-red-200 bg-red-50 px-2.5 py-1 text-xs font-medium text-red-600 transition hover:border-red-600 hover:bg-red-600 hover:text-white disabled:opacity-50">
+                            {deletingId === r.id ? "Deleting…" : "Delete"}
+                          </button>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      )}
+    </div>
+  );
+}

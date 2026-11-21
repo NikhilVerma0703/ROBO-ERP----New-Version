@@ -1,0 +1,913 @@
+/**
+ * The Attendance API — ONE implementation, mounted twice.
+ *
+ * ── WHY ONE FILE AND NOT TWO SETS OF ROUTES ───────────────────────────────
+ * Robo and Chromia must always show the same register, so there is one set of
+ * tables and one set of handlers. What differs between the two ERPs is only
+ * which gate lets you in: /api/robo/attendance/… is behind roboGate and the
+ * middleware's /api/robo rule, /api/chromia/attendance/… behind chromiaGate
+ * and the /api/chromia rule. Each module's route file is five lines — its own
+ * gate, then this.
+ *
+ * It is NOT mounted at a new /api/attendance prefix, which would be the
+ * obvious thing and is wrong twice over: middleware has no rule for it, so
+ * every other department's login would reach it, while the ROBO and CHROMIA
+ * role caps (which allow only their own module's paths) would lock out the two
+ * logins that actually need it.
+ *
+ * Twenty near-identical route files — ten endpoints in two modules — would be
+ * the alternative, and Nav.tsx already records what happens to hand-kept
+ * copies: they drift the first time one of them is edited. So the dispatch is
+ * by path here, once.
+ *
+ * ── "VIEW AS" STAYS READ-ONLY ─────────────────────────────────────────────
+ * Every request that is not a GET runs inside unlessViewing()
+ * (lib/viewAsServer.ts), the way Lab's and Accounts' writes do: while an admin
+ * views the ERP as a Robo or Chromia login, nothing is written and the screen
+ * is told why in words. The Prisma write guard (lib/prisma.ts) would refuse
+ * the write anyway, but as a thrown error the register could only report as
+ * "That did not save". tests/viewAsSource.test.ts lists this file among the
+ * callers.
+ *
+ * ── EVERY WRITE LEAVES A TRAIL ────────────────────────────────────────────
+ * The register is written from two shared tablet logins (ROBO, CHROMIA)
+ * through either door, so "who changed this, and what did it say before?"
+ * has to be answerable from the record — the tables carry no actor column.
+ * Every write and its action_log row are one transaction (logActionTx, as the
+ * Robo slab delete writes its own): if the trail cannot be written, neither is
+ * the change. The row names the login, says in words what changed, and keeps
+ * what was there before — for a removal, the whole row — so a mistake can be
+ * put back by hand. Kind "edit", never "delete": the global Undo
+ * (app/batch/undo.ts, undoLastAction with no batch) reverses the last "delete"
+ * anywhere in the ERP, and must not restore a leave record someone removed on
+ * purpose (lib/actionLogKinds NOT_UNDOABLE; the commercial alias delete logs
+ * the same way). All of it runs inside unlessViewing, so a view writes no
+ * trail either.
+ */
+
+import * as XLSX from "xlsx-js-style";
+import type { Prisma } from "@prisma/client";
+import { prisma } from "@/lib/prisma";
+import { logActionTx } from "@/lib/actionLog";
+import { currentUser } from "@/lib/rbac";
+import {
+  ALREADY_SAVED, NOT_YOURS, ONLY_TODAY, plantRightsOfUser, type PlantRights,
+} from "@/lib/plantAccess";
+import { unlessViewing, viewAsBlocked } from "@/lib/viewAsServer";
+import { styleRoboSheet } from "@/lib/robo/exportStyle";
+import { toPlantDateInput, toPlantTimeInput } from "@/lib/chromia/plant-time";
+import { isValidTime } from "@/lib/robo/time";
+import { INVALID_TIME, inTimeErrorOn, inTimeUnchanged, outTimeToStoreOn } from "./clock.ts";
+import {
+  INCOMPLETE_PREVIOUS_DAY,
+  amendsSavedRow,
+  anotherShiftError,
+  canStartAnotherShift,
+  cleanOperatorName,
+  nightShiftStillOpen,
+  previousDayState,
+  shiftLengthError,
+  shiftOverlapError,
+  type PreviousDayState,
+  closesOpenRow,
+  dayKind,
+  joinLines,
+  laterThanNowError,
+  leaveLabel,
+  leaveTypeError,
+  leaveTypeLabel,
+  linesLabel,
+  operatorNameError,
+  outDate,
+  outDaysOf,
+  parseLeaveType,
+  previousDay,
+  SUM_OF_HOURS_LABEL,
+  minutesLabel,
+  sumWorkedMinutes,
+  workedLabel,
+} from "./attendance.ts";
+import {
+  ATTENDANCE_COLUMNS,
+  LEAVE_COLUMNS,
+  PERIOD_MODES,
+  RECORD_TYPES,
+  columnsFor,
+  describeFilter,
+  filterFileName,
+  periodBounds,
+  widthsFor,
+  type AttendanceFilter,
+  type PeriodMode,
+  type RecordType,
+} from "./filters.ts";
+
+/** Today, on the plant's clock rather than the server's — the host runs in UTC
+ *  and "last week" must not start a day early for a night shift. */
+const todayPlant = () => toPlantDateInput(new Date());
+
+const json = (body: unknown, status = 200) =>
+  Response.json(body, { status, headers: { "Cache-Control": "no-store" } });
+const bad = (message: string, status = 400) => json({ error: message }, status);
+
+const isDate = (v: unknown): v is string => /^\d{4}-\d{2}-\d{2}$/.test(String(v ?? ""));
+
+/** A typed time as it is stored: "HH:MM", or null for an empty box. Anything
+ *  that is not a time is refused rather than stored as text nobody can total. */
+function timeOrNull(v: unknown): string | null | undefined {
+  const s = String(v ?? "").trim();
+  if (!s) return null;
+  return isValidTime(s) ? s : undefined; // undefined = invalid, the caller refuses
+}
+
+/* ── Operators ─────────────────────────────────────────────────────── */
+
+async function listOperators() {
+  /* THE ROSTER'S OWN ORDER, which is the owner's list in the owner's order —
+     the order the line is called in. It is NOT alphabetical and must not be
+     re-sorted into it: "Jagadeesh, Rajesh, Saravanan .L, Kiran…" is how the
+     register reads on paper, and a screen that answers with "Aaquib, Jagadeesh,
+     Kiran…" is a different document. `id` only breaks a tie between two rows
+     left on the same number, so the list can never come back shuffled. */
+  return prisma.attendanceOperator.findMany({
+    select: { id: true, name: true, isActive: true, sortOrder: true },
+    orderBy: [{ sortOrder: "asc" }, { id: "asc" }],
+  });
+}
+
+/** Where a newly added operator goes: the end. Adding one never moves anybody
+ *  already on the list. */
+async function nextSortOrder(tx: Tx): Promise<number> {
+  const last = await tx.attendanceOperator.findFirst({
+    orderBy: { sortOrder: "desc" },
+    select: { sortOrder: true },
+  });
+  return (last?.sortOrder ?? 0) + 1;
+}
+
+/* ── The day's register ────────────────────────────────────────────── */
+
+/** A shift row as the register screen and its rules read it. */
+interface StoredShift { shiftNo: number; lines: string; inTime: string | null; outTime: string | null; outDate: string | null }
+
+/**
+ * Every active operator for a date, each with their shifts on it — one line per
+ * SHIFT (7 Nov 2026), in shift order. The register is the roster, not the
+ * rows: an operator with nothing entered yet still has a line to fill in,
+ * which is the whole point of a register.
+ */
+async function dayRegister(date: string) {
+  const prev = previousDay(date);
+  const [operators, days, previous] = await Promise.all([
+    listOperators(),
+    prisma.attendanceDay.findMany({ where: { date }, orderBy: { shiftNo: "asc" } }),
+    previousDayStates(date),
+  ]);
+  const byOperator = new Map<string, typeof days>();
+  for (const d of days) byOperator.set(d.operatorId, [...(byOperator.get(d.operatorId) ?? []), d]);
+  return operators
+    .filter((o) => o.isActive || byOperator.has(o.id))
+    .flatMap((o) => {
+      const shifts = byOperator.get(o.id) ?? [];
+      const state = previous.get(o.id) ?? { kind: "clear" as const };
+      /** The previous day is genuinely unfinished for this operator, so
+       *  nothing new may be entered for them until it is. */
+      const blocked = state.kind === "incomplete";
+      /** Last night's shift, still awaiting its Out-Time: not unfinished —
+       *  it is closed from this register (7 Nov 2026). */
+      const overnight = state.kind === "overnight"
+        ? { date: prev, shiftNo: state.row.shiftNo, lines: state.row.lines, inTime: state.row.inTime ?? "" }
+        : null;
+      const anotherShift = canStartAnotherShift(shifts, date);
+      const line = (d: (typeof days)[number] | undefined, shiftNo: number, last: boolean) => ({
+        operatorId: o.id,
+        operatorName: o.name,
+        isActive: o.isActive,
+        /** Which shift of the date this line is — 1 for the first. */
+        shiftNo,
+        lines: d?.lines ?? "",
+        linesLabel: linesLabel(d?.lines),
+        inTime: d?.inTime ?? "",
+        outTime: d?.outTime ?? "",
+        /* A shift that went in at 22:00 and came out at 06:00 is ONE row, on
+           the day it started; the Out is the next date and the screen says so
+           rather than printing a 06:00 that reads as eight hours earlier. */
+        outDate: outDate(date, d?.inTime, d?.outTime, d?.outDate),
+        worked: workedLabel(d?.inTime, d?.outTime, outDaysOf(date, d?.outDate)),
+        saved: Boolean(d),
+        blocked,
+        blockedDate: blocked ? prev : "",
+        /** That unfinished row. Null when nothing is held. */
+        blockedRow: state.kind === "incomplete"
+          ? { lines: state.row.lines, inTime: state.row.inTime ?? "", outTime: state.row.outTime ?? "" }
+          : null,
+        overnight,
+        /** On the operator's last shift of the date: it is finished, so the
+         *  operator may be entered again for another shift. */
+        canAddShift: last && anotherShift && !blocked && !overnight,
+      });
+      if (shifts.length === 0) return [line(undefined, 1, true)];
+      return shifts.map((d, i) => line(d, d.shiftNo, i === shifts.length - 1));
+    });
+}
+
+/**
+ * What each operator's PREVIOUS date leaves for this one (previousDayState):
+ * clear, a night shift still awaiting its Out-Time, or genuinely unfinished —
+ * the ones held until it is put right. One pass for the whole register rather
+ * than a query per operator. An operator with no row that day, or on recorded
+ * leave, is not held (see previousDayIncomplete).
+ *
+ * Whether last night's open shift can still be running is read on the plant's
+ * clock, and only when `date` is the plant's today.
+ */
+async function previousDayStates(date: string): Promise<Map<string, PreviousDayState<StoredShift>>> {
+  const states = new Map<string, PreviousDayState<StoredShift>>();
+  const prev = previousDay(date);
+  if (!prev) return states;
+  const at = { isToday: dayKind(date, todayPlant()) === "today", now: toPlantTimeInput(new Date()) };
+  const [rows, leaves] = await Promise.all([
+    prisma.attendanceDay.findMany({
+      where: { date: prev },
+      select: { operatorId: true, shiftNo: true, lines: true, inTime: true, outTime: true, outDate: true },
+    }),
+    prisma.attendanceLeave.findMany({ where: { date: prev }, select: { operatorId: true } }),
+  ]);
+  const onLeave = new Set(leaves.map((l) => l.operatorId));
+  const byOperator = new Map<string, StoredShift[]>();
+  for (const { operatorId, ...row } of rows) byOperator.set(operatorId, [...(byOperator.get(operatorId) ?? []), row]);
+  for (const [operatorId, shifts] of byOperator) {
+    const state = previousDayState(shifts, onLeave.has(operatorId), at);
+    if (state.kind !== "clear") states.set(operatorId, state);
+  }
+  return states;
+}
+
+/* ── Leave ─────────────────────────────────────────────────────────── */
+
+async function listLeave() {
+  const rows = await prisma.attendanceLeave.findMany({
+    orderBy: [{ date: "desc" }, { createdAt: "asc" }],
+    take: 500,
+    include: { operator: { select: { name: true } } },
+  });
+  /* S.No. is the row's 1..N position within its own date, computed here and
+     never stored — the same rule Slab Records follows, and for the same
+     reason: a typed serial on a register gets mistyped and then two rows
+     claim the same number. */
+  const seenPerDate = new Map<string, number>();
+  const dated = [...rows].sort((a, b) => a.date.localeCompare(b.date) || a.createdAt.getTime() - b.createdAt.getTime());
+  const serials = new Map<string, number>();
+  for (const r of dated) {
+    const n = (seenPerDate.get(r.date) ?? 0) + 1;
+    seenPerDate.set(r.date, n);
+    serials.set(r.id, n);
+  }
+  return rows.map((r) => ({
+    id: r.id,
+    date: r.date,
+    serial: serials.get(r.id) ?? 1,
+    operatorId: r.operatorId,
+    operatorName: r.operator?.name ?? "",
+    /* The code is what the screen colours by and what an edit sends back; the
+       label is what it prints. Both, so neither end has to know the other's
+       vocabulary. */
+    leaveType: parseLeaveType(r.leaveType) ?? "",
+    leaveTypeLabel: leaveTypeLabel(r.leaveType),
+    fromTime: r.fromTime ?? "",
+    toTime: r.toTime ?? "",
+    leaveTime: leaveLabel(r.fromTime, r.toTime),
+    reason: r.reason ?? "",
+    remarks: r.remarks ?? "",
+  }));
+}
+
+/* ── Downloads ─────────────────────────────────────────────────────── */
+
+function readFilter(p: URLSearchParams): AttendanceFilter {
+  const type = (RECORD_TYPES as readonly string[]).includes(String(p.get("type")))
+    ? (p.get("type") as RecordType)
+    : "ATTENDANCE";
+  const period = (PERIOD_MODES as readonly string[]).includes(String(p.get("period")))
+    ? (p.get("period") as PeriodMode)
+    : "ALL";
+  return {
+    type,
+    period,
+    operatorId: p.get("operatorId") ?? "",
+    date: p.get("date") ?? undefined,
+    from: p.get("from") ?? undefined,
+    to: p.get("to") ?? undefined,
+    month: p.get("month") ?? undefined,
+  };
+}
+
+/** The where-clause a filter means. The period is turned into bounds once, by
+ *  periodBounds, so the page's table and the spreadsheet cannot disagree. */
+function filterWhere(f: AttendanceFilter, today: string) {
+  const { from, to } = periodBounds(f, today);
+  const where: { operatorId?: string; date?: { gte?: string; lte?: string } } = {};
+  if (f.operatorId) where.operatorId = f.operatorId;
+  if (from !== null || to !== null) {
+    where.date = {};
+    if (from !== null) where.date.gte = from;
+    if (to !== null) where.date.lte = to;
+  }
+  return where;
+}
+
+/** The rows a filter selects, already shaped as the table and the sheet show
+ *  them — ONE function behind both, so the download is the table you looked at. */
+async function filteredRows(f: AttendanceFilter, today: string) {
+  const where = filterWhere(f, today);
+  if (f.type === "LEAVE") {
+    const rows = await prisma.attendanceLeave.findMany({
+      where,
+      orderBy: [{ date: "asc" }, { createdAt: "asc" }],
+      include: { operator: { select: { name: true } } },
+    });
+    const perDate = new Map<string, number>();
+    return rows.map((r) => {
+      const n = (perDate.get(r.date) ?? 0) + 1;
+      perDate.set(r.date, n);
+      return {
+        "Date": r.date,
+        "S.No.": n,
+        "Operator Name": r.operator?.name ?? "",
+        "Leave Type": leaveTypeLabel(r.leaveType),
+        "Leave Time": leaveLabel(r.fromTime, r.toTime),
+        "Leave Reason": r.reason ?? "",
+        "Remarks": r.remarks ?? "",
+      } as Record<string, string | number>;
+    });
+  }
+  /* Date first, then the roster's own order within the date — so a day in the
+     sheet reads down the page exactly as the register does on screen. */
+  const rows = await prisma.attendanceDay.findMany({
+    where,
+    orderBy: [{ date: "asc" }, { operator: { sortOrder: "asc" } }, { operatorId: "asc" }, { shiftNo: "asc" }],
+    include: { operator: { select: { name: true } } },
+  });
+  return rows
+    .map((r) => ({
+      "Date": r.date,
+      "Operator Name": r.operator?.name ?? "",
+      "Line": linesLabel(r.lines),
+      "In-Time": r.inTime ?? "-",
+      "Out-Time": outTimeCell(r),
+      "Total Working Hours": workedLabel(r.inTime, r.outTime, outDaysOf(r.date, r.outDate)),
+    }) as Record<string, string | number>);
+}
+
+/**
+ * The Out-Time as Downloads prints it. Exactly as before for a shift whose Out
+ * the times already place (the same date, or the next morning); with its
+ * date beside it when they cannot (17 Nov 2026) — a shift of a day or more,
+ * "19:00 (19/11/2026)", so the sheet does not read as eleven hours.
+ */
+function outTimeCell(r: { date: string; inTime: string | null; outTime: string | null; outDate: string | null }): string {
+  if (!r.outTime) return "-";
+  const ended = outDate(r.date, r.inTime, r.outTime, r.outDate);
+  if (ended === outDate(r.date, r.inTime, r.outTime)) return r.outTime;
+  return `${r.outTime} (${ended.replace(/^(\d{4})-(\d{2})-(\d{2})$/, "$3/$2/$1")})`;
+}
+
+/**
+ * Sum of Total Working Hours (7 Nov 2026, change 7) — for the Attendance
+ * records of ONE operator, over every record the date filters select: the
+ * same rows filteredRows shows and the sheet carries, their minutes added
+ * (sumWorkedMinutes). Null when the filter is not one operator's attendance,
+ * where no sum is shown.
+ */
+async function sumOfHours(f: AttendanceFilter, today: string): Promise<string | null> {
+  if (f.type !== "ATTENDANCE" || !f.operatorId) return null;
+  const rows = await prisma.attendanceDay.findMany({ where: filterWhere(f, today), select: { date: true, inTime: true, outTime: true, outDate: true } });
+  return minutesLabel(sumWorkedMinutes(rows));
+}
+
+async function operatorNameOf(id: string): Promise<string> {
+  if (!id) return "";
+  const row = await prisma.attendanceOperator.findUnique({ where: { id }, select: { name: true } });
+  return row?.name ?? "";
+}
+
+/* ── The trail ─────────────────────────────────────────────────────── */
+
+type Tx = Prisma.TransactionClient;
+type Model = "AttendanceOperator" | "AttendanceDay" | "AttendanceLeave";
+
+/** The action_log row for one attendance write, in the write's own
+ *  transaction (see EVERY WRITE LEAVES A TRAIL above). `payload` carries the
+ *  row before and after; `action` names the write for anyone filtering the
+ *  log. */
+function trail(tx: Tx, model: Model, summary: string, payload: { action: string } & Record<string, unknown>) {
+  return logActionTx(tx, { kind: "edit", model, summary, payload });
+}
+
+/** A yyyy-mm-dd as the summary reads it, dd/mm/yyyy (the screen's dmy). */
+const onDay = (d: string) => d.replace(/^(\d{4})-(\d{2})-(\d{2})$/, "$3/$2/$1");
+/** A day's row in words: "Robo + Chromia, In 06:00, Out 14:00" — and the
+ *  Out's date when it is not the row's own ("Out 06:12 on 18/11/2026"), so a
+ *  change of the Out date alone reads as a change in the log (review, 17 Nov
+ *  2026). */
+const dayWords = (d: { lines: string; inTime: string | null; outTime: string | null; outDate?: string | null }, date: string) =>
+  `${linesLabel(d.lines)}, In ${d.inTime || "-"}, Out ${d.outTime || "-"}${d.outTime && d.outDate && d.outDate !== date ? ` on ${onDay(d.outDate)}` : ""}`;
+
+/* ── The one handler ───────────────────────────────────────────────── */
+
+/** The sentence when a view skipped the write and the view itself could not
+ *  be named (it always can, inside a request — this is the fallback). */
+const VIEWING = "This is a read-only view of another login — nothing was saved.";
+
+/**
+ * Dispatch on the path AFTER ".../attendance". Both module routes hand their
+ * own segments in, so the same request reaches the same code whichever ERP
+ * asked. A read goes straight through; anything else is skipped during an
+ * admin's "View as" and answered with the read-only sentence (403).
+ */
+export async function attendanceApi(req: Request, segments: string[]): Promise<Response> {
+  const method = req.method.toUpperCase();
+  /* WHO IS ASKING, decided HERE and not in the two route files.
+     The register is one implementation behind two doors, and the owner asked
+     for "the same permissions consistently in both ERPs" — so the permissions
+     are read in the shared half, where there is no second copy to drift. The
+     module gates upstream (roboGate, chromiaGate) have already settled whether
+     this login belongs in the building; this settles what it may do inside.
+     A request with no session at all reads as the narrowest tier, not the
+     widest: see plantRightsOf. */
+  const rights = plantRightsOfUser(await currentUser());
+  if (method === "GET") return route(req, segments, method, rights);
+  // Boxed, so a handler's answer is never mistaken for the skipped write.
+  const done = await unlessViewing(async () => ({ res: await route(req, segments, method, rights) }));
+  return done ? done.res : bad((await viewAsBlocked()) ?? VIEWING, 403);
+}
+
+/**
+ * What this tier is refused at this endpoint, by its path alone, or null.
+ *
+ * The three cards an operator never sees. Kept as one table rather than a
+ * check inside each handler, so the list is readable next to the hidden cards
+ * in AttendanceClient and the paths in routeCaps.plantOperatorRefused — the
+ * three layers the owner asked for, each of which must be able to be read
+ * against the other two.
+ *
+ * The day's register is NOT here: it is the one endpoint where both tiers have
+ * business, and what separates them is the date and what is already written,
+ * which only the handler knows. Nor is the roster's GET: the tablet has to
+ * read the list of operators to draw the register it IS allowed to write.
+ */
+function refusedHere(rights: PlantRights, head: string, method: string): string | null {
+  if (head === "leave" && !rights.leave) return NOT_YOURS;
+  if ((head === "records" || head === "export") && !rights.downloads) return NOT_YOURS;
+  if (head === "operators" && method !== "GET" && !rights.roster) return NOT_YOURS;
+  return null;
+}
+
+async function route(req: Request, segments: string[], method: string, rights: PlantRights): Promise<Response> {
+  const url = new URL(req.url);
+  const p = url.searchParams;
+  const [head, id] = segments;
+  /* Refused before the body is read, let alone acted on. 403, not 404: the
+     endpoint is there and the answer is no, which is what the screen says
+     too — one wording for both, from lib/plantAccess.ts. */
+  const refused = refusedHere(rights, String(head ?? ""), method);
+  if (refused) return bad(refused, 403);
+  const body = method === "GET" || method === "DELETE" ? {} : await req.json().catch(() => ({}));
+
+  /* operators */
+  if (head === "operators" && !id) {
+    if (method === "GET") return json(await listOperators());
+    if (method === "POST") {
+      const name = cleanOperatorName((body as { name?: unknown }).name);
+      const err = operatorNameError(name);
+      if (err) return bad(err);
+      const clash = await prisma.attendanceOperator.findUnique({ where: { name }, select: { id: true } });
+      if (clash) return bad(`${name} is already on the list.`, 409);
+      const row = await prisma.$transaction(async (tx) => {
+        const made = await tx.attendanceOperator.create({
+          data: { name, sortOrder: await nextSortOrder(tx) },
+          select: { id: true, name: true, isActive: true, sortOrder: true },
+        });
+        await trail(tx, "AttendanceOperator", `Attendance: operator ${name} added`,
+          { action: "attendance.operator.add", after: made });
+        return made;
+      });
+      return json(row, 201);
+    }
+  }
+
+  if (head === "operators" && id) {
+    if (method === "PATCH") {
+      const data: { name?: string; isActive?: boolean } = {};
+      if ((body as { name?: unknown }).name !== undefined) {
+        const name = cleanOperatorName((body as { name?: unknown }).name);
+        const err = operatorNameError(name);
+        if (err) return bad(err);
+        const clash = await prisma.attendanceOperator.findFirst({ where: { name, NOT: { id } }, select: { id: true } });
+        if (clash) return bad(`${name} is already on the list.`, 409);
+        data.name = name;
+      }
+      if (typeof (body as { isActive?: unknown }).isActive === "boolean") data.isActive = (body as { isActive: boolean }).isActive;
+      if (Object.keys(data).length === 0) return bad("Nothing to change.");
+      const row = await prisma.$transaction(async (tx) => {
+        const before = await tx.attendanceOperator.findUnique({ where: { id }, select: { id: true, name: true, isActive: true } });
+        if (!before) return null;
+        const after = await tx.attendanceOperator.update({ where: { id }, data, select: { id: true, name: true, isActive: true } });
+        const said = [
+          before.name !== after.name ? `renamed ${before.name} → ${after.name}` : "",
+          before.isActive !== after.isActive ? `${after.name} ${after.isActive ? "back on" : "taken off"} the roster` : "",
+        ].filter(Boolean).join("; ");
+        await trail(tx, "AttendanceOperator", `Attendance: ${said || `operator ${after.name} saved unchanged`}`,
+          { action: "attendance.operator.edit", before, after });
+        return after;
+      });
+      if (!row) return bad("That operator is not on the list any more. Reload the page.", 404);
+      return json(row);
+    }
+    if (method === "DELETE") {
+      /* An operator who has ever been marked present is part of the record, so
+         deleting them would take their attendance with them. They are switched
+         off instead and keep their history; one who has never been used is
+         simply removed. The caller is told which happened, and the trail keeps
+         the row either way. */
+      const out = await prisma.$transaction(async (tx) => {
+        const before = await tx.attendanceOperator.findUnique({ where: { id } });
+        if (!before) return null;
+        // One after the other: a transaction's queries share one connection.
+        const days = await tx.attendanceDay.count({ where: { operatorId: id } });
+        const leaves = await tx.attendanceLeave.count({ where: { operatorId: id } });
+        if (days + leaves > 0) {
+          const row = await tx.attendanceOperator.update({ where: { id }, data: { isActive: false }, select: { name: true } });
+          await trail(tx, "AttendanceOperator", `Attendance: ${row.name} taken off the roster (${days + leaves} record(s) on file, so not deleted)`,
+            { action: "attendance.operator.deactivate", before, after: { ...before, isActive: false }, records: days + leaves });
+          return { deactivated: true, name: row.name, records: days + leaves };
+        }
+        await tx.attendanceOperator.delete({ where: { id } });
+        await trail(tx, "AttendanceOperator", `Attendance: operator ${before.name} removed (no attendance or leave on file)`,
+          { action: "attendance.operator.delete", before });
+        return { deleted: true };
+      });
+      if (!out) return bad("That operator is not on the list any more. Reload the page.", 404);
+      return json(out);
+    }
+  }
+
+  /* the day's register */
+  if (head === "day") {
+    if (method === "GET") {
+      const date = isDate(p.get("date")) ? (p.get("date") as string) : todayPlant();
+      /* The tablet reads today and no other day. Refused rather than quietly
+         answered with today's rows under yesterday's date: a screen told
+         "here is 25/10" while holding 26/10's register is worse than a
+         refusal, and a manual request deserves the true answer. */
+      if (!rights.anyDate && date !== todayPlant()) return bad(ONLY_TODAY, 403);
+      return json({ date, rows: await dayRegister(date) });
+    }
+    if (method === "PUT") {
+      const b = body as { date?: unknown; operatorId?: unknown; shiftNo?: unknown; lines?: unknown; inTime?: unknown; outTime?: unknown; outDate?: unknown };
+      if (!isDate(b.date)) return bad("Pick a date.");
+      const operatorId = String(b.operatorId ?? "");
+      if (!operatorId) return bad("Pick an operator.");
+      /* Which shift of the date (7 Nov 2026). Left out, it is the first —
+         every save written before shifts were numbered meant that one. */
+      const shiftNo = b.shiftNo === undefined || b.shiftNo === null || b.shiftNo === "" ? 1 : Number(b.shiftNo);
+      if (!Number.isInteger(shiftNo) || shiftNo < 1 || shiftNo > 9) return bad("Pick a shift.");
+      const inTime = timeOrNull(b.inTime);
+      if (inTime === undefined) return bad("In-Time is not a valid time.");
+      const lines = joinLines(Array.isArray(b.lines) ? b.lines.map(String) : String(b.lines ?? "").split(","));
+      const date = b.date;
+
+      /* THE CLOCK IS THE SERVER'S, not the browser's.
+         The page checks the same two rules so the operator is told at once, but
+         a page can be edited and a request can be made without one, so what is
+         stored is decided here against this machine's own reading of the plant
+         clock. See lib/attendance/clock.ts. */
+      const nowPlant = toPlantTimeInput(new Date());
+      const today = todayPlant();
+      const existing = await prisma.attendanceDay.findUnique({
+        where: { date_operatorId_shiftNo: { date, operatorId, shiftNo } },
+        select: { lines: true, inTime: true, outTime: true, outDate: true },
+      });
+      /* The operator's other shifts on this date, and the previous date's —
+         what a new shift has to follow, and what no shift may overlap. */
+      const [dayShifts, previousShifts] = await Promise.all([
+        prisma.attendanceDay.findMany({ where: { date, operatorId }, select: { shiftNo: true, lines: true, inTime: true, outTime: true, outDate: true } }),
+        prisma.attendanceDay.findMany({ where: { date: previousDay(date), operatorId }, select: { shiftNo: true, lines: true, inTime: true, outTime: true, outDate: true } }),
+      ]);
+      const otherShifts = dayShifts.filter((s) => s.shiftNo !== shiftNo);
+      /* LAST NIGHT'S OUT-TIME. The night shift marks in at 22:00 and out at
+         06:00, and its row is dated the day it started — so at 06:00 the
+         tablet's today is the next date. The tablet may put the Out-Time on
+         the PREVIOUS day's open row (In-Time, no Out-Time) and do nothing
+         else on that day (code review, 26 Oct 2026): same Lines, same
+         In-Time, and the Out stamped from this machine's clock below. */
+      const closesLastNight = !rights.anyDate && date === previousDay(today)
+        && closesOpenRow(existing, { lines, inTime: b.inTime, outTime: b.outTime });
+      /* THE TABLET WRITES TODAY. Owner, 26 Oct 2026: operators may enter
+         their In and Out "for the current date", and may not "select
+         previous dates or future dates", "edit previous attendance records",
+         "enter missed attendance for previous dates", or "bypass incomplete
+         previous-day attendance restrictions". All four are this one line:
+         with no other date reachable there is no previous record to edit, no
+         missed day to fill in, and no way round the hold — which clears when
+         the night shift is marked out (above) or when the Plant In-Charge
+         finishes the day that is holding it, the login that exists to do
+         exactly that.
+
+         Checked against THE SERVER'S reading of the plant date, not the
+         browser's, for the reason the clock rules are: a page can be edited
+         and a request can be made without one. */
+      if (!closesLastNight && !rights.anyDate && date !== today) return bad(ONLY_TODAY, 403);
+      /* However long last night's shift has run, it is still that shift (owner,
+         17 Nov 2026: any In-Time, and no longest shift): its Out is stamped
+         below, dated today. */
+      const kind = dayKind(date, today);
+      // A day that has not happened cannot be attended. This is the only case
+      // the past-day correction path below would otherwise let through.
+      if (kind === "future") return bad(`${INVALID_TIME} That date has not happened yet.`);
+      const isToday = kind === "today";
+      /* THE CLOCK RULES ARE THE TABLET'S: marking attendance as it happens.
+         The Plant In-Charge types both times on today's row as on a past day
+         — the 06:00 In nobody tapped, the 14:00 Out somebody forgot — and is
+         refused only a time that has not happened yet (laterThanNowError). */
+      const clockRules = isToday && !rights.amendSaved;
+      const correctsToday = isToday && rights.amendSaved;
+
+      // Rule 1 — only when the In-Time is being ENTERED or changed. Carrying an
+      // old one back (saving the row to correct its Line) must not be refused.
+      /* YESTERDAY FIRST. A new entry is refused while the operator's previous
+         day is unfinished — started and never finished (previousDayIncomplete).
+         Checked here and not only on the page, because the page is not what
+         decides; and only for a NEW entry, so the row being complained about
+         can still be put right. */
+      if (!existing) {
+        /* A night shift from the day before that is still awaiting its Out
+           is not unfinished (7 Nov 2026) — but the operator is still on it,
+           so a new shift waits until it is marked out. */
+        const before = (await previousDayStates(date)).get(operatorId);
+        if (before?.kind === "incomplete") return bad(INCOMPLETE_PREVIOUS_DAY);
+        if (before?.kind === "overnight") return bad(nightShiftStillOpen(previousDay(date)));
+        /* ANOTHER SHIFT ON THE SAME DATE (7 Nov 2026): the next number only,
+           and only once the shift before it is finished and ended on this
+           date. A shift still open is genuinely incomplete and keeps holding. */
+        const expected = dayShifts.length === 0 ? 1 : Math.max(...dayShifts.map((s) => s.shiftNo)) + 1;
+        if (shiftNo !== expected) {
+          return bad(dayShifts.length === 0 ? "Enter the first shift of this date." : `The next shift of this date is shift ${expected}. Reload the page.`, 409);
+        }
+        const notYet = anotherShiftError(date, dayShifts);
+        if (notYet) return bad(notYet);
+      }
+
+      const inTimeChanged = !inTimeUnchanged(b.inTime as string, existing?.inTime);
+      if (inTimeChanged) {
+        const refused = inTime === null ? null
+          : inTimeErrorOn(clockRules, inTime, nowPlant) ?? (correctsToday ? laterThanNowError(inTime, nowPlant) : null);
+        if (refused) return bad(refused);
+      }
+      // Rule 2 — the Out-Time is stamped, never taken, when the tablet writes
+      // it: on today's row, and on last night's. Whatever arrived is discarded
+      // unless it is the one already stored. Typed by the Plant In-Charge, and
+      // on a past day, because no reading of the clock would be right for a
+      // day that has already ended.
+      const stamped = clockRules || closesLastNight;
+      const outTime = outTimeToStoreOn(stamped, b.outTime as string, existing?.outTime, nowPlant);
+      const outChanged = outTime !== (existing?.outTime ?? null);
+      /* THE DATE THE OUT FELL ON (17 Nov 2026). A shift may run on for a day
+         or more, which the two times cannot say, so it is recorded with the
+         Out: a stamped Out is today's; a typed one is the date sent with it
+         (the Plant In-Charge's Out date), or else read from the times as
+         before — the same date, or the next when the Out is before the In. */
+      const sentOutDate = isDate(b.outDate) ? (b.outDate as string) : null;
+      /* The Out date box sent EMPTY while a date is recorded: the Plant
+         In-Charge cleared it, so it is read from the times again — what the
+         page already shows (review, 17 Nov 2026). The box is empty too when
+         the recorded date is the one the times give; reading it again then
+         gives the same date and changes nothing. */
+      const outDateCleared = b.outDate === "" && Boolean(existing?.outDate);
+      const outDay = !outTime ? null
+        : stamped ? (outChanged ? today : (existing?.outDate ?? null))
+        : sentOutDate ?? (outChanged || inTimeChanged || outDateCleared ? outDate(date, inTime, outTime) : (existing?.outDate ?? null));
+      const outDayChanged = outDay !== (existing?.outDate ?? null);
+      /* A TYPED Out is never later than the moment it was recorded (clock.ts):
+         not before the shift's own date, not on a date still to come, and on
+         today not past now. Judged against the In it will be stored WITH,
+         whichever changed — moving the In past an Out already there makes
+         that Out the next date's. */
+      if (!stamped && outTime && (inTimeChanged || outChanged || outDayChanged)) {
+        const ended = outDate(date, inTime, outTime, outDay);
+        if (ended < date) return bad(`${INVALID_TIME} The Out date cannot be before the shift's own date.`);
+        if (ended > today) return bad(`${INVALID_TIME} It cannot be later than now (${nowPlant}).`);
+        if (ended === today) {
+          const refused = laterThanNowError(outTime, nowPlant);
+          if (refused) return bad(refused);
+        }
+      }
+      /* One shift is never of no length — however long it is (no longest
+         shift since 17 Nov 2026); and no shift may overlap another of the
+         same operator (7 Nov 2026). Asked only of a time being entered or
+         changed, so an old row saved for its Line alone is never refused for
+         what it already holds. */
+      if (inTimeChanged || outChanged || outDayChanged) {
+        const refused = shiftLengthError(inTime, outTime, outDaysOf(date, outDay))
+          ?? shiftOverlapError({ date, shift: { shiftNo, inTime, outTime, outDate: outDay }, previousDayRows: previousShifts, dayRows: otherShifts });
+        if (refused) return bad(refused);
+      }
+
+      /* AND IT WRITES ONCE. The tablet may fill in what is blank — the
+         morning's In-Time, the evening's Out-Time onto the same row — and may
+         not write over what is already there. Asked AFTER the two clock rules
+         have decided what would be stored, because that, and not what the
+         browser sent, is what would change (amendsSavedRow says why). The
+         Plant In-Charge passes straight through: correcting the register is
+         what that login is for. */
+      if (!rights.amendSaved && amendsSavedRow(existing, { lines, inTime, outTime })) {
+        return bad(ALREADY_SAVED, 403);
+      }
+
+      const row = await prisma.$transaction(async (tx) => {
+        const before = await tx.attendanceDay.findUnique({ where: { date_operatorId_shiftNo: { date, operatorId, shiftNo } } });
+        /* The upsert IS the "no duplicates" rule: (date, operatorId, shiftNo)
+           is unique in the database, so the same shift saved twice is one row
+           that the second save corrects rather than a second row. */
+        const saved = await tx.attendanceDay.upsert({
+          where: { date_operatorId_shiftNo: { date, operatorId, shiftNo } },
+          create: { date, operatorId, shiftNo, lines, inTime, outTime, outDate: outDay },
+          update: { lines, inTime, outTime, outDate: outDay },
+          include: { operator: { select: { name: true } } },
+        });
+        const was = before ? ` (was ${dayWords(before, date)})` : "";
+        const shift = shiftNo > 1 ? `, shift ${shiftNo}` : "";
+        await trail(tx, "AttendanceDay",
+          `Attendance: ${saved.operator?.name ?? "an operator"} on ${onDay(date)}${shift} — ${dayWords(saved, date)}${was}`,
+          {
+            action: before ? "attendance.day.edit" : "attendance.day.add",
+            before: before ? { id: before.id, date, operatorId, shiftNo, lines: before.lines, inTime: before.inTime, outTime: before.outTime, outDate: before.outDate } : null,
+            after: { id: saved.id, date, operatorId, shiftNo, lines: saved.lines, inTime: saved.inTime, outTime: saved.outTime, outDate: saved.outDate },
+          });
+        return saved;
+      });
+      return json({
+        operatorId,
+        shiftNo,
+        lines: row.lines,
+        linesLabel: linesLabel(row.lines),
+        inTime: row.inTime ?? "",
+        outTime: row.outTime ?? "",
+        outDate: outDate(date, row.inTime, row.outTime, row.outDate),
+        worked: workedLabel(row.inTime, row.outTime, outDaysOf(date, row.outDate)),
+        saved: true,
+      });
+    }
+  }
+
+  /* leave */
+  if (head === "leave" && !id) {
+    if (method === "GET") return json(await listLeave());
+    if (method === "POST") {
+      const b = body as Record<string, unknown>;
+      if (!isDate(b.date)) return bad("Pick a date.");
+      const operatorId = String(b.operatorId ?? "");
+      if (!operatorId) return bad("Pick an operator.");
+      const fromTime = timeOrNull(b.fromTime);
+      const toTime = timeOrNull(b.toTime);
+      if (fromTime === undefined || toTime === undefined) return bad("Leave time is not a valid time.");
+      /* Required, and checked here rather than only on the form: an absence is
+         either excused or it is not, and a record that cannot say which is of
+         no use to the supervisor reading it. */
+      const typeErr = leaveTypeError(b.leaveType);
+      if (typeErr) return bad(typeErr);
+      const date = b.date;
+      await prisma.$transaction(async (tx) => {
+        const made = await tx.attendanceLeave.create({
+          data: {
+            date,
+            operatorId,
+            leaveType: parseLeaveType(b.leaveType) as string,
+            fromTime,
+            toTime,
+            reason: String(b.reason ?? "").trim(),
+            remarks: String(b.remarks ?? "").trim() || null,
+          },
+          include: { operator: { select: { name: true } } },
+        });
+        const { operator, ...after } = made;
+        await trail(tx, "AttendanceLeave", `Attendance: leave added for ${operator?.name ?? "an operator"} on ${onDay(date)} (${leaveLabel(fromTime, toTime)})`,
+          { action: "attendance.leave.add", after });
+      });
+      return json(await listLeave(), 201);
+    }
+  }
+
+  if (head === "leave" && id) {
+    if (method === "PATCH") {
+      const b = body as Record<string, unknown>;
+      const data: Record<string, unknown> = {};
+      if (b.date !== undefined) {
+        if (!isDate(b.date)) return bad("Pick a date.");
+        data.date = b.date;
+      }
+      if (b.operatorId !== undefined) {
+        if (!String(b.operatorId ?? "")) return bad("Pick an operator.");
+        data.operatorId = String(b.operatorId);
+      }
+      if (b.leaveType !== undefined) {
+        const typeErr = leaveTypeError(b.leaveType);
+        if (typeErr) return bad(typeErr);
+        data.leaveType = parseLeaveType(b.leaveType) as string;
+      }
+      for (const k of ["fromTime", "toTime"] as const) {
+        if (b[k] !== undefined) {
+          const t = timeOrNull(b[k]);
+          if (t === undefined) return bad("Leave time is not a valid time.");
+          data[k] = t;
+        }
+      }
+      if (b.reason !== undefined) data.reason = String(b.reason ?? "").trim();
+      if (b.remarks !== undefined) data.remarks = String(b.remarks ?? "").trim() || null;
+      if (Object.keys(data).length === 0) return bad("Nothing to change.");
+      const there = await prisma.$transaction(async (tx) => {
+        const found = await tx.attendanceLeave.findUnique({ where: { id }, include: { operator: { select: { name: true } } } });
+        if (!found) return false;
+        const { operator: was, ...before } = found;
+        const { operator, ...after } = await tx.attendanceLeave.update({ where: { id }, data, include: { operator: { select: { name: true } } } });
+        await trail(tx, "AttendanceLeave",
+          `Attendance: leave for ${operator?.name ?? "an operator"} on ${onDay(after.date)} (${leaveLabel(after.fromTime, after.toTime)}) changed — was ${was?.name ?? "an operator"} on ${onDay(before.date)} (${leaveLabel(before.fromTime, before.toTime)})`,
+          { action: "attendance.leave.edit", before, after });
+        return true;
+      });
+      if (!there) return bad("That leave record is not there any more. Reload the page.", 404);
+      return json(await listLeave());
+    }
+    if (method === "DELETE") {
+      /* Removed for good, so the trail keeps the whole row: who it was for,
+         the day, the hours, the reason and the remarks. */
+      const there = await prisma.$transaction(async (tx) => {
+        const before = await tx.attendanceLeave.findUnique({ where: { id }, include: { operator: { select: { name: true } } } });
+        if (!before) return false;
+        await tx.attendanceLeave.delete({ where: { id } });
+        const { operator, ...row } = before;
+        await trail(tx, "AttendanceLeave",
+          `Attendance: leave removed for ${operator?.name ?? "an operator"} on ${onDay(row.date)} (${leaveLabel(row.fromTime, row.toTime)}${row.reason ? `, ${row.reason}` : ""})`,
+          { action: "attendance.leave.delete", before: { ...row, operatorName: operator?.name ?? null } });
+        return true;
+      });
+      if (!there) return bad("That leave record is not there any more. Reload the page.", 404);
+      return json(await listLeave());
+    }
+  }
+
+  /* downloads — the table, then the same rows as a sheet */
+  if (head === "records" && method === "GET") {
+    const f = readFilter(p);
+    const today = todayPlant();
+    const rows = await filteredRows(f, today);
+    return json({
+      columns: columnsFor(f.type),
+      rows,
+      description: describeFilter(f, today, await operatorNameOf(f.operatorId)),
+      // One operator's attendance: the Sum of Total Working Hours under the table.
+      sumOfHours: await sumOfHours(f, today),
+    });
+  }
+
+  if (head === "export" && method === "GET") {
+    const f = readFilter(p);
+    const today = todayPlant();
+    const rows = await filteredRows(f, today);
+    const columns = [...columnsFor(f.type)];
+    /* One operator's attendance: the Sum of Total Working Hours goes on the
+       line right after the last record — its label in the first column, the
+       sum under Total Working Hours — styled as the sheet's total line. The
+       same figure the on-screen table shows under its rows. */
+    const sum = await sumOfHours(f, today);
+    const sheetRows = sum === null
+      ? rows
+      : [...rows, { [columns[0] as string]: SUM_OF_HOURS_LABEL, "Total Working Hours": sum } as Record<string, string | number>];
+    const ws = XLSX.utils.json_to_sheet(sheetRows, { header: columns });
+    ws["!cols"] = widthsFor(f.type).map((wch) => ({ wch }));
+    if (sum !== null) {
+      // The label is longer than a date: let it run into the cells beside it.
+      ws["!merges"] = [...(ws["!merges"] ?? []), { s: { r: rows.length + 1, c: 0 }, e: { r: rows.length + 1, c: columns.length - 2 } }];
+    }
+    styleRoboSheet(ws, {
+      columnCount: columns.length,
+      rowRoles: sum === null ? undefined : [...rows.map(() => null), "grandTotal" as const],
+    });
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, (f.type === "LEAVE" ? "Leave" : "Attendance").slice(0, 31));
+    const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+    return new Response(buf, {
+      status: 200,
+      headers: {
+        "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "Content-Disposition": `attachment; filename="${filterFileName(f, today, await operatorNameOf(f.operatorId))}"`,
+        "Cache-Control": "no-store",
+      },
+    });
+  }
+
+  return bad("Not found", 404);
+}
+
+/** Re-exported so a test can check the sheets match the registers on screen. */
+export { ATTENDANCE_COLUMNS, LEAVE_COLUMNS };

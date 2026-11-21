@@ -1,0 +1,2529 @@
+From 33e4bb974d60060a549b03d89ecf1adceafb6426 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 26 Aug 2026 04:48:21 +0000
+Subject: [PATCH 1/5] =?UTF-8?q?chromia(import):=20header-name=20columns,?=
+ =?UTF-8?q?=20Remarks=E2=86=92QC=20grade,=20delete=20imported=20file?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The register import now reads columns by HEADER NAME rather than fixed position,
+so the six required columns — Production Date, Batch Number, Slab Number, Base
+Material / Slab Name, File Name / Planned Design, Remarks — are found in any
+order, under minor name variations (Batch No. / Slab Batch Number, Program /
+File Name, Date / Production Date...), with extra columns ignored. Thickness and
+In-time are optional. A missing required column is named in the error instead of
+a bare FAILED, and a good run says "Import Successful". The legacy monthly
+register still imports through its own positional parser, auto-detected.
+
+From the remark, QC is completed for historical rows: Dispatch → Grade A,
+Stock → Grade A, Sample Cutting → Grade B, Recalibration → Grade C, each written
+as a real grade decision (matching the intake QC path), so imported rows carry a
+genuine Grade + Outcome, not just a disposition.
+
+The import history gains a Delete button that removes an imported file and every
+slab it brought in — through the existing single-slab delete cascade, with an
+audit entry and the slab numbers freed. Existing duplicate-slab validation and
+the persistence path are unchanged. Tests cover header detection, name
+variations, missing-column reporting, optional columns and the remark→grade map.
+---
+ .../chromia/import/delete-import-button.tsx   |  66 +++
+ src/app/chromia/import/import-form.tsx        |   8 +-
+ src/app/chromia/import/page.tsx               |   9 +
+ src/lib/chromia/import/pro-register.ts        | 388 +++++++++++++++++-
+ src/lib/chromia/server/actions/import.ts      |  66 ++-
+ .../chromia/server/services/import-service.ts | 104 ++++-
+ tests/chromia/import-parser.test.ts           | 159 +++++++
+ 7 files changed, 781 insertions(+), 19 deletions(-)
+ create mode 100644 src/app/chromia/import/delete-import-button.tsx
+
+diff --git a/src/app/chromia/import/delete-import-button.tsx b/src/app/chromia/import/delete-import-button.tsx
+new file mode 100644
+index 0000000..5dfc7d9
+--- /dev/null
++++ b/src/app/chromia/import/delete-import-button.tsx
+@@ -0,0 +1,66 @@
++'use client';
++
++import { useActionState, useEffect, useState } from 'react';
++
++import { ConfirmDialog } from '@/components/chromia/ui/confirm-dialog';
++import { deleteImportAction, type DeleteImportState } from '@/lib/chromia/server/actions/import';
++
++const INITIAL_STATE: DeleteImportState = {};
++
++/**
++ * Delete one imported file, and every slab it brought in.
++ *
++ * Asks first, and the question names the file and the count: an import can
++ * carry a whole month, so removing one is as consequential as a register delete
++ * and confirms the same way. A failure keeps the dialog open with the reason on
++ * it; a success removes the row from the list.
++ */
++export function DeleteImportButton({
++  importBatchId,
++  fileName,
++  slabCount,
++}: {
++  importBatchId: string;
++  fileName: string;
++  slabCount: number;
++}) {
++  const [state, formAction, isPending] = useActionState(deleteImportAction, INITIAL_STATE);
++  const [asking, setAsking] = useState(false);
++
++  useEffect(() => {
++    if (state.deleted !== undefined) setAsking(false);
++  }, [state.deleted]);
++
++  return (
++    <>
++      <button
++        type="button"
++        onClick={() => setAsking(true)}
++        aria-label={`Delete imported file ${fileName}`}
++        className="border-line surface text-status-waste hover:border-status-waste inline-flex h-9 items-center justify-center rounded-lg border px-3 text-xs font-medium transition-colors hover:bg-[color-mix(in_srgb,var(--color-status-waste)_8%,transparent)]"
++      >
++        Delete
++      </button>
++
++      <ConfirmDialog
++        open={asking}
++        busy={isPending}
++        title="Delete this imported file?"
++        detail={`${fileName} and the ${slabCount} slab${slabCount === 1 ? '' : 's'} it imported will be removed permanently, and those slab numbers freed. Slabs entered or graded by hand are not touched. This cannot be undone.`}
++        error={state.error}
++        onCancel={() => setAsking(false)}
++      >
++        <form action={formAction} className="contents">
++          <input type="hidden" name="importBatchId" value={importBatchId} />
++          <button
++            type="submit"
++            disabled={isPending}
++            className="bg-status-waste inline-flex h-11 items-center justify-center rounded-lg px-5 text-sm font-semibold text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-55"
++          >
++            {isPending ? 'Deleting…' : 'Delete imported file'}
++          </button>
++        </form>
++      </ConfirmDialog>
++    </>
++  );
++}
+diff --git a/src/app/chromia/import/import-form.tsx b/src/app/chromia/import/import-form.tsx
+index 05d371b..5f86afa 100644
+--- a/src/app/chromia/import/import-form.tsx
++++ b/src/app/chromia/import/import-form.tsx
+@@ -75,7 +75,11 @@ export function ImportForm() {
+       {/* ------------------------------------------------------------ result */}
+       {result.summary ? (
+         <Card>
+-          <h2 className="mb-1 text-sm font-semibold tracking-tight">Import complete</h2>
++          <h2 className="mb-1 text-sm font-semibold tracking-tight">
++            {result.summary.failed === 0 && result.summary.unreadable === 0
++              ? 'Import Successful'
++              : 'Import completed with issues'}
++          </h2>
+           {/* The one-line answer, written by the same module that decides the
+               status — so the sentence and the status can never disagree. It is
+               above the numbers because "nothing new, everything was already
+@@ -158,6 +162,7 @@ export function ImportForm() {
+                       <th className={table.th}>Date</th>
+                       <th className={table.th}>Remark</th>
+                       <th className={table.th}>Reads as</th>
++                      <th className={table.th}>Grade</th>
+                     </tr>
+                   </thead>
+                   <tbody>
+@@ -175,6 +180,7 @@ export function ImportForm() {
+                             ? row.disposition.replace(/_/g, ' ').toLowerCase()
+                             : 'in processing'}
+                         </td>
++                        <td className={table.td}>{row.grade ?? '—'}</td>
+                       </tr>
+                     ))}
+                   </tbody>
+diff --git a/src/app/chromia/import/page.tsx b/src/app/chromia/import/page.tsx
+index 13c6501..d0385ea 100644
+--- a/src/app/chromia/import/page.tsx
++++ b/src/app/chromia/import/page.tsx
+@@ -6,6 +6,7 @@ import { prisma } from '@/lib/chromia/db';
+ import { table } from '@/lib/chromia/ui';
+ import { PLANT_TIME_ZONE } from '@/lib/chromia/plant-time';
+ 
++import { DeleteImportButton } from './delete-import-button';
+ import { ImportForm } from './import-form';
+ 
+ export const metadata: Metadata = { title: 'Import' };
+@@ -48,6 +49,7 @@ export default async function ImportPage() {
+                   <th className={table.th}>Skipped</th>
+                   <th className={table.th}>Failed</th>
+                   <th className={table.th}>When</th>
++                  <th className={`${table.th} text-right`}>Actions</th>
+                 </tr>
+               </thead>
+               <tbody>
+@@ -64,6 +66,13 @@ export default async function ImportPage() {
+                       {dateFmt.format(run.createdAt)}
+                       {run.importedById ? ` · ${importers.get(run.importedById) ?? 'Unknown'}` : ''}
+                     </td>
++                    <td className={`${table.td} text-right`}>
++                      <DeleteImportButton
++                        importBatchId={run.id}
++                        fileName={run.sourceFile}
++                        slabCount={run.importedRows}
++                      />
++                    </td>
+                   </tr>
+                 ))}
+               </tbody>
+diff --git a/src/lib/chromia/import/pro-register.ts b/src/lib/chromia/import/pro-register.ts
+index b1525b8..a1d6d00 100644
+--- a/src/lib/chromia/import/pro-register.ts
++++ b/src/lib/chromia/import/pro-register.ts
+@@ -1,17 +1,30 @@
+-import { ChromiaDisposition as Disposition } from '@prisma/client';
++import { ChromiaDisposition as Disposition, ChromiaSlabGrade as SlabGrade } from '@prisma/client';
++
++import { plantInstant } from '@/lib/chromia/plant-time';
+ 
+ /**
+- * Parser for the monthly production register ("PRO MAY" and its siblings).
++ * Parser for the production register.
++ *
++ * Two shapes of workbook reach this module and both end up as the same
++ * `ParseResult`, so everything downstream — the preview, the importer, the
++ * duplicate check — is written once:
+  *
+- * The workbook has three merged header rows and one row per slab. Columns are
+- * addressed by index because the headers are merged and cannot be matched by
+- * name reliably.
++ *   • The flexible register (the operational format). Any column order, minor
++ *     header-name variations, and extra columns it does not care about. Its
++ *     columns are found by matching the header row by NAME — see
++ *     `parseRegister` and `detectHeaderRow`.
+  *
+- * Kept pure — no database, no file I/O — so the mapping rules are unit-testable
+- * against real rows from the sheet.
++ *   • The legacy monthly register ("PRO MAY" and its siblings). Three merged
++ *     header rows, one row per slab, columns addressed by index because the
++ *     merged headers cannot be matched by name. Kept exactly as it was so an
++ *     old file re-imports the way it always did — see `parseProRegister`.
++ *
++ * `parseRegister` is the entry point and picks between them. Both are pure — no
++ * database, no file I/O — so the mapping rules stay unit-testable against real
++ * rows.
+  */
+ 
+-/** Zero-based column indexes in the register. */
++/** Zero-based column indexes in the legacy monthly register. */
+ export const COLUMN = {
+   serial: 0,
+   date: 1,
+@@ -41,6 +54,12 @@ export interface ParsedSlabRow {
+   bypassedDate: Date | null;
+   remark: string | null;
+   disposition: Disposition | null;
++  /** Grade implied by the remark, so a historical row carries a real QC grade. */
++  grade: SlabGrade | null;
++  /** Millimetres, when a thickness column was present. */
++  thicknessMm: number | null;
++  /** An explicit in-time, when one was given; otherwise the received date is used. */
++  inTime: Date | null;
+   recalibrationReasonCode: string | null;
+   recalSentDate: Date | null;
+   recalReceivedDate: Date | null;
+@@ -56,6 +75,12 @@ export interface ParseResult {
+   rows: ParsedSlabRow[];
+   issues: ParseIssue[];
+   skipped: number;
++  /**
++   * Required columns whose header could not be found in a flexible-format file.
++   * Empty/absent when every required column is present (or for the legacy
++   * format, which is addressed by position and cannot report this).
++   */
++  missingColumns?: string[];
+ }
+ 
+ type Cell = unknown;
+@@ -113,15 +138,56 @@ function toDate(cell: Cell): Date | null {
+   return parsed.getFullYear() < 2000 ? null : toCalendarDay(parsed);
+ }
+ 
++/** Centimetres on the register → millimetres in the database. Null when blank. */
++function toThicknessMm(cell: Cell): number | null {
++  if (cell === null || cell === undefined) return null;
++  const raw = typeof cell === 'number' ? cell : Number(String(cell).replace(/[^0-9.]/g, ''));
++  if (!Number.isFinite(raw) || raw <= 0) return null;
++  return raw * 10;
++}
++
++/**
++ * Combine a day with an explicit in-time.
++ *
++ * Accepts "HH:mm" text and an Excel time fraction (0–1). A datetime cell that
++ * arrives as a Date is deliberately NOT read for its time here — reading the
++ * clock off a bare-time Date is exactly the drift the plant-timezone work
++ * removed — so those fall through to null and the received date is used, which
++ * is what the legacy importer has always done for in-time.
++ */
++function toInTime(day: Date, cell: Cell): Date | null {
++  if (cell === null || cell === undefined) return null;
++
++  let hours: number | null = null;
++  let minutes: number | null = null;
++
++  if (typeof cell === 'number' && cell > 0 && cell < 1) {
++    const total = Math.round(cell * 24 * 60);
++    hours = Math.floor(total / 60) % 24;
++    minutes = total % 60;
++  } else {
++    const match = /^(\d{1,2}):(\d{2})/.exec(String(cell).trim());
++    if (match) {
++      hours = Number(match[1]);
++      minutes = Number(match[2]);
++    }
++  }
++
++  if (hours === null || minutes === null || hours > 23 || minutes > 59) return null;
++  return plantInstant(day.getFullYear(), day.getMonth() + 1, day.getDate(), hours, minutes);
++}
++
+ /**
+  * Map a free-text remark to a disposition.
+  *
+  * Real values seen in the register: "STOCK", "RECALIBRATE - HALF PRINT",
+- * "RECALIBRATE - RED COLOUR", "SAMPLE CUTTING  5 MAY".
++ * "RECALIBRATE - RED COLOUR", "SAMPLE CUTTING  5 MAY", "DISPATCH". Matched
++ * case-insensitively, most specific first, so "dispatch from stock" reads as
++ * stock rather than dispatch.
+  */
+ export function dispositionFromRemark(
+   remark: string | null,
+-  hasDispatchDate: boolean,
++  hasDispatchDate = false,
+ ): Disposition | null {
+   const value = (remark ?? '').toUpperCase();
+ 
+@@ -129,10 +195,40 @@ export function dispositionFromRemark(
+   if (/SAMPLE/.test(value)) return Disposition.SAMPLE_CUTTING;
+   if (/WASTE|SCRAP/.test(value)) return Disposition.WASTE;
+   if (/STOCK/.test(value)) return Disposition.STOCK;
++  if (/DISPATCH|DESPATCH/.test(value)) return Disposition.DISPATCH;
+   if (hasDispatchDate) return Disposition.DISPATCH;
+   return null;
+ }
+ 
++/**
++ * The grade a disposition implies, for a historical row graded from its remark.
++ *
++ *   Dispatch → A · Stock → A · Sample Cutting → B · Recalibration → C
++ *
++ * These are the only pairings `GRADE_ALLOWED_DISPOSITIONS` permits, so a row
++ * graded this way passes the same rule a QC decision does. Waste carries no
++ * grade.
++ */
++export function gradeForDisposition(disposition: Disposition | null): SlabGrade | null {
++  switch (disposition) {
++    case Disposition.DISPATCH:
++      return SlabGrade.A;
++    case Disposition.STOCK:
++      return SlabGrade.A;
++    case Disposition.SAMPLE_CUTTING:
++      return SlabGrade.B;
++    case Disposition.RECALIBRATION:
++      return SlabGrade.C;
++    default:
++      return null;
++  }
++}
++
++/** The grade a remark implies — its disposition's grade. */
++export function gradeFromRemark(remark: string | null): SlabGrade | null {
++  return gradeForDisposition(dispositionFromRemark(remark));
++}
++
+ /**
+  * Map the free-text part of a recalibration remark to a seeded reason code.
+  * Anything unrecognised falls back to OTHER, with the original text preserved
+@@ -154,8 +250,272 @@ export function reasonCodeFromRemark(remark: string | null): string | null {
+   return 'OTHER';
+ }
+ 
++// ─── Flexible header-name mapping ───────────────────────────────────────────
++
++/** The fields the flexible importer knows how to place. */
++export type RegisterField =
++  | 'productionDate'
++  | 'batchNo'
++  | 'slabNo'
++  | 'materialName'
++  | 'designFile'
++  | 'remark'
++  | 'thickness'
++  | 'inTime';
++
++/** The six a file MUST carry, and the exact words a missing-column error uses. */
++export const REQUIRED_FIELDS: RegisterField[] = [
++  'productionDate',
++  'batchNo',
++  'slabNo',
++  'materialName',
++  'designFile',
++  'remark',
++];
++
++const OPTIONAL_FIELDS: RegisterField[] = ['thickness', 'inTime'];
++
++export const FIELD_LABELS: Record<RegisterField, string> = {
++  productionDate: 'Production Date',
++  batchNo: 'Batch Number',
++  slabNo: 'Slab Number',
++  materialName: 'Base Material / Slab Name',
++  designFile: 'File Name / Planned Design',
++  remark: 'Remarks',
++  thickness: 'Thickness',
++  inTime: 'In-time',
++};
++
++/**
++ * The header names each field answers to, already normalised. Matching is
++ * case-insensitive and ignores punctuation and spacing (so "Batch No.",
++ * "batch no" and "BatchNo" are one and the same), which is what "minor name
++ * variations" means in practice.
++ */
++const FIELD_ALIASES: Record<RegisterField, string[]> = {
++  productionDate: ['production date', 'date', 'prod date', 'production'],
++  batchNo: ['batch number', 'slab batch number', 'batch no', 'batch'],
++  slabNo: ['slab number', 'slab no'],
++  materialName: [
++    'base material slab name',
++    'slab name',
++    'base material',
++    'material',
++    'material name',
++    'base material name',
++  ],
++  designFile: [
++    'file name planned design',
++    'file name',
++    'planned design',
++    'program',
++    'program name',
++    'design',
++    'design name',
++  ],
++  remark: ['remarks', 'remark'],
++  thickness: ['thickness cm', 'thickness', 'thickness in cm', 'thk'],
++  inTime: ['in time', 'in', 'time in'],
++};
++
++const ALL_FIELDS: RegisterField[] = [...REQUIRED_FIELDS, ...OPTIONAL_FIELDS];
++
++/** Lowercase, punctuation → space, collapsed. "Batch No." → "batch no". */
++function norm(cell: Cell): string {
++  return text(cell)
++    .toLowerCase()
++    .replace(/[^a-z0-9]+/g, ' ')
++    .trim();
++}
++
++/** The same with spaces removed, so "SlabNo" and "Slab No" meet. */
++function compact(value: string): string {
++  return value.replace(/ /g, '');
++}
++
++/** Does this header cell name this field, allowing spacing/punctuation drift? */
++function headerMatches(cell: Cell, field: RegisterField): boolean {
++  const asText = norm(cell);
++  if (!asText) return false;
++  const asCompact = compact(asText);
++  return FIELD_ALIASES[field].some((alias) => {
++    const aliasNorm = norm(alias);
++    return asText === aliasNorm || asCompact === compact(aliasNorm);
++  });
++}
++
++interface HeaderDetection {
++  /** Row index of the header, or -1 when no row reads as one. */
++  index: number;
++  /** field → column index, for every field whose header was found. */
++  map: Partial<Record<RegisterField, number>>;
++}
++
++/**
++ * Find the header row and where each field sits in it.
++ *
++ * Scans the first rows, scores each by how many of the six required headers it
++ * carries, and takes the best — a real header row names several fields, a data
++ * row names none. A single word never counts for two fields (each column is
++ * claimed by the first field it matches), so "Slab Name" and "Slab No." do not
++ * fight over one another.
++ */
++export function detectHeaderRow(rows: Cell[][]): HeaderDetection {
++  let best: HeaderDetection & { score: number } = { index: -1, map: {}, score: 0 };
++  const scan = Math.min(rows.length, 25);
++
++  for (let i = 0; i < scan; i += 1) {
++    const row = rows[i] ?? [];
++    const map: Partial<Record<RegisterField, number>> = {};
++
++    for (let column = 0; column < row.length; column += 1) {
++      const cell = row[column];
++      if (text(cell) === '') continue;
++      for (const field of ALL_FIELDS) {
++        if (map[field] === undefined && headerMatches(cell, field)) {
++          map[field] = column;
++          break;
++        }
++      }
++    }
++
++    const score = REQUIRED_FIELDS.filter((field) => map[field] !== undefined).length;
++    if (score > best.score) best = { index: i, map, score };
++  }
++
++  // Three named headers is enough to trust a row as the header row; fewer and
++  // it is more likely a stray label than a real header, and the legacy parser
++  // is the safer reading.
++  return best.score >= 3 ? { index: best.index, map: best.map } : { index: -1, map: {} };
++}
++
++/**
++ * Is this the legacy monthly register rather than a flexible-format file?
++ *
++ * The legacy sheet is the only one with a "Fully Printed Date" column, and it
++ * fills the DATE column once and carries it down through that column — logic
++ * that lives only in `parseProRegister`. Reading such a file by header name
++ * would refill its sparse dates wrong, so its own signature routes it back to
++ * its own parser.
++ */
++function looksLikeLegacyRegister(rows: Cell[][]): boolean {
++  const scan = Math.min(rows.length, 6);
++  for (let i = 0; i < scan; i += 1) {
++    for (const cell of rows[i] ?? []) {
++      if (/fully.?printed/.test(compact(norm(cell)))) return true;
++    }
++  }
++  return false;
++}
++
++/**
++ * Parse a flexible-format sheet using a detected header map.
++ *
++ * Same row-level rules as the legacy parser — a slab needs a number, a batch, a
++ * name and a date, blank rows are skipped quietly — but the columns come from
++ * the header, so any order and any extra columns are fine. The date is carried
++ * down when a row leaves it blank, exactly as a person reads a register.
++ */
++function parseByHeader(rows: Cell[][], detection: HeaderDetection): ParseResult {
++  const parsed: ParsedSlabRow[] = [];
++  const issues: ParseIssue[] = [];
++  let skipped = 0;
++  let carriedDate: Date | null = null;
++
++  const at = (row: Cell[], field: RegisterField): Cell => {
++    const column = detection.map[field];
++    return column === undefined ? null : row[column];
++  };
++
++  for (let index = detection.index + 1; index < rows.length; index += 1) {
++    const row = rows[index] ?? [];
++    const sourceRow = index + 1; // 1-based, matching what the user sees in Excel
++
++    const rowDate = toDate(at(row, 'productionDate'));
++    if (rowDate) carriedDate = rowDate;
++    const receivedDate = rowDate ?? carriedDate;
++
++    const slabNo = text(at(row, 'slabNo'));
++    const batchNo = text(at(row, 'batchNo'));
++    const materialName = text(at(row, 'materialName'));
++
++    if (!slabNo && !batchNo && !materialName) {
++      skipped += 1;
++      continue;
++    }
++
++    if (!slabNo) {
++      issues.push({ sourceRow, reason: 'Missing slab number' });
++      continue;
++    }
++    if (!batchNo) {
++      issues.push({ sourceRow, reason: `Slab ${slabNo}: missing batch number` });
++      continue;
++    }
++    if (!materialName) {
++      issues.push({ sourceRow, reason: `Slab ${slabNo}: missing slab name` });
++      continue;
++    }
++    if (!receivedDate) {
++      issues.push({ sourceRow, reason: `Slab ${slabNo}: missing production date` });
++      continue;
++    }
++
++    const remark = text(at(row, 'remark')) || null;
++    const disposition = dispositionFromRemark(remark);
++
++    parsed.push({
++      sourceRow,
++      slabNo,
++      batchNo,
++      materialName,
++      designFile: text(at(row, 'designFile')) || null,
++      receivedDate,
++      fullyPrintedDate: null,
++      bypassedDate: null,
++      remark,
++      disposition,
++      grade: gradeForDisposition(disposition),
++      thicknessMm: toThicknessMm(at(row, 'thickness')),
++      inTime: toInTime(receivedDate, at(row, 'inTime')),
++      recalibrationReasonCode: reasonCodeFromRemark(remark),
++      recalSentDate: null,
++      recalReceivedDate: null,
++      dispatchDate: null,
++    });
++  }
++
++  return { rows: parsed, issues, skipped };
++}
++
++/**
++ * Parse a register, whichever shape it is.
++ *
++ * The flexible header-name path is the operational one; the legacy monthly
++ * register keeps its own positional parser. A file that names at least three of
++ * the required columns and is not the legacy sheet is read by header — and if
++ * it names some but not all six, the missing ones are reported by name rather
++ * than the file simply failing.
++ */
++export function parseRegister(rows: Cell[][]): ParseResult {
++  const detection = detectHeaderRow(rows);
++
++  if (detection.index === -1 || looksLikeLegacyRegister(rows)) {
++    return parseProRegister(rows);
++  }
++
++  const missingColumns = REQUIRED_FIELDS.filter((field) => detection.map[field] === undefined).map(
++    (field) => FIELD_LABELS[field],
++  );
++  if (missingColumns.length > 0) {
++    return { rows: [], issues: [], skipped: 0, missingColumns };
++  }
++
++  return parseByHeader(rows, detection);
++}
++
+ /**
+- * Parse the sheet.
++ * Parse the legacy monthly register by column position.
+  *
+  * Which day does a slab belong to?
+  *
+@@ -219,6 +579,7 @@ export function parseProRegister(rows: Cell[][]): ParseResult {
+ 
+     const remark = text(row[COLUMN.remark]) || null;
+     const dispatchDate = toDate(row[COLUMN.dispatchDate]);
++    const disposition = dispositionFromRemark(remark, Boolean(dispatchDate));
+ 
+     parsed.push({
+       sourceRow,
+@@ -230,7 +591,10 @@ export function parseProRegister(rows: Cell[][]): ParseResult {
+       fullyPrintedDate,
+       bypassedDate: toDate(row[COLUMN.bypassedDate]),
+       remark,
+-      disposition: dispositionFromRemark(remark, Boolean(dispatchDate)),
++      disposition,
++      grade: gradeForDisposition(disposition),
++      thicknessMm: null,
++      inTime: null,
+       recalibrationReasonCode: reasonCodeFromRemark(remark),
+       recalSentDate: toDate(row[COLUMN.recalSentDate]),
+       recalReceivedDate: toDate(row[COLUMN.recalReceivedDate]),
+diff --git a/src/lib/chromia/server/actions/import.ts b/src/lib/chromia/server/actions/import.ts
+index 89cd7e4..e4f79dd 100644
+--- a/src/lib/chromia/server/actions/import.ts
++++ b/src/lib/chromia/server/actions/import.ts
+@@ -5,8 +5,12 @@ import * as XLSX from 'xlsx';
+ 
+ import { requireActingUser } from '@/lib/chromia/current-user';
+ import { isAppError } from '@/lib/chromia/errors';
+-import { findDuplicateSlabNos, parseProRegister } from '@/lib/chromia/import/pro-register';
+-import { importProRegister, type ImportSummary } from '@/lib/chromia/server/services/import-service';
++import { findDuplicateSlabNos, parseRegister } from '@/lib/chromia/import/pro-register';
++import {
++  deleteImportBatch,
++  importProRegister,
++  type ImportSummary,
++} from '@/lib/chromia/server/services/import-service';
+ 
+ const MAX_BYTES = 10 * 1024 * 1024;
+ 
+@@ -29,10 +33,21 @@ export interface ImportFormState {
+       receivedDate: string;
+       remark: string | null;
+       disposition: string | null;
++      grade: string | null;
+     }[];
+   };
+ }
+ 
++/**
++ * A file is missing one or more of the six required columns — say which, by
++ * name, instead of a bare failure. Column order does not matter and extra
++ * columns are ignored, so the only thing to fix is the ones named here.
++ */
++function missingColumnsMessage(missing: string[]): string {
++  const plural = missing.length === 1 ? '' : 's';
++  return `This file is missing required column${plural}: ${missing.join(', ')}. Column order does not matter and extra columns are fine — add the missing column${plural} and import again.`;
++}
++
+ /** Read the uploaded workbook into a row matrix. */
+ async function readSheet(file: File) {
+   const buffer = await file.arrayBuffer();
+@@ -77,7 +92,11 @@ export async function previewImportAction(
+   try {
+     const file = validateFile(formData.get('file'));
+     const { sheetName, rows } = await readSheet(file);
+-    const result = parseProRegister(rows);
++    const result = parseRegister(rows);
++
++    if (result.missingColumns && result.missingColumns.length > 0) {
++      return { error: missingColumnsMessage(result.missingColumns) };
++    }
+ 
+     return {
+       preview: {
+@@ -96,6 +115,7 @@ export async function previewImportAction(
+           receivedDate: row.receivedDate.toISOString().slice(0, 10),
+           remark: row.remark,
+           disposition: row.disposition,
++          grade: row.grade,
+         })),
+       },
+     };
+@@ -116,7 +136,11 @@ export async function runImportAction(
+ 
+     const user = await requireActingUser();
+     const { sheetName, rows } = await readSheet(file);
+-    const parsed = parseProRegister(rows);
++    const parsed = parseRegister(rows);
++
++    if (parsed.missingColumns && parsed.missingColumns.length > 0) {
++      return { error: missingColumnsMessage(parsed.missingColumns) };
++    }
+ 
+     if (parsed.rows.length === 0) {
+       return { error: 'No slab rows were found in that sheet.' };
+@@ -138,3 +162,37 @@ export async function runImportAction(
+     throw error;
+   }
+ }
++
++export interface DeleteImportState {
++  error?: string;
++  /** Set on success — how many slabs the removed file had brought in. */
++  deleted?: number;
++  sourceFile?: string;
++}
++
++/**
++ * Delete a previously imported file: the batch record and every slab it
++ * brought in, through the same delete workflow a single slab uses.
++ */
++export async function deleteImportAction(
++  _previousState: DeleteImportState,
++  formData: FormData,
++): Promise<DeleteImportState> {
++  const importBatchId = String(formData.get('importBatchId') ?? '').trim();
++  if (!importBatchId) return { error: 'That import could not be identified.' };
++
++  try {
++    const user = await requireActingUser();
++    const result = await deleteImportBatch(importBatchId, user.id);
++
++    revalidatePath('/chromia/import');
++    revalidatePath('/chromia/slabs');
++    revalidatePath('/chromia/dashboard');
++    revalidatePath('/chromia/recalibrations');
++
++    return { deleted: result.deleted, sourceFile: result.sourceFile };
++  } catch (error) {
++    if (isAppError(error) || error instanceof Error) return { error: error.message };
++    throw error;
++  }
++}
+diff --git a/src/lib/chromia/server/services/import-service.ts b/src/lib/chromia/server/services/import-service.ts
+index 8229fac..f326a38 100644
+--- a/src/lib/chromia/server/services/import-service.ts
++++ b/src/lib/chromia/server/services/import-service.ts
+@@ -1,6 +1,7 @@
+-import { ChromiaCycleStatus as CycleStatus, ChromiaDisposition as Disposition, ChromiaImportStatus as ImportStatus, ChromiaRecalibrationStatus as RecalibrationStatus, ChromiaSlabEventType as SlabEventType, ChromiaSlabStatus as SlabStatus } from '@prisma/client';
++import { ChromiaAuditAction as AuditAction, ChromiaCycleStatus as CycleStatus, ChromiaDisposition as Disposition, ChromiaImportStatus as ImportStatus, ChromiaRecalibrationStatus as RecalibrationStatus, ChromiaSlabEventType as SlabEventType, ChromiaSlabStatus as SlabStatus } from '@prisma/client';
+ import { MAX_RECALIBRATION_ATTEMPTS } from '@/lib/chromia/constants/process-stages';
+ import { prisma } from '@/lib/chromia/db';
++import { NotFoundError } from '@/lib/chromia/errors';
+ import { createLogger } from '@/lib/chromia/logger';
+ import { daysBetween, toDateColumn } from '@/lib/chromia/utils/dates';
+ import { importStatus, importSummaryLine } from '@/lib/chromia/import/outcome';
+@@ -168,7 +169,9 @@ export async function importProRegister(
+ 
+       const isRecalibration = row.disposition === Disposition.RECALIBRATION;
+       const status = statusFor(row);
+-      const inTime = row.receivedDate;
++      // An explicit in-time when the file carried one, else the production date
++      // — the same fallback the operator entry uses.
++      const inTime = row.inTime ?? row.receivedDate;
+       const outTime = row.fullyPrintedDate ?? row.bypassedDate ?? null;
+ 
+       await prisma.$transaction(async (tx) => {
+@@ -191,7 +194,10 @@ export async function importProRegister(
+             plannedDesignId,
+             status,
+             currentCycleNumber: 1,
++            currentGrade: row.grade,
+             currentDisposition: row.disposition,
++            originalThicknessMm: row.thicknessMm,
++            currentThicknessMm: row.thicknessMm,
+             recalibrationCount: isRecalibration ? 1 : 0,
+             isRecalibrationOut: status === SlabStatus.OUT_FOR_RECALIBRATION,
+             receivedDate: row.receivedDate,
+@@ -228,6 +234,7 @@ export async function importProRegister(
+             status: outTime ? CycleStatus.COMPLETED : CycleStatus.ACTIVE,
+             completedAt: outTime,
+             disposition: row.disposition,
++            finalGrade: row.grade,
+             createdById: userId,
+           },
+         });
+@@ -246,6 +253,37 @@ export async function importProRegister(
+           },
+         });
+ 
++        // The remark's grade and outcome, recorded as a real grade decision so
++        // a historical row carries the same Grade + Outcome a slab graded at QC
++        // does — not just a disposition with no grade behind it.
++        if (row.grade && row.disposition) {
++          await tx.chromiaGradeDecision.create({
++            data: {
++              cycleId: cycle.id,
++              slabId: slab.id,
++              grade: row.grade,
++              disposition: row.disposition,
++              reason: 'Graded from register remark on import',
++              remarks: row.remark,
++              decidedById: userId,
++              decidedAt: row.receivedDate,
++              attemptNumberAtDecision: 1,
++            },
++          });
++
++          await tx.chromiaSlabEvent.create({
++            data: {
++              slabId: slab.id,
++              cycleId: cycle.id,
++              eventType: SlabEventType.GRADE_ASSIGNED,
++              toStatus: status,
++              userId,
++              occurredAt: row.receivedDate,
++              note: `Grade ${row.grade} → ${row.disposition} (from import remark)`,
++            },
++          });
++        }
++
+         if (isRecalibration) {
+           const sentDate = row.recalSentDate ?? row.receivedDate;
+           const receivedDate = row.recalReceivedDate;
+@@ -347,4 +385,66 @@ export async function importProRegister(
+   };
+ }
+ 
++/**
++ * Undo an import — remove the slabs a file brought in, and the batch record.
++ *
++ * Everything that hangs off each slab (its cycle, QC, grade decision, history,
++ * recalibration trips and outcome record) goes with it by the same cascade a
++ * single delete uses, scoped to the slab's own id. Each production batch keeps
++ * its slab count straight, and an audit entry records the removal after the
++ * rows it names are gone.
++ *
++ * Slab numbers are handed back to the plant, so a file imported by mistake can
++ * be corrected and imported again.
++ */
++export async function deleteImportBatch(
++  importBatchId: string,
++  userId: string,
++): Promise<{ deleted: number; sourceFile: string }> {
++  const batch = await prisma.chromiaImportBatch.findUnique({
++    where: { id: importBatchId },
++    select: { id: true, sourceFile: true },
++  });
++  if (!batch) throw new NotFoundError('Import batch');
++
++  const slabs = await prisma.chromiaSlab.findMany({
++    where: { importBatchId },
++    select: { id: true, batchId: true },
++  });
++
++  await prisma.$transaction(async (tx) => {
++    // Each production batch loses exactly the slabs this import gave it.
++    const perBatch = new Map<string, number>();
++    for (const slab of slabs) perBatch.set(slab.batchId, (perBatch.get(slab.batchId) ?? 0) + 1);
++    for (const [batchId, count] of perBatch) {
++      await tx.chromiaBatch.update({
++        where: { id: batchId },
++        data: { totalSlabs: { decrement: count } },
++      });
++    }
++
++    // One id each, and everything removed with a slab is that slab's own
++    // children — the database's cascade, the same one deleteSlabRecord relies on.
++    if (slabs.length > 0) {
++      await tx.chromiaSlab.deleteMany({ where: { importBatchId } });
++    }
++
++    await tx.chromiaAuditLog.create({
++      data: {
++        entity: 'ImportBatch',
++        entityId: batch.id,
++        action: AuditAction.DELETE,
++        userId,
++        changes: { sourceFile: batch.sourceFile, deletedSlabs: slabs.length },
++      },
++    });
++
++    // No slab points at it now, so the batch row goes cleanly.
++    await tx.chromiaImportBatch.delete({ where: { id: batch.id } });
++  });
++
++  log.warn({ importBatchId, deleted: slabs.length }, 'Import batch deleted');
++  return { deleted: slabs.length, sourceFile: batch.sourceFile };
++}
++
+ export { MAX_RECALIBRATION_ATTEMPTS };
+diff --git a/tests/chromia/import-parser.test.ts b/tests/chromia/import-parser.test.ts
+index 7f17a0a..74057fa 100644
+--- a/tests/chromia/import-parser.test.ts
++++ b/tests/chromia/import-parser.test.ts
+@@ -5,7 +5,9 @@ import {
+   COLUMN,
+   dispositionFromRemark,
+   findDuplicateSlabNos,
++  gradeFromRemark,
+   parseProRegister,
++  parseRegister,
+   reasonCodeFromRemark,
+   toCalendarDay,
+ } from '@/lib/chromia/import/pro-register';
+@@ -164,6 +166,163 @@ describe('duplicate detection', () => {
+   });
+ });
+ 
++describe('remark → grade', () => {
++  it('maps each outcome to the grade the QC rules allow', () => {
++    expect(gradeFromRemark('Dispatch')).toBe('A');
++    expect(gradeFromRemark('STOCK')).toBe('A');
++    expect(gradeFromRemark('Sample Cutting')).toBe('B');
++    expect(gradeFromRemark('Sample Cut')).toBe('B');
++    expect(gradeFromRemark('RECALIBRATE - RED COLOUR')).toBe('C');
++  });
++
++  it('leaves an unrecognised or empty remark ungraded', () => {
++    expect(gradeFromRemark('some free text')).toBeNull();
++    expect(gradeFromRemark(null)).toBeNull();
++    expect(gradeFromRemark('WASTE')).toBeNull();
++  });
++});
++
++/** Build a flexible sheet: a header row, then one array per data row. */
++function flexSheet(headers: string[], dataRows: (string | number | null)[][]): unknown[][] {
++  return [headers, ...dataRows];
++}
++
++const REQUIRED_HEADERS = [
++  'Production Date',
++  'Batch Number',
++  'Slab Number',
++  'Base Material / Slab Name',
++  'File Name / Planned Design',
++  'Remarks',
++];
++
++describe('flexible header-name import', () => {
++  it('reads the six required columns in any order and grades from the remark', () => {
++    const result = parseRegister(
++      flexSheet(
++        ['Remarks', 'Slab Number', 'Production Date', 'File Name / Planned Design', 'Batch Number', 'Base Material / Slab Name'],
++        [['Stock', '130520', '2026-05-01', 'THAJ 3', '1245', 'robo trail']],
++      ),
++    );
++
++    expect(result.missingColumns).toBeUndefined();
++    expect(result.rows).toHaveLength(1);
++    const parsed = result.rows[0];
++    expect(parsed?.slabNo).toBe('130520');
++    expect(parsed?.batchNo).toBe('1245');
++    expect(parsed?.materialName).toBe('robo trail');
++    expect(parsed?.designFile).toBe('THAJ 3');
++    expect(parsed?.disposition).toBe(Disposition.STOCK);
++    expect(parsed?.grade).toBe('A');
++    expect(day(parsed?.receivedDate)).toBe('2026-05-01');
++  });
++
++  it('accepts minor header-name variations and ignores extra columns', () => {
++    const result = parseRegister(
++      flexSheet(
++        ['Date', 'Slab No.', 'Slab Batch Number', 'Slab Name', 'Program Name', 'Remarks', 'Some Extra Column'],
++        [['2026-05-02', '59183-A', 'B-9', 'quartz', 'design-7', 'Dispatch', 'ignored']],
++      ),
++    );
++
++    expect(result.missingColumns).toBeUndefined();
++    expect(result.rows).toHaveLength(1);
++    // Alphanumeric slab and batch numbers survive intact.
++    expect(result.rows[0]?.slabNo).toBe('59183-A');
++    expect(result.rows[0]?.batchNo).toBe('B-9');
++    expect(result.rows[0]?.disposition).toBe(Disposition.DISPATCH);
++    expect(result.rows[0]?.grade).toBe('A');
++  });
++
++  it('names the missing required column instead of failing blankly', () => {
++    const result = parseRegister(
++      flexSheet(
++        ['Production Date', 'Batch Number', 'Slab Number', 'Base Material', 'File Name'],
++        [['2026-05-01', '1245', '130520', 'robo', 'THAJ']],
++      ),
++    );
++
++    expect(result.rows).toHaveLength(0);
++    expect(result.missingColumns).toEqual(['Remarks']);
++  });
++
++  it('imports when the optional Thickness and In-time columns are present', () => {
++    const result = parseRegister(
++      flexSheet(
++        [...REQUIRED_HEADERS, 'Thickness', 'In-time'],
++        [['2026-05-01', '1245', '130520', 'robo', 'THAJ', 'Sample Cutting', '2', '14:53']],
++      ),
++    );
++
++    expect(result.rows).toHaveLength(1);
++    expect(result.rows[0]?.thicknessMm).toBe(20); // 2 cm → 20 mm
++    expect(result.rows[0]?.inTime).not.toBeNull();
++    expect(result.rows[0]?.disposition).toBe(Disposition.SAMPLE_CUTTING);
++    expect(result.rows[0]?.grade).toBe('B');
++  });
++
++  it('imports just as happily when Thickness and In-time are absent', () => {
++    const result = parseRegister(
++      flexSheet(REQUIRED_HEADERS, [
++        ['2026-05-01', '1245', '130520', 'robo', 'THAJ', 'Recalibrate - half print'],
++      ]),
++    );
++
++    expect(result.rows).toHaveLength(1);
++    expect(result.rows[0]?.thicknessMm).toBeNull();
++    expect(result.rows[0]?.inTime).toBeNull();
++    expect(result.rows[0]?.disposition).toBe(Disposition.RECALIBRATION);
++    expect(result.rows[0]?.grade).toBe('C');
++    expect(result.rows[0]?.recalibrationReasonCode).toBe('HALF-PRINT');
++  });
++
++  it('reports a row missing its slab number without dropping the rest', () => {
++    const result = parseRegister(
++      flexSheet(REQUIRED_HEADERS, [
++        ['2026-05-01', '1245', '', 'robo', 'THAJ', 'Stock'],
++        ['2026-05-01', '1245', '130521', 'robo', 'THAJ', 'Stock'],
++      ]),
++    );
++
++    expect(result.rows).toHaveLength(1);
++    expect(result.rows[0]?.slabNo).toBe('130521');
++    expect(result.issues[0]?.reason).toContain('Missing slab number');
++  });
++});
++
++describe('choosing the right parser', () => {
++  it('falls back to the legacy parser when no header row is recognisable', () => {
++    // The legacy fixture: blank header rows, values addressed by position.
++    const viaRegister = parseRegister([
++      ...HEADERS,
++      row({ date: '2026-05-01', slabNo: '130520', batchNo: '1245', slabName: 'robo trail' }),
++    ]);
++    expect(viaRegister.rows).toHaveLength(1);
++    expect(viaRegister.rows[0]?.slabNo).toBe('130520');
++  });
++
++  it('routes a sheet with a Fully Printed Date column to the legacy parser', () => {
++    const headers = new Array(30).fill(null);
++    headers[COLUMN.date] = 'Date';
++    headers[COLUMN.slabName] = 'Slab Name';
++    headers[COLUMN.batchNo] = 'Batch No';
++    headers[COLUMN.slabNo] = 'Slab No';
++    headers[COLUMN.fullyPrintedDate] = 'Fully Printed Date';
++    headers[COLUMN.remark] = 'Remarks';
++
++    const result = parseRegister([
++      headers,
++      [],
++      [],
++      [],
++      row({ date: '2026-05-01', slabNo: '130520', batchNo: '1245', slabName: 'robo trail' }),
++    ]);
++
++    expect(result.rows).toHaveLength(1);
++    expect(result.rows[0]?.slabNo).toBe('130520');
++  });
++});
++
+ describe('date cells land on the day they mean', () => {
+   it('pulls a spreadsheet instant that fell ten seconds short back onto its day', () => {
+     // Exactly what the reader returns for "1 May 2026" in the May register:
+-- 
+2.43.0
+
+
+From 3168cdc5299789ae16914f0beafce9dc37ab08e8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 26 Aug 2026 04:48:21 +0000
+Subject: [PATCH 2/5] =?UTF-8?q?chromia:=20speed=20up=20every=20save=20?=
+ =?UTF-8?q?=E2=80=94=20index=20reference=20lookups,=20parallelise?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Each entry / correction / QC save resolved the base material and design by
+loading the WHOLE table and matching in memory — an O(rows) read per save,
+twice, that grew every time an import minted a design. Each resolver now tries
+the stable unique `code` first (an indexed lookup, the value a name picked from
+the list resolves to) and only falls back to the full scan for a genuinely new
+or oddly-punctuated name, so the answer is identical and the common save never
+scans the table. The two independent lookups in the operator entry and the slab
+correction now run together rather than one after the other. No behaviour
+change — only far less work on the most-pressed buttons.
+---
+ .../server/services/operator-service.ts       |  8 +++-
+ .../server/services/reference-service.ts      | 44 +++++++++++++++++--
+ .../server/services/slab-record-service.ts    |  8 +++-
+ 3 files changed, 53 insertions(+), 7 deletions(-)
+
+diff --git a/src/lib/chromia/server/services/operator-service.ts b/src/lib/chromia/server/services/operator-service.ts
+index d5f510a..e33dc4d 100644
+--- a/src/lib/chromia/server/services/operator-service.ts
++++ b/src/lib/chromia/server/services/operator-service.ts
+@@ -67,8 +67,12 @@ export async function recordOperatorEntry(input: OperatorEntryInput, userId: str
+     throw new ConflictError(DUPLICATE_SLAB_NO_MESSAGE);
+   }
+ 
+-  const baseMaterialId = await resolveBaseMaterialId(input.baseMaterial);
+-  const designId = await resolveDesignId(input.fileName);
++  // Independent of each other — resolved together rather than one after the
++  // other, so an entry save waits for one round-trip here, not two.
++  const [baseMaterialId, designId] = await Promise.all([
++    resolveBaseMaterialId(input.baseMaterial),
++    resolveDesignId(input.fileName),
++  ]);
+   const thicknessMm = input.thicknessCm === undefined ? null : input.thicknessCm * 10;
+ 
+   const slab = await prisma.$transaction(async (tx) => {
+diff --git a/src/lib/chromia/server/services/reference-service.ts b/src/lib/chromia/server/services/reference-service.ts
+index 0c7f3fe..ad60697 100644
+--- a/src/lib/chromia/server/services/reference-service.ts
++++ b/src/lib/chromia/server/services/reference-service.ts
+@@ -15,6 +15,16 @@ import { normaliseFileName } from '@/lib/chromia/operator-register';
+  * what already exists — ignoring case and spacing, because "Roller mark" and
+  * "ROLLER MARK" are the same thing — and creates the record only when it is
+  * genuinely new. Nothing is ever duplicated by a difference in typing.
++ *
++ * ── PERFORMANCE ──────────────────────────────────────────────────────────
++ * The loose match cannot be expressed in SQL, so the fallback loads the list
++ * and compares in memory. That list grows every time an import invents a design
++ * from a file name, and it was being read in full on every single save — the
++ * biggest, most-typed one, the operator entry, does two of these. Each resolver
++ * now tries the stable `code` first, which is unique and indexed and is what a
++ * name picked from the list resolves to, so the common save never scans the
++ * table. The scan stays as the exact same fallback for a genuinely new or
++ * oddly-punctuated name, so the answer is unchanged — only the work is less.
+  */
+ 
+ /** Slug a free-text name into a stable business code. */
+@@ -37,12 +47,22 @@ export async function resolveBaseMaterialId(name: string): Promise<string> {
+   const wanted = name.trim();
+   if (!wanted) throw new ValidationError('Enter a base material / slab name');
+ 
++  const code = toCode(wanted);
++
++  // The common path: the name maps to a code already on file — an indexed
++  // lookup, not a scan of every material. The full scan matches `code` too, so
++  // this returns exactly what it would; it only skips the read.
++  const byCode = await prisma.chromiaBaseMaterial.findFirst({
++    where: { code, deletedAt: null },
++    select: { id: true },
++  });
++  if (byCode) return byCode.id;
++
+   const existing = await prisma.chromiaBaseMaterial.findMany({
+     where: { deletedAt: null },
+     select: { id: true, name: true, code: true },
+   });
+ 
+-  const code = toCode(wanted);
+   const match = existing.find((row) => sameName(row.name, wanted) || row.code === code);
+   if (match) return match.id;
+ 
+@@ -64,6 +84,18 @@ export async function resolveDesignId(fileName: string): Promise<string> {
+   const wanted = fileName.trim();
+   if (!wanted) throw new ValidationError('Enter a file name / planned design');
+ 
++  const code = toCode(wanted);
++
++  // Fast path on the unique code, as for base materials — a file name picked
++  // from the list resolves to a code that already exists and returns at once,
++  // rather than reading every design on file (imports mint one per file name,
++  // so this list is the one that grows without bound).
++  const byCode = await prisma.chromiaDesign.findFirst({
++    where: { code, deletedAt: null },
++    select: { id: true },
++  });
++  if (byCode) return byCode.id;
++
+   const normalised = normaliseFileName(wanted);
+ 
+   const existing = await prisma.chromiaDesign.findMany({
+@@ -71,7 +103,6 @@ export async function resolveDesignId(fileName: string): Promise<string> {
+     select: { id: true, name: true, fileName: true, code: true },
+   });
+ 
+-  const code = toCode(wanted);
+   const match = existing.find(
+     (row) =>
+       sameName(row.name, wanted) ||
+@@ -92,12 +123,19 @@ export async function resolveRecalibrationReasonId(name: string): Promise<string
+   const wanted = name.trim();
+   if (!wanted) throw new ValidationError('Enter a recalibrate reason');
+ 
++  const code = toCode(wanted);
++
++  const byCode = await prisma.chromiaRecalibrationReason.findFirst({
++    where: { code, deletedAt: null },
++    select: { id: true },
++  });
++  if (byCode) return byCode.id;
++
+   const existing = await prisma.chromiaRecalibrationReason.findMany({
+     where: { deletedAt: null },
+     select: { id: true, name: true, code: true },
+   });
+ 
+-  const code = toCode(wanted);
+   const match = existing.find((row) => sameName(row.name, wanted) || row.code === code);
+   if (match) return match.id;
+ 
+diff --git a/src/lib/chromia/server/services/slab-record-service.ts b/src/lib/chromia/server/services/slab-record-service.ts
+index 85ae268..ab7cda8 100644
+--- a/src/lib/chromia/server/services/slab-record-service.ts
++++ b/src/lib/chromia/server/services/slab-record-service.ts
+@@ -74,8 +74,12 @@ export async function updateSlabRecord(input: SlabRecordEditInput, userId: strin
+     return { slabNo: record.slabNo, changed: 0 };
+   }
+ 
+-  const baseMaterialId = await resolveBaseMaterialId(input.baseMaterial);
+-  const designId = await resolveDesignId(input.fileName);
++  // Independent lookups, resolved together so a correction save costs one
++  // round-trip here rather than two.
++  const [baseMaterialId, designId] = await Promise.all([
++    resolveBaseMaterialId(input.baseMaterial),
++    resolveDesignId(input.fileName),
++  ]);
+   const thicknessMm = input.thicknessCm === undefined ? null : input.thicknessCm * 10;
+   // The production date the operator chose dates the record — not the in-time,
+   // which is optional now and may not be there at all. They agree whenever a
+-- 
+2.43.0
+
+
+From d0c1b50c1da09a22ee6dd873d1016d8dc5c97616 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 26 Aug 2026 04:48:21 +0000
+Subject: [PATCH 3/5] chromia(stockyard): first column is Production Date, not
+ Stock Date
+
+A slab marked Stock at QC is stocked on its production date, so the two are the
+same day; the "In stock" table now shows the register's Production Date in that
+first column, read from the existing slab record. No separate stock-date field
+is introduced, and every other column, filter and action is unchanged.
+---
+ src/app/chromia/stockyard/page.tsx | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/src/app/chromia/stockyard/page.tsx b/src/app/chromia/stockyard/page.tsx
+index 0d1ab0a..6c5f9a6 100644
+--- a/src/app/chromia/stockyard/page.tsx
++++ b/src/app/chromia/stockyard/page.tsx
+@@ -102,7 +102,10 @@ export default async function StockyardPage({
+               <table className={dataTable.root}>
+                 <thead className={dataTable.head}>
+                   <tr>
+-                    <th className={th}>Stock Date</th>
++                    {/* Production Date, not a separate Stock Date: a slab marked
++                        Stock at QC is stocked on its production date, so the two
++                        are the same day and the register's date is the one shown. */}
++                    <th className={th}>Production Date</th>
+                     <th className={th}>Batch No.</th>
+                     <th className={th}>Slab No.</th>
+                     <th className={th}>Base Material / Slab Name</th>
+@@ -117,7 +120,7 @@ export default async function StockyardPage({
+                   {stocked.map((slab) => (
+                     <tr key={slab.id} className={dataTable.row}>
+                       <td className={`${td} font-medium whitespace-nowrap`}>
+-                        {slab.stockDate ? dateFmt.format(slab.stockDate) : '—'}
++                        {dateFmt.format(slab.receivedDate)}
+                       </td>
+                       <td className={`${tdMuted} font-mono`}>{slab.batch.batchNo}</td>
+                       <td className={`${td} font-mono`}>{slab.slabNo}</td>
+-- 
+2.43.0
+
+
+From 2300f9dee3f1065d23d4e3ac77a7db0dbd117cbb Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 26 Aug 2026 04:48:21 +0000
+Subject: [PATCH 4/5] chromia(slabs): mark in-processing slab numbers
+ distinctly
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+In Slab Records a slab still in processing looked almost the same as a finished
+one. Its number now carries a status-blue indicator dot and blue mono text
+against the plain grey of a graded slab, so a glance down the column separates
+"still in processing" from "graded and done" without reading the Status column.
+It remains the link to the QC screen — only the styling changed, not the table
+or any logic.
+---
+ src/components/chromia/ui/slab-no.tsx | 21 ++++++++++++++++-----
+ 1 file changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/src/components/chromia/ui/slab-no.tsx b/src/components/chromia/ui/slab-no.tsx
+index 057089a..88a6fd2 100644
+--- a/src/components/chromia/ui/slab-no.tsx
++++ b/src/components/chromia/ui/slab-no.tsx
+@@ -3,14 +3,17 @@ import Link from 'next/link';
+ import type { ChromiaSlabStatus as SlabStatus } from '@prisma/client';
+ import { slabHref } from '@/lib/chromia/slab-links';
+ import { cn } from '@/lib/chromia/utils/cn';
+-import { link } from '@/lib/chromia/ui';
+ 
+ /**
+  * A slab number in a table.
+  *
+- * It becomes a link only when there is somewhere to go: the intake form that
+- * finishes the slab. Once the slab is graded the number is just an identifier,
+- * so it is rendered as plain text rather than as a link to nothing.
++ * It becomes a link only when there is somewhere to go — the QC screen that
++ * finishes the slab — and while it is unfinished it is marked so it cannot be
++ * mistaken for a completed one: a status-blue dot and a blue mono number,
++ * against the plain grey number of a slab whose work is done. So a glance down
++ * the column separates "still in processing" from "graded and gone" without
++ * reading the Status column at all. Once graded, the number is just an
++ * identifier, rendered as plain text.
+  */
+ export function SlabNo({
+   id,
+@@ -33,7 +36,15 @@ export function SlabNo({
+   }
+ 
+   return (
+-    <Link href={href} className={cn(link, 'font-mono', className)}>
++    <Link
++      href={href}
++      title="Still in processing — click to grade"
++      className={cn(
++        'text-status-active inline-flex items-center gap-1.5 font-mono font-semibold hover:underline',
++        className,
++      )}
++    >
++      <span className="bg-status-active inline-block size-1.5 shrink-0 rounded-full" aria-hidden />
+       {slabNo}
+     </Link>
+   );
+-- 
+2.43.0
+
+
+From 9e03e9acb55283ee1392001a2615a6dcb7bc09e0 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 26 Aug 2026 04:48:21 +0000
+Subject: [PATCH 5/5] chromia(qc): deferred Dispatch page, full-record Edit
+ incl. QC, Grade+Outcome-only QC
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Three related changes to the QC and dispatch flow.
+
+Dispatch is decided at QC but sent later. Grade A → Dispatch no longer captures a
+date at QC; the slab is graded and joins a new Dispatch page — a queue of slabs
+awaiting dispatch (Dispatch Date shown as "—") on top, a "Dispatched" log below.
+Its Action is a date picker plus "Sent for Dispatch", which records the real
+dispatch through the existing dispatch logic and will not save without a date.
+Stock-then-dispatch stays in the Stockyard's own release log, so the two never
+double-count; the dashboard and reports read the same signals as before.
+
+Edit on a slab record now opens the Operator Entry screen with the QC Section
+beneath it, pre-filled with every field including the current Grade, Outcome and
+Slab Remarks, and saves back onto the SAME record. Correcting the QC reuses the
+whole grading path: the current decision (grade decision and its dispatch /
+stock / sample / waste record) is undone, then the new grade and outcome are
+applied exactly as a first grading would be. History is appended (a CORRECTION
+event), never erased. A slab mid-recalibration is out of scope and is sent to
+the Recalibration page. The old edit page redirects here.
+
+The QC Section now decides only Grade + Outcome: the Dispatch, Stock and Sample-
+cutting date fields are gone (captured on their own screens), while Recalibration
+keeps its reason with all its values. The chosen outcome is still written to the
+slab's remark behind the scenes, so the Slab Remarks column keeps reading true.
+---
+ src/app/chromia/dispatch/page.tsx             | 200 ++++++++++++++++++
+ src/app/chromia/dispatch/send-form.tsx        |  43 ++++
+ src/app/chromia/operator/page.tsx             |  44 +++-
+ src/app/chromia/operator/qc-panel.tsx         |  42 +++-
+ .../chromia/recalibrations/[slabId]/page.tsx  |   1 -
+ src/app/chromia/slabs/[slabId]/edit/page.tsx  |  72 ++-----
+ src/app/chromia/slabs/new/qc-section.tsx      | 115 +++-------
+ src/app/chromia/slabs/row-actions.tsx         |   2 +-
+ src/components/chromia/layout/nav-icons.tsx   |  10 +
+ src/lib/chromia/config/navigation.ts          |   1 +
+ src/lib/chromia/constants/app.ts              |   1 +
+ src/lib/chromia/server/actions/dispatch.ts    |  55 +++++
+ src/lib/chromia/server/actions/slab.ts        |  33 ++-
+ .../repositories/dispatch-repository.ts       | 100 +++++++++
+ .../repositories/slab-record-repository.ts    |   5 +
+ .../server/services/intake-outcome-service.ts |  99 +++++++++
+ 16 files changed, 664 insertions(+), 159 deletions(-)
+ create mode 100644 src/app/chromia/dispatch/page.tsx
+ create mode 100644 src/app/chromia/dispatch/send-form.tsx
+ create mode 100644 src/lib/chromia/server/actions/dispatch.ts
+ create mode 100644 src/lib/chromia/server/repositories/dispatch-repository.ts
+
+diff --git a/src/app/chromia/dispatch/page.tsx b/src/app/chromia/dispatch/page.tsx
+new file mode 100644
+index 0000000..ee6c331
+--- /dev/null
++++ b/src/app/chromia/dispatch/page.tsx
+@@ -0,0 +1,200 @@
++import type { Metadata } from 'next';
++
++import { EmptyState, PageHeader } from '@/components/chromia/ui';
++import { SimpleFilterBar } from '@/components/chromia/filter-bar-simple';
++import { dataTable, SectionCard } from '@/components/chromia/ui/form';
++import { GradeBadge } from '@/components/chromia/ui/status';
++import { APP_ROUTES } from '@/lib/chromia/constants/app';
++import {
++  hasSimpleFilters,
++  parseSimpleFilters,
++  type RawSearchParams,
++} from '@/lib/chromia/simple-filters';
++import {
++  listAwaitingDispatch,
++  listDirectDispatches,
++} from '@/lib/chromia/server/repositories/dispatch-repository';
++import { PLANT_TIME_ZONE } from '@/lib/chromia/plant-time';
++
++import { SendForDispatchForm } from './send-form';
++
++export const metadata: Metadata = { title: 'Dispatch' };
++export const dynamic = 'force-dynamic';
++
++const dateFmt = new Intl.DateTimeFormat('en-GB', {
++  day: '2-digit',
++  month: 'short',
++  year: 'numeric',
++  timeZone: PLANT_TIME_ZONE,
++});
++
++const { th, td, tdMuted, tdNum } = dataTable;
++
++/**
++ * Dispatch.
++ *
++ * QC decides a Grade A slab will be dispatched, but the slab is usually sent
++ * out weeks or months later — sometimes the same day, but rarely at the QC
++ * bench. This page holds that gap: the queue on top is every slab QC marked for
++ * dispatch that has not actually gone yet, with no dispatch date until it does;
++ * the log underneath is what has really been sent. Recording the send here runs
++ * the same dispatch logic as everywhere else, so nothing about traceability
++ * changes — only *when* the date is captured.
++ */
++export default async function DispatchPage({
++  searchParams,
++}: {
++  searchParams: Promise<RawSearchParams>;
++}) {
++  const filters = parseSimpleFilters(await searchParams);
++  const filtered = hasSimpleFilters(filters);
++
++  // Filters narrow the queue; the sent log below is history and stays whole,
++  // the same way the Stockyard filters its racks and not its release log.
++  const [awaiting, dispatched] = await Promise.all([
++    listAwaitingDispatch(filtered ? filters : undefined),
++    listDirectDispatches(),
++  ]);
++
++  return (
++    <>
++      <PageHeader
++        title="Dispatch"
++        description={
++          awaiting.length === 0
++            ? filtered
++              ? 'No slabs awaiting dispatch match these filters.'
++              : 'No slabs are waiting to be dispatched.'
++            : `${awaiting.length} slab${awaiting.length === 1 ? '' : 's'} awaiting dispatch${
++                filtered ? ' matching' : ''
++              }`
++        }
++      />
++
++      <SimpleFilterBar filters={filters} action={APP_ROUTES.dispatch} />
++
++      {/* --------------------------------------------------- awaiting queue --- */}
++      <div className="mb-6">
++        <SectionCard
++          title="Awaiting dispatch"
++          accent="active"
++          padded={awaiting.length === 0}
++          actions={
++            <span className="border-line surface text-muted rounded-full border px-3 py-1 text-xs font-medium">
++              <span className="text-foreground font-semibold tabular-nums">{awaiting.length}</span>{' '}
++              {awaiting.length === 1 ? 'slab' : 'slabs'}
++            </span>
++          }
++        >
++          {awaiting.length === 0 ? (
++            <EmptyState>
++              {filtered
++                ? 'No slab awaiting dispatch matches these filters.'
++                : 'Nothing is waiting to be dispatched. Grade a slab A → Dispatch and it appears here.'}
++            </EmptyState>
++          ) : (
++            <div className="overflow-x-auto">
++              <table className={dataTable.root}>
++                <thead className={dataTable.head}>
++                  <tr>
++                    <th className={th}>Dispatch Date</th>
++                    <th className={th}>Production Date</th>
++                    <th className={th}>Batch No.</th>
++                    <th className={th}>Slab No.</th>
++                    <th className={th}>Base Material / Slab Name</th>
++                    <th className={th}>File Name / Planned Design</th>
++                    <th className={`${th} text-right`}>Thickness (cm)</th>
++                    <th className={th}>Grade</th>
++                    <th className={`${th} text-right`}>Action</th>
++                  </tr>
++                </thead>
++                <tbody>
++                  {awaiting.map((slab) => (
++                    <tr key={slab.id} className={dataTable.row}>
++                      {/* Empty until it is actually sent — that is the point. */}
++                      <td className={tdMuted}>—</td>
++                      <td className={`${td} font-medium whitespace-nowrap`}>
++                        {dateFmt.format(slab.receivedDate)}
++                      </td>
++                      <td className={`${tdMuted} font-mono`}>{slab.batch.batchNo}</td>
++                      <td className={`${td} font-mono`}>{slab.slabNo}</td>
++                      <td className={td}>{slab.baseMaterial.name}</td>
++                      <td className={tdMuted}>
++                        {slab.plannedDesign?.fileName ?? slab.plannedDesign?.name ?? '—'}
++                      </td>
++                      <td className={`${tdNum} text-right`}>
++                        {slab.thicknessCm === null ? '—' : slab.thicknessCm}
++                      </td>
++                      <td className={td}>
++                        <GradeBadge grade={slab.currentGrade} />
++                      </td>
++                      <td className={`${td} text-right`}>
++                        <SendForDispatchForm slabId={slab.id} />
++                      </td>
++                    </tr>
++                  ))}
++                </tbody>
++              </table>
++            </div>
++          )}
++        </SectionCard>
++      </div>
++
++      {/* ----------------------------------------------------- sent log --- */}
++      <SectionCard
++        title="Dispatched"
++        accent="brand"
++        padded={dispatched.length === 0}
++        actions={
++          <span className="border-line surface text-muted rounded-full border px-3 py-1 text-xs font-medium">
++            <span className="text-foreground font-semibold tabular-nums">{dispatched.length}</span>{' '}
++            {dispatched.length === 1 ? 'record' : 'records'}
++          </span>
++        }
++      >
++        {dispatched.length === 0 ? (
++          <EmptyState>No slab has been dispatched from here yet.</EmptyState>
++        ) : (
++          <div className="overflow-x-auto">
++            <table className={dataTable.root}>
++              <thead className={dataTable.head}>
++                <tr>
++                  <th className={th}>Dispatch Date</th>
++                  <th className={th}>Production Date</th>
++                  <th className={th}>Batch No.</th>
++                  <th className={th}>Slab No.</th>
++                  <th className={th}>Base Material / Slab Name</th>
++                  <th className={th}>File Name / Planned Design</th>
++                  <th className={`${th} text-right`}>Thickness (cm)</th>
++                  <th className={th}>Grade</th>
++                </tr>
++              </thead>
++              <tbody>
++                {dispatched.map((row) => (
++                  <tr key={row.id} className={dataTable.row}>
++                    <td className={`${td} font-medium whitespace-nowrap`}>
++                      {dateFmt.format(row.dispatchDate)}
++                    </td>
++                    <td className={`${tdMuted} whitespace-nowrap`}>
++                      {dateFmt.format(row.receivedDate)}
++                    </td>
++                    <td className={`${tdMuted} font-mono`}>{row.batchNo}</td>
++                    <td className={`${td} font-mono`}>{row.slabNo}</td>
++                    <td className={td}>{row.baseMaterial}</td>
++                    <td className={tdMuted}>{row.designFileName ?? '—'}</td>
++                    <td className={`${tdNum} text-right`}>
++                      {row.thicknessCm === null ? '—' : row.thicknessCm}
++                    </td>
++                    <td className={td}>
++                      <GradeBadge grade={row.grade} />
++                    </td>
++                  </tr>
++                ))}
++              </tbody>
++            </table>
++          </div>
++        )}
++      </SectionCard>
++    </>
++  );
++}
+diff --git a/src/app/chromia/dispatch/send-form.tsx b/src/app/chromia/dispatch/send-form.tsx
+new file mode 100644
+index 0000000..94f0de3
+--- /dev/null
++++ b/src/app/chromia/dispatch/send-form.tsx
+@@ -0,0 +1,43 @@
++'use client';
++
++import { useActionState } from 'react';
++
++import { field } from '@/components/chromia/ui/form';
++import { sendForDispatchAction, type DispatchFormState } from '@/lib/chromia/server/actions/dispatch';
++
++const INITIAL_STATE: DispatchFormState = {};
++
++/**
++ * One row of the queue — its own form.
++ *
++ * The date is required by the browser as well as the server, because a slab may
++ * be sent weeks after QC decided it, and the whole point of this page is that
++ * the dispatch date is the day it really left — not the day it was graded, and
++ * not defaulted to today.
++ */
++export function SendForDispatchForm({ slabId }: { slabId: string }) {
++  const [state, formAction, isPending] = useActionState(sendForDispatchAction, INITIAL_STATE);
++
++  return (
++    <form action={formAction} className="flex items-center justify-end gap-2">
++      <input type="hidden" name="slabId" value={slabId} />
++      <input
++        aria-label="Dispatch date"
++        name="dispatchDate"
++        type="date"
++        required
++        className={`${field} w-[10.5rem]`}
++      />
++      <button
++        type="submit"
++        disabled={isPending}
++        className="bg-brand-600 hover:bg-brand-700 inline-flex h-11 items-center justify-center rounded-lg px-4 text-sm font-semibold whitespace-nowrap text-white shadow-[0_1px_2px_rgba(16,24,40,0.12)] transition-colors disabled:cursor-not-allowed disabled:opacity-55"
++      >
++        {isPending ? 'Saving…' : 'Sent for Dispatch'}
++      </button>
++      {state.error ? (
++        <span className="text-status-waste max-w-[14rem] text-xs font-medium">{state.error}</span>
++      ) : null}
++    </form>
++  );
++}
+diff --git a/src/app/chromia/operator/page.tsx b/src/app/chromia/operator/page.tsx
+index a8e9519..42798e1 100644
+--- a/src/app/chromia/operator/page.tsx
++++ b/src/app/chromia/operator/page.tsx
+@@ -73,6 +73,9 @@ export default async function OperatorPage({
+ }) {
+   const params = await searchParams;
+   const slabId = resolveSlabId(params.slab);
++  // `?edit=1` — opened from Slab Records "Edit" for a full correction of the
++  // record, QC included, rather than the normal grade-a-new-slab flow.
++  const editMode = (Array.isArray(params.edit) ? params.edit[0] : params.edit) === '1';
+   // The filtered Slab Records view this slab was opened from, if any — carried
+   // through so saving its QC returns there instead of the bare list. See
+   // slabHref and completeSlabAction.
+@@ -95,6 +98,14 @@ export default async function OperatorPage({
+      link that exists always leads to something. */
+   const qcOpen = selected !== null && needsIntakeQc(selected.status);
+ 
++  // A slab mid-recalibration has a multi-cycle journey the Recalibration page
++  // owns; its QC is not corrected here. Every other decided outcome can be.
++  const inRecalibration =
++    selected !== null &&
++    (selected.currentDisposition === 'RECALIBRATION' ||
++      selected.status === 'OUT_FOR_RECALIBRATION' ||
++      selected.status === 'RECEIVED_FROM_RECALIBRATION');
++
+   return (
+     <>
+       <PageHeader
+@@ -102,7 +113,9 @@ export default async function OperatorPage({
+         title="Operator entry"
+         description={
+           selected
+-            ? `Slab ${selected.slabNo} — correct the entry, or grade it below`
++            ? editMode
++              ? `Slab ${selected.slabNo} — correct any field, including QC, below`
++              : `Slab ${selected.slabNo} — correct the entry, or grade it below`
+             : 'Book slabs onto the line'
+         }
+         actions={
+@@ -151,13 +164,38 @@ export default async function OperatorPage({
+       />
+ 
+       {selected ? (
+-        qcOpen ? (
++        editMode ? (
++          inRecalibration ? (
++            <SectionCard title="QC Section — correct" accent="grade" padded>
++              <EmptyState>
++                Slab {selected.slabNo} is in a recalibration cycle — correct it on the{' '}
++                <Link href={APP_ROUTES.recalibrations} className={link}>
++                  Recalibration
++                </Link>{' '}
++                page.
++              </EmptyState>
++            </SectionCard>
++          ) : (
++            <QcPanel
++              edit
++              key={selected.id}
++              slabId={selected.id}
++              slabNo={selected.slabNo}
++              recalibrationReasons={recalibrationReasons}
++              back={back}
++              initial={{
++                grade: selected.currentGrade ?? '',
++                disposition: selected.currentDisposition ?? '',
++                slabRemarks: selected.remarks ?? '',
++              }}
++            />
++          )
++        ) : qcOpen ? (
+           <QcPanel
+             key={selected.id}
+             slabId={selected.id}
+             slabNo={selected.slabNo}
+             recalibrationReasons={recalibrationReasons}
+-            today={toDateInput(new Date())}
+             back={back}
+           />
+         ) : (
+diff --git a/src/app/chromia/operator/qc-panel.tsx b/src/app/chromia/operator/qc-panel.tsx
+index bb420df..2ec6849 100644
+--- a/src/app/chromia/operator/qc-panel.tsx
++++ b/src/app/chromia/operator/qc-panel.tsx
+@@ -4,7 +4,11 @@ import { useActionState } from 'react';
+ 
+ import { FormError } from '@/components/chromia/ui';
+ import { SectionCard } from '@/components/chromia/ui/form';
+-import { completeSlabAction, type SlabIntakeFormState } from '@/lib/chromia/server/actions/slab';
++import {
++  completeSlabAction,
++  editSlabQcAction,
++  type SlabIntakeFormState,
++} from '@/lib/chromia/server/actions/slab';
+ 
+ import { QcSection, type Option } from '../slabs/new/qc-section';
+ 
+@@ -14,9 +18,15 @@ interface Props {
+   slabId: string;
+   slabNo: string;
+   recalibrationReasons: Option[];
+-  today: string;
+   /** The filtered Slab Records query to return to after saving — see slabHref. */
+   back?: string;
++  /**
++   * Correction mode (the Edit path): the QC section opens pre-filled with the
++   * slab's current grade and outcome, and saving corrects the same record
++   * instead of grading a fresh slab.
++   */
++  edit?: boolean;
++  initial?: { grade?: string; disposition?: string; slabRemarks?: string };
+ }
+ 
+ /**
+@@ -37,12 +47,22 @@ interface Props {
+  * `QcSection` itself is imported unchanged from where it has always lived, so
+  * the allowed grade/outcome pairs stay decided in exactly one place.
+  */
+-export function QcPanel({ slabId, slabNo, recalibrationReasons, today, back }: Props) {
+-  const [state, formAction, isPending] = useActionState(completeSlabAction, INITIAL_STATE);
++export function QcPanel({
++  slabId,
++  slabNo,
++  recalibrationReasons,
++  back,
++  edit = false,
++  initial,
++}: Props) {
++  const [state, formAction, isPending] = useActionState(
++    edit ? editSlabQcAction : completeSlabAction,
++    INITIAL_STATE,
++  );
+ 
+   return (
+     <div className="mb-6">
+-      <SectionCard title="QC Section" accent="grade">
++      <SectionCard title={edit ? 'QC Section — correct' : 'QC Section'} accent="grade">
+         <form action={formAction} className="flex flex-col gap-6">
+           <input type="hidden" name="slabId" value={slabId} />
+           {/* The filtered view to return to once this is saved. Absent when the
+@@ -51,8 +71,8 @@ export function QcPanel({ slabId, slabNo, recalibrationReasons, today, back }: P
+ 
+           <QcSection
+             recalibrationReasons={recalibrationReasons}
+-            today={today}
+             errors={state.fieldErrors}
++            initial={edit ? initial : undefined}
+           />
+ 
+           <FormError message={state.error} />
+@@ -63,10 +83,16 @@ export function QcPanel({ slabId, slabNo, recalibrationReasons, today, back }: P
+               disabled={isPending}
+               className="bg-brand-600 hover:bg-brand-700 inline-flex h-11 items-center justify-center rounded-lg px-6 text-sm font-semibold text-white shadow-[0_1px_2px_rgba(16,24,40,0.12)] transition-colors disabled:cursor-not-allowed disabled:opacity-55"
+             >
+-              {isPending ? 'Saving…' : `Save QC for slab ${slabNo}`}
++              {isPending
++                ? 'Saving…'
++                : edit
++                  ? `Save QC changes for slab ${slabNo}`
++                  : `Save QC for slab ${slabNo}`}
+             </button>
+             <span className="text-muted text-sm">
+-              The entry above stays In-Processing until this is saved.
++              {edit
++                ? 'This replaces the current grade and outcome on the same record.'
++                : 'The entry above stays In-Processing until this is saved.'}
+             </span>
+           </div>
+         </form>
+diff --git a/src/app/chromia/recalibrations/[slabId]/page.tsx b/src/app/chromia/recalibrations/[slabId]/page.tsx
+index eadb8fe..8b0fc38 100644
+--- a/src/app/chromia/recalibrations/[slabId]/page.tsx
++++ b/src/app/chromia/recalibrations/[slabId]/page.tsx
+@@ -147,7 +147,6 @@ export default async function RecalibrationSlabPage({
+           slabId={record.id}
+           slabNo={record.slabNo}
+           recalibrationReasons={recalibrationReasons}
+-          today={toDateInput(new Date())}
+         />
+       </div>
+     );
+diff --git a/src/app/chromia/slabs/[slabId]/edit/page.tsx b/src/app/chromia/slabs/[slabId]/edit/page.tsx
+index 4385723..b76815d 100644
+--- a/src/app/chromia/slabs/[slabId]/edit/page.tsx
++++ b/src/app/chromia/slabs/[slabId]/edit/page.tsx
+@@ -1,71 +1,23 @@
+-import type { Metadata } from 'next';
+-import Link from 'next/link';
++import { redirect } from 'next/navigation';
+ 
+-import { EmptyState, PageHeader } from '@/components/chromia/ui';
+ import { APP_ROUTES } from '@/lib/chromia/constants/app';
+-import { toDateInput, toTimeInput } from '@/lib/chromia/operator-register';
+-import {
+-  loadBaseMaterialNames,
+-  loadDesignFileNames,
+-  loadRecentBatchNos,
+-} from '@/lib/chromia/server/services/operator-service';
+-import { loadSlabRecord } from '@/lib/chromia/server/repositories/slab-record-repository';
+ 
+-import { EditForm } from './edit-form';
+-
+-export const metadata: Metadata = { title: 'Edit Slab Record' };
+ export const dynamic = 'force-dynamic';
+ 
+-
+-export default async function EditSlabPage({
++/**
++ * The old dedicated edit page.
++ *
++ * Editing a slab record now happens on the Operator Entry screen with the QC
++ * Section open beneath it, so the whole record — the entry fields and the QC
++ * grade/outcome alike — is corrected in one place, on the same record. This
++ * route stays and forwards, so a bookmark or a pasted link still lands on the
++ * right screen.
++ */
++export default async function EditSlabRedirect({
+   params,
+ }: {
+   params: Promise<{ slabId: string }>;
+ }) {
+   const { slabId } = await params;
+-
+-  const [record, baseMaterials, fileNames, batchNos] = await Promise.all([
+-    loadSlabRecord(slabId),
+-    loadBaseMaterialNames(),
+-    loadDesignFileNames(),
+-    loadRecentBatchNos(),
+-  ]);
+-
+-  if (!record) {
+-    return (
+-      <div className="mx-auto max-w-3xl">
+-        <PageHeader title="Edit slab record" />
+-        <EmptyState>
+-          That slab is no longer in{' '}
+-          <Link href={APP_ROUTES.slabs} className="text-brand-700 font-medium underline">
+-            Slab Records
+-          </Link>
+-          .
+-        </EmptyState>
+-      </div>
+-    );
+-  }
+-
+-  return (
+-    <div className="mx-auto max-w-4xl">
+-      <PageHeader title={`Edit slab record — ${record.slabNo}`} size="md" />
+-
+-      <EditForm
+-        slab={{
+-          id: record.id,
+-          slabNo: record.slabNo,
+-          batchNo: record.batchNo,
+-          baseMaterial: record.baseMaterial,
+-          designFileName: record.designFileName,
+-          thicknessCm: record.thicknessCm === null ? '' : String(record.thicknessCm),
+-          receivedDate: toDateInput(record.receivedDate),
+-          inTime: record.inTime ? toTimeInput(record.inTime) : '',
+-          remarks: record.remarks ?? '',
+-        }}
+-        baseMaterials={baseMaterials}
+-        fileNames={fileNames}
+-        batchNos={batchNos}
+-      />
+-    </div>
+-  );
++  redirect(`${APP_ROUTES.operator}?slab=${encodeURIComponent(slabId)}&edit=1`);
+ }
+diff --git a/src/app/chromia/slabs/new/qc-section.tsx b/src/app/chromia/slabs/new/qc-section.tsx
+index 0ca5652..a8ad959 100644
+--- a/src/app/chromia/slabs/new/qc-section.tsx
++++ b/src/app/chromia/slabs/new/qc-section.tsx
+@@ -9,7 +9,7 @@ import { DispositionBadge, GradeBadge } from '@/components/chromia/ui/status';
+ import { DISPOSITION_LABELS, GRADE_ALLOWED_DISPOSITIONS } from '@/lib/chromia/constants/process-stages';
+ import { ChromiaDisposition as Disposition, ChromiaSlabGrade as SlabGrade } from '@prisma/client';
+ 
+-import { Divider, field, FieldGrid, OutcomePanel, selectField } from './ui';
++import { field, FieldGrid, OutcomePanel, selectField } from './ui';
+ 
+ export interface Option {
+   id: string;
+@@ -18,8 +18,14 @@ export interface Option {
+ 
+ interface Props {
+   recalibrationReasons: Option[];
+-  today: string;
+   errors?: Record<string, string[] | undefined>;
++  /** Pre-filled values when correcting an already-graded slab (the Edit path). */
++  initial?: {
++    grade?: string;
++    disposition?: string;
++    slabRemarks?: string;
++    reasonName?: string;
++  };
+ }
+ 
+ const GRADE_OPTIONS = [
+@@ -35,19 +41,20 @@ const GRADE_OPTIONS = [
+  *   Grade B → Stock · Sample Cutting
+  *   Grade C → Recalibration
+  *
+- * The allowed outcomes come from `GRADE_ALLOWED_DISPOSITIONS`, the same table
+- * the server validates against — the dropdown can never offer something the
+- * service would reject.
++ * QC decides two things and only two: the grade, and the outcome that grade
++ * allows. The dates a slab is dispatched, stocked or cut are captured later, on
++ * those sections' own screens, when the slab actually gets there — so nothing
++ * but the grade, the outcome, and (for recalibration) its reason appears here.
+  *
+- * Choosing an outcome writes it into Slab Remarks, which is how the paper
+- * register works. Recalibration writes "RECALIBRATE - <reason>" instead, once
+- * a reason is picked.
++ * The chosen outcome is still written into the slab's remark behind the scenes,
++ * the way the paper register records it, so the Slab Remarks column keeps
++ * reading true without QC having to ask for anything extra.
+  */
+-export function QcSection({ recalibrationReasons, today, errors }: Props) {
+-  const [grade, setGrade] = useState<string>('');
+-  const [disposition, setDisposition] = useState<string>('');
+-  const [remarks, setRemarks] = useState('');
+-  const [reasonName, setReasonName] = useState('');
++export function QcSection({ recalibrationReasons, errors, initial }: Props) {
++  const [grade, setGrade] = useState<string>(initial?.grade ?? '');
++  const [disposition, setDisposition] = useState<string>(initial?.disposition ?? '');
++  const [remarks, setRemarks] = useState(initial?.slabRemarks ?? '');
++  const [reasonName, setReasonName] = useState(initial?.reasonName ?? '');
+ 
+   const allowed = grade
+     ? GRADE_ALLOWED_DISPOSITIONS[grade as keyof typeof GRADE_ALLOWED_DISPOSITIONS]
+@@ -63,8 +70,9 @@ export function QcSection({ recalibrationReasons, today, errors }: Props) {
+   function chooseDisposition(value: string) {
+     setDisposition(value);
+     setReasonName('');
+-    // Auto-fill the remark with the chosen outcome. Recalibration is filled
+-    // from the reason instead, once one is picked.
++    // The remark still mirrors the chosen outcome (Dispatch, Stock, Sample
++    // cutting), the way the register does; recalibration fills it from the
++    // reason instead, once one is picked.
+     setRemarks(
+       value && value !== Disposition.RECALIBRATION
+         ? DISPOSITION_LABELS[value as keyof typeof DISPOSITION_LABELS]
+@@ -72,7 +80,7 @@ export function QcSection({ recalibrationReasons, today, errors }: Props) {
+     );
+   }
+ 
+-  /** "RECALIBRATE - Roller Mark" — the reason is now typed or picked by name. */
++  /** "RECALIBRATE - Roller Mark" — the reason is typed or picked by name. */
+   function chooseReason(value: string) {
+     setReasonName(value);
+     setRemarks(value.trim() ? `RECALIBRATE - ${value.trim()}` : '');
+@@ -136,61 +144,10 @@ export function QcSection({ recalibrationReasons, today, errors }: Props) {
+         </Field>
+       </FieldGrid>
+ 
+-      {/* ----------------------------------------------------- dispatch --- */}
+-      {disposition === Disposition.DISPATCH ? (
+-        <OutcomePanel title="Dispatch">
+-          <FieldGrid>
+-            <Field label="Dispatch Date" htmlFor="dispatchDate" hint="Blank = today">
+-              <input
+-                id="dispatchDate"
+-                name="dispatchDate"
+-                type="date"
+-                defaultValue={today}
+-                className={field}
+-              />
+-            </Field>
+-          </FieldGrid>
+-        </OutcomePanel>
+-      ) : null}
+-
+-      {/* -------------------------------------------------------- stock --- */}
+-      {disposition === Disposition.STOCK ? (
+-        <OutcomePanel title="Stock">
+-          <FieldGrid>
+-            <Field label="Stock Date" htmlFor="stockDate" hint="Blank = today">
+-              <input
+-                id="stockDate"
+-                name="stockDate"
+-                type="date"
+-                defaultValue={today}
+-                className={field}
+-              />
+-            </Field>
+-            <Field label="Notes" htmlFor="stockNotes">
+-              <input id="stockNotes" name="stockNotes" className={field} />
+-            </Field>
+-          </FieldGrid>
+-        </OutcomePanel>
+-      ) : null}
+-
+-      {/* ----------------------------------------------- sample cutting --- */}
+-      {disposition === Disposition.SAMPLE_CUTTING ? (
+-        <OutcomePanel title="Sample cutting">
+-          <FieldGrid>
+-            <Field label="Sample Cut Date" htmlFor="cutDate" hint="Blank = today">
+-              <input
+-                id="cutDate"
+-                name="cutDate"
+-                type="date"
+-                defaultValue={today}
+-                className={field}
+-              />
+-            </Field>
+-          </FieldGrid>
+-        </OutcomePanel>
+-      ) : null}
+-
+-      {/* ----------------------------------------------- recalibration --- */}
++      {/* Recalibration keeps its reason — the one outcome-specific field QC
++          still fills, because the reason is decided at the bench, not later.
++          Dispatch, Stock and Sample cutting no longer ask for a date here; those
++          are captured on their own screens when the slab actually gets there. */}
+       {disposition === Disposition.RECALIBRATION ? (
+         <OutcomePanel title="Recalibration">
+           <FieldGrid>
+@@ -213,18 +170,10 @@ export function QcSection({ recalibrationReasons, today, errors }: Props) {
+         </OutcomePanel>
+       ) : null}
+ 
+-      <Divider />
+-
+-      <Field label="Slab Remarks" htmlFor="slabRemarks">
+-        <input
+-          id="slabRemarks"
+-          name="slabRemarks"
+-          className={field}
+-          value={remarks}
+-          onChange={(event) => setRemarks(event.target.value)}
+-          placeholder={disposition === Disposition.RECALIBRATION ? 'RECALIBRATE - <reason>' : ''}
+-        />
+-      </Field>
++      {/* The chosen outcome, kept as the slab's remark the way the register
++          records it — but no longer a field anyone types. QC decides only Grade
++          and Outcome. */}
++      <input type="hidden" name="slabRemarks" value={remarks} />
+     </div>
+   );
+ }
+diff --git a/src/app/chromia/slabs/row-actions.tsx b/src/app/chromia/slabs/row-actions.tsx
+index c7969a0..4bdd607 100644
+--- a/src/app/chromia/slabs/row-actions.tsx
++++ b/src/app/chromia/slabs/row-actions.tsx
+@@ -32,7 +32,7 @@ export function RowActions({ slabId, slabNo }: { slabId: string; slabNo: string
+   return (
+     <span className="flex items-center justify-end gap-1.5 whitespace-nowrap">
+       <Link
+-        href={`${APP_ROUTES.slabs}/${slabId}/edit`}
++        href={`${APP_ROUTES.operator}?slab=${slabId}&edit=1`}
+         aria-label={`Edit slab ${slabNo}`}
+         className="border-line surface hover:border-line-strong inline-flex h-9 items-center justify-center rounded-lg border px-3 text-xs font-medium transition-colors hover:bg-[var(--surface-muted)]"
+       >
+diff --git a/src/components/chromia/layout/nav-icons.tsx b/src/components/chromia/layout/nav-icons.tsx
+index 9796d56..f1dda9b 100644
+--- a/src/components/chromia/layout/nav-icons.tsx
++++ b/src/components/chromia/layout/nav-icons.tsx
+@@ -24,6 +24,7 @@ export type NavIconName =
+   | 'slabs'
+   | 'intake'
+   | 'stockyard'
++  | 'dispatch'
+   | 'recalibration'
+   | 'tracking'
+   | 'reports'
+@@ -73,6 +74,15 @@ const PATHS: Record<NavIconName, React.ReactNode> = {
+       <path d="M7 15.5v3M11 15.5v3M15 15.5v3" />
+     </>
+   ),
++  // Van — outbound dispatch
++  dispatch: (
++    <>
++      <path d="M3 6h11v9H3z" />
++      <path d="M14 9h4l3 3v3h-7z" />
++      <circle cx="7" cy="18" r="1.6" />
++      <circle cx="17" cy="18" r="1.6" />
++    </>
++  ),
+   // Cycle — recalibration loop
+   recalibration: (
+     <>
+diff --git a/src/lib/chromia/config/navigation.ts b/src/lib/chromia/config/navigation.ts
+index 975a1ce..78fcc87 100644
+--- a/src/lib/chromia/config/navigation.ts
++++ b/src/lib/chromia/config/navigation.ts
+@@ -29,6 +29,7 @@ export const navigation: readonly NavItem[] = [
+   { title: 'Operator Entry', href: '/chromia/operator', icon: 'operator' },
+   { title: 'Slab Records', href: '/chromia/slabs', icon: 'slabs' },
+   { title: 'Stockyard', href: '/chromia/stockyard', icon: 'stockyard' },
++  { title: 'Dispatch', href: '/chromia/dispatch', icon: 'dispatch' },
+   { title: 'Recalibration', href: '/chromia/recalibrations', icon: 'recalibration' },
+   { title: 'Recal. Tracking', href: '/chromia/recalibration-tracking', icon: 'tracking' },
+   { title: 'Summary', href: '/chromia/reports', icon: 'reports' },
+diff --git a/src/lib/chromia/constants/app.ts b/src/lib/chromia/constants/app.ts
+index 7be45c2..f7f8aba 100644
+--- a/src/lib/chromia/constants/app.ts
++++ b/src/lib/chromia/constants/app.ts
+@@ -20,6 +20,7 @@ export const APP_ROUTES = {
+    */
+   slabIntake: '/chromia/operator',
+   stockyard: '/chromia/stockyard',
++  dispatch: '/chromia/dispatch',
+   recalibrations: '/chromia/recalibrations',
+   recalibrationTracking: '/chromia/recalibration-tracking',
+   import: '/chromia/import',
+diff --git a/src/lib/chromia/server/actions/dispatch.ts b/src/lib/chromia/server/actions/dispatch.ts
+new file mode 100644
+index 0000000..cdf80cb
+--- /dev/null
++++ b/src/lib/chromia/server/actions/dispatch.ts
+@@ -0,0 +1,55 @@
++'use server';
++
++import { revalidatePath } from 'next/cache';
++
++import { APP_ROUTES } from '@/lib/chromia/constants/app';
++import { requireActingUser } from '@/lib/chromia/current-user';
++import { isAppError } from '@/lib/chromia/errors';
++import { registerDay } from '@/lib/chromia/operator-register';
++import { recordDispatch } from '@/lib/chromia/server/services/disposition-service';
++
++export interface DispatchFormState {
++  error?: string;
++  /** Set on success, so the lists refresh and the row clears. */
++  dispatchedSlabId?: string;
++  dispatchedAt?: number;
++}
++
++/**
++ * Send a decided-dispatch slab out for real.
++ *
++ * The date is required — a dispatch with no date is the very thing this page
++ * exists to prevent — and the slab is then dispatched through the existing
++ * dispatch logic, so a slab sent from here is indistinguishable from one
++ * dispatched any other way, and its traceability is unchanged.
++ */
++export async function sendForDispatchAction(
++  _previousState: DispatchFormState,
++  formData: FormData,
++): Promise<DispatchFormState> {
++  const slabId = String(formData.get('slabId') ?? '').trim();
++  const dateRaw = String(formData.get('dispatchDate') ?? '').trim();
++
++  if (!slabId) return { error: 'That slab could not be identified.' };
++  if (!dateRaw) return { error: 'Pick the date this slab was dispatched.' };
++
++  const dispatchDate = registerDay(dateRaw);
++  if (!dispatchDate) return { error: 'Enter a valid dispatch date.' };
++
++  try {
++    const user = await requireActingUser();
++    await recordDispatch({ slabId, dispatchDate }, user.id, {
++      note: 'Sent for dispatch from the Dispatch page',
++    });
++  } catch (error) {
++    if (isAppError(error) || error instanceof Error) return { error: error.message };
++    throw error;
++  }
++
++  revalidatePath(APP_ROUTES.dispatch);
++  revalidatePath(APP_ROUTES.slabs);
++  revalidatePath(APP_ROUTES.dashboard);
++  revalidatePath(APP_ROUTES.reports);
++
++  return { dispatchedSlabId: slabId, dispatchedAt: Date.now() };
++}
+diff --git a/src/lib/chromia/server/actions/slab.ts b/src/lib/chromia/server/actions/slab.ts
+index 39a1781..d7f81d9 100644
+--- a/src/lib/chromia/server/actions/slab.ts
++++ b/src/lib/chromia/server/actions/slab.ts
+@@ -10,11 +10,13 @@ import { isAppError } from '@/lib/chromia/errors';
+ import { intakeQcSchema, type IntakeQcInput } from '@/lib/chromia/validation/slab';
+ import {
+   declareWaste,
+-  recordDispatch,
+   recordSampleCutting,
+   recordStock,
+ } from '@/lib/chromia/server/services/disposition-service';
+-import { applyIntakeGrade } from '@/lib/chromia/server/services/intake-outcome-service';
++import {
++  applyIntakeGrade,
++  resetSlabQcForCorrection,
++} from '@/lib/chromia/server/services/intake-outcome-service';
+ import { markAwaitingRecalibration } from '@/lib/chromia/server/services/recalibration-flow-service';
+ import { resolveRecalibrationReasonId } from '@/lib/chromia/server/services/reference-service';
+ import { completeSlabIntake } from '@/lib/chromia/server/services/slab-intake-service';
+@@ -28,7 +30,10 @@ export interface SlabIntakeFormState {
+ async function applyDisposition(slabId: string, qc: IntakeQcInput, userId: string) {
+   switch (qc.disposition) {
+     case Disposition.DISPATCH:
+-      return recordDispatch({ slabId, dispatchDate: qc.dispatchDate }, userId);
++      // Grade A → Dispatch no longer dispatches on the spot. The slab is graded
++      // and joins the Dispatch page queue; its real dispatch date is recorded
++      // there when it is actually sent, days or weeks later. See /chromia/dispatch.
++      return undefined;
+ 
+     case Disposition.STOCK:
+       return recordStock(
+@@ -87,6 +92,28 @@ export async function completeSlabAction(
+   return saveQc(formData, (userId) => completeSlabIntake(slabId, userId).then((slab) => slab.id));
+ }
+ 
++/**
++ * Correct the QC on a slab that has already been graded — the Edit path.
++ *
++ * The whole grading flow is reused: the slab's current QC is undone, then the
++ * new grade and outcome are applied exactly as a first grading would, onto the
++ * same record. Nothing here is a second, parallel way to grade — it is the same
++ * one, run again — so the rules can never drift from the normal screen.
++ */
++export async function editSlabQcAction(
++  _previousState: SlabIntakeFormState,
++  formData: FormData,
++): Promise<SlabIntakeFormState> {
++  const raw = formData.get('slabId');
++  const slabId = typeof raw === 'string' ? raw : '';
++  if (!slabId) return { error: 'This slab could not be identified. Reopen it from Slab Records.' };
++
++  return saveQc(formData, async (userId) => {
++    await resetSlabQcForCorrection(slabId, userId);
++    return slabId;
++  });
++}
++
+ async function saveQc(
+   formData: FormData,
+   persist: (userId: string) => Promise<string>,
+diff --git a/src/lib/chromia/server/repositories/dispatch-repository.ts b/src/lib/chromia/server/repositories/dispatch-repository.ts
+new file mode 100644
+index 0000000..010b095
+--- /dev/null
++++ b/src/lib/chromia/server/repositories/dispatch-repository.ts
+@@ -0,0 +1,100 @@
++import { ChromiaDisposition as Disposition, ChromiaSlabStatus as SlabStatus } from '@prisma/client';
++import { prisma } from '@/lib/chromia/db';
++import { simpleSlabWhere, type SimpleFilters } from '@/lib/chromia/simple-filters';
++
++/**
++ * Dispatch data access.
++ *
++ * Two questions, kept apart the way the Stockyard keeps its racks and its
++ * release log apart:
++ *
++ *   • what QC has decided to dispatch but nobody has actually sent yet — a slab
++ *     whose outcome is Dispatch and whose status is still GRADED (decided, not
++ *     gone); and
++ *   • what has actually been dispatched straight from the line — a real dispatch
++ *     record with no closed stock holding behind it. A slab that was stocked and
++ *     then dispatched belongs to the Stockyard's own release log, not here, so
++ *     the two pages never show the same departure twice.
++ */
++
++/** Slabs QC marked for dispatch that are still waiting to be sent. */
++export async function listAwaitingDispatch(filters?: SimpleFilters) {
++  const slabs = await prisma.chromiaSlab.findMany({
++    where: {
++      deletedAt: null,
++      status: SlabStatus.GRADED,
++      currentDisposition: Disposition.DISPATCH,
++      ...(filters ? simpleSlabWhere(filters) : {}),
++    },
++    orderBy: [{ receivedDate: 'asc' }, { createdAt: 'asc' }],
++    select: {
++      id: true,
++      slabNo: true,
++      receivedDate: true,
++      currentThicknessMm: true,
++      currentGrade: true,
++      batch: { select: { batchNo: true } },
++      baseMaterial: { select: { name: true } },
++      plannedDesign: { select: { name: true, fileName: true } },
++    },
++  });
++
++  return slabs.map(({ currentThicknessMm, ...slab }) => ({
++    ...slab,
++    thicknessCm: currentThicknessMm === null ? null : Number(currentThicknessMm) / 10,
++  }));
++}
++
++export type AwaitingDispatchSlab = Awaited<ReturnType<typeof listAwaitingDispatch>>[number];
++
++/**
++ * Slabs actually dispatched straight from the line (not via stock).
++ *
++ * Mirrors the Stockyard's release log exactly, but for the other kind of
++ * departure: a dispatch whose slab has NO closed stock holding.
++ */
++export async function listDirectDispatches(take = 50) {
++  const dispatches = await prisma.chromiaDispatch.findMany({
++    where: {
++      slab: { deletedAt: null, stockEntries: { none: { releasedAt: { not: null } } } },
++    },
++    orderBy: [{ dispatchDate: 'desc' }, { createdAt: 'desc' }],
++    take,
++    select: {
++      id: true,
++      dispatchDate: true,
++      createdAt: true,
++      slab: {
++        select: {
++          id: true,
++          slabNo: true,
++          receivedDate: true,
++          currentGrade: true,
++          currentThicknessMm: true,
++          batch: { select: { batchNo: true } },
++          baseMaterial: { select: { name: true } },
++          plannedDesign: { select: { name: true, fileName: true } },
++        },
++      },
++    },
++  });
++
++  return dispatches.map((dispatch) => ({
++    id: dispatch.id,
++    dispatchDate: dispatch.dispatchDate,
++    slabId: dispatch.slab.id,
++    slabNo: dispatch.slab.slabNo,
++    receivedDate: dispatch.slab.receivedDate,
++    batchNo: dispatch.slab.batch.batchNo,
++    baseMaterial: dispatch.slab.baseMaterial.name,
++    designFileName:
++      dispatch.slab.plannedDesign?.fileName ?? dispatch.slab.plannedDesign?.name ?? null,
++    thicknessCm:
++      dispatch.slab.currentThicknessMm === null
++        ? null
++        : Number(dispatch.slab.currentThicknessMm) / 10,
++    grade: dispatch.slab.currentGrade,
++  }));
++}
++
++export type DirectDispatch = Awaited<ReturnType<typeof listDirectDispatches>>[number];
+diff --git a/src/lib/chromia/server/repositories/slab-record-repository.ts b/src/lib/chromia/server/repositories/slab-record-repository.ts
+index c09e504..2daf867 100644
+--- a/src/lib/chromia/server/repositories/slab-record-repository.ts
++++ b/src/lib/chromia/server/repositories/slab-record-repository.ts
+@@ -22,6 +22,9 @@ export async function loadSlabRecord(slabId: string) {
+       receivedDate: true,
+       remarks: true,
+       currentThicknessMm: true,
++      // The QC decision, so the Edit screen can pre-fill and correct it.
++      currentGrade: true,
++      currentDisposition: true,
+       recalibrationCount: true,
+       batch: { select: { id: true, batchNo: true } },
+       baseMaterial: { select: { id: true, name: true } },
+@@ -44,6 +47,8 @@ export async function loadSlabRecord(slabId: string) {
+     status: slab.status,
+     receivedDate: slab.receivedDate,
+     remarks: slab.remarks,
++    currentGrade: slab.currentGrade,
++    currentDisposition: slab.currentDisposition,
+     // Decimal does not survive the trip to a client component, and the register
+     // works in centimetres while the database stores millimetres.
+     thicknessCm:
+diff --git a/src/lib/chromia/server/services/intake-outcome-service.ts b/src/lib/chromia/server/services/intake-outcome-service.ts
+index 68cd260..736abc9 100644
+--- a/src/lib/chromia/server/services/intake-outcome-service.ts
++++ b/src/lib/chromia/server/services/intake-outcome-service.ts
+@@ -101,3 +101,102 @@ export async function applyIntakeGrade(slabId: string, input: IntakeQcInput, use
+ 
+   log.info({ slabNo: slab.slabNo, grade, disposition }, 'Intake grade recorded');
+ }
++
++/**
++ * Undo a slab's QC so it can be graded again — the Edit / correction path.
++ *
++ * Operators are catching up historical production and sometimes put the wrong
++ * grade or outcome on a slab. This lets the Edit screen re-open the QC section
++ * on an already-decided slab: it clears the current decision — the grade
++ * decision and whichever of dispatch, stock, sample-cutting or waste record it
++ * produced — and returns the slab to IN_PROCESS on its current cycle, so the
++ * ordinary grading path (`applyIntakeGrade` + the disposition services) can
++ * decide it afresh, onto the SAME record. No duplicate slab is ever made.
++ *
++ * History is appended, never erased: the slab's events stay as they were and a
++ * CORRECTION event records the reset, so the story still reads true.
++ *
++ * A slab inside a recalibration cycle is out of scope — its multi-cycle journey
++ * belongs to the Recalibration page — and is refused with a message that says
++ * so, rather than being half-unwound here.
++ */
++export async function resetSlabQcForCorrection(slabId: string, userId: string) {
++  const slab = await prisma.chromiaSlab.findFirst({
++    where: { id: slabId, deletedAt: null },
++    select: {
++      id: true,
++      slabNo: true,
++      status: true,
++      currentGrade: true,
++      currentDisposition: true,
++      cycles: { orderBy: { cycleNumber: 'desc' }, take: 1, select: { id: true } },
++    },
++  });
++  if (!slab) throw new NotFoundError('Slab');
++
++  const inRecalibration =
++    slab.currentDisposition === Disposition.RECALIBRATION ||
++    slab.status === SlabStatus.OUT_FOR_RECALIBRATION ||
++    slab.status === SlabStatus.RECEIVED_FROM_RECALIBRATION;
++
++  if (inRecalibration) {
++    throw new BusinessRuleViolationError(
++      `Slab ${slab.slabNo} is in a recalibration cycle — correct it on the Recalibration page, not here.`,
++    );
++  }
++
++  // Nothing decided yet: "editing" an ungraded slab's QC is simply grading it,
++  // and the ordinary grading path does exactly that. There is nothing to undo.
++  if (slab.currentGrade === null && slab.currentDisposition === null) return;
++
++  const cycleId = slab.cycles[0]?.id ?? null;
++  const priorGrade = slab.currentGrade;
++  const priorDisposition = slab.currentDisposition;
++
++  await prisma.$transaction(async (tx) => {
++    // A slab holds one live outcome at a time, so clearing by slab id removes
++    // exactly the current one. Recalibration is refused above, so its cycles are
++    // never touched here.
++    await tx.chromiaDispatch.deleteMany({ where: { slabId: slab.id } });
++    await tx.chromiaStockEntry.deleteMany({ where: { slabId: slab.id } });
++    await tx.chromiaSampleCutting.deleteMany({ where: { slabId: slab.id } });
++    await tx.chromiaWasteRecord.deleteMany({ where: { slabId: slab.id } });
++
++    if (cycleId) {
++      await tx.chromiaGradeDecision.deleteMany({ where: { cycleId } });
++      await tx.chromiaProcessCycle.update({
++        where: { id: cycleId },
++        data: {
++          finalGrade: null,
++          disposition: null,
++          status: CycleStatus.ACTIVE,
++          completedAt: null,
++        },
++      });
++    }
++
++    await tx.chromiaSlab.update({
++      where: { id: slab.id },
++      data: {
++        status: SlabStatus.IN_PROCESS,
++        currentGrade: null,
++        currentDisposition: null,
++        updatedById: userId,
++      },
++    });
++
++    await tx.chromiaSlabEvent.create({
++      data: {
++        slabId: slab.id,
++        cycleId,
++        eventType: SlabEventType.CORRECTION,
++        userId,
++        note: `QC reset for correction — was Grade ${priorGrade ?? '—'} → ${
++          priorDisposition ? DISPOSITION_LABELS[priorDisposition] : '—'
++        }`,
++      },
++    });
++  });
++
++  log.info({ slabNo: slab.slabNo }, 'QC reset for correction');
++}
+-- 
+2.43.0
+

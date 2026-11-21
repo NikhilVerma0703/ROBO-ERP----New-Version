@@ -1,0 +1,305 @@
+"use client";
+import { useState, useEffect, useCallback } from "react";
+import Link from "next/link";
+import { Card } from "@/components/ui";
+import { formatSlabRemarks, slabStatusClass, slabStatusLabel, type DelayLike } from "@/lib/robo/utils";
+import { productionDateOf } from "@/lib/robo/productionDate";
+import { shiftCell } from "@/lib/robo/productionShift";
+import { DESIGN_SUGGESTIONS } from "@/lib/robo/design-presets";
+import { batchLabel } from "@/lib/robo/trial";
+
+interface SlabRecord {
+  id: string;
+  serialNumber: number | null;
+  /** S.No. = the slab's 1..N position in its batch by physical slab number,
+   *  computed server-side (change #3). Present when the list is a whole batch
+   *  (a Batch No. search); null otherwise, since a partial set has no batch rank. */
+  seqNo?: number | null;
+  slabNumber: string;
+  /** The slab's own production date, when it has one (a batch past midnight).
+   *  Highest precedence in productionDateOf — see productionDate.ts. */
+  productionDate: string | null;
+  /** The shift the operator picked for this slab: "A", "B", "C" or null. Null
+   *  on everything entered before the field existed, where the In Time answers
+   *  instead — productionShift.ts. NOT shift.shiftNumber below, which is the
+   *  per-day plumbing row's wall-clock stamp. */
+  productionShift: string | null;
+  inTime: string | null;
+  outTime: string | null;
+  status: string;
+  remarks: string | null;
+  shift: { date: string; shiftNumber: number } | null;
+  /** isTrial (CR-003): a trial slab, shown as "D-1506 (Trial Slab)". */
+  batchRecipe: { designName: string; batchNo: string | null; productionDate: string | null; isTrial?: boolean } | null;
+  delayLogs: (DelayLike & { id: string })[];
+}
+
+const EMPTY = { date: "", batchNo: "", slabNumber: "", designName: "" };
+
+/* Slab Records keeps the filters you applied for as long as this browser tab
+   stays open, so opening a slab, editing it and coming back lands on the same
+   filtered list instead of the whole register — the Chromia Slab Records
+   behaviour, reached here without touching the search itself. The applied
+   filters are stashed under this key on every search and read back on mount;
+   Clear Filters (a search with none) removes them, and closing the tab drops
+   them. A manual refresh keeps them, which the workflow allows.
+
+   sessionStorage, not the URL: Robo's Slab Records is a client screen that
+   already owns its filters as state and fetches them itself, so persisting
+   that state leaves the filtering, Edit and Save logic exactly as it was —
+   only the persistence and the return-navigation change. */
+const FILTERS_STORAGE_KEY = "robo:slabs:filters";
+
+function loadStoredFilters(): typeof EMPTY {
+  if (typeof window === "undefined") return EMPTY;
+  try {
+    const raw = window.sessionStorage.getItem(FILTERS_STORAGE_KEY);
+    if (!raw) return EMPTY;
+    const p = JSON.parse(raw) as Partial<typeof EMPTY>;
+    return {
+      date:       typeof p.date === "string" ? p.date : "",
+      batchNo:    typeof p.batchNo === "string" ? p.batchNo : "",
+      slabNumber: typeof p.slabNumber === "string" ? p.slabNumber : "",
+      designName: typeof p.designName === "string" ? p.designName : "",
+    };
+  } catch {
+    return EMPTY;
+  }
+}
+
+function saveStoredFilters(f: typeof EMPTY | null): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (f) window.sessionStorage.setItem(FILTERS_STORAGE_KEY, JSON.stringify(f));
+    else window.sessionStorage.removeItem(FILTERS_STORAGE_KEY);
+  } catch {
+    /* storage unavailable (private mode, quota) — filters just won't persist */
+  }
+}
+
+export function SlabsBrowser({ canDelete = false }: {
+  /** Whether the signed-in user may delete a slab. A courtesy so a ROBO
+   *  operator never meets a button that 403s — the real gate is in the route
+   *  handler (see canDeleteRoboSlab in src/lib/rbac.ts). */
+  canDelete?: boolean;
+}) {
+  const [filters, setFilters] = useState(EMPTY);
+  const [results, setResults] = useState<SlabRecord[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [applied, setApplied] = useState(false);
+  const [designOptions, setDesignOptions] = useState<string[]>([...DESIGN_SUGGESTIONS]);
+  const [actionError, setActionError] = useState("");
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+
+  /* Suggestions = designs already produced, plus the plant reference designs.
+     The field stays free text, so anything else can still be typed. */
+  useEffect(() => {
+    fetch("/api/robo/designs")
+      .then(r => (r.ok ? r.json() : []))
+      .then((designs: { name: string }[]) => {
+        const seen = new Map<string, string>();
+        for (const name of [...designs.map(d => d.name), ...DESIGN_SUGGESTIONS]) {
+          const key = name.trim().toLowerCase();
+          if (key && !seen.has(key)) seen.set(key, name.trim());
+        }
+        setDesignOptions([...seen.values()].sort((a, b) => a.localeCompare(b)));
+      })
+      .catch(() => {});
+  }, []);
+
+  const runSearch = useCallback(async (f: typeof EMPTY) => {
+    setLoading(true);
+    const qs = new URLSearchParams();
+    if (f.date.trim()) qs.set("date", f.date.trim());
+    if (f.batchNo.trim()) qs.set("batchNo", f.batchNo.trim());
+    if (f.slabNumber.trim()) qs.set("slabNumber", f.slabNumber.trim());
+    if (f.designName.trim()) qs.set("designName", f.designName.trim());
+    const hasFilters = qs.toString().length > 0;
+    // Remember exactly what was applied so the list can restore it after the
+    // operator opens a slab and returns; a search with no filters clears it.
+    saveStoredFilters(hasFilters ? f : null);
+    const res = await fetch(`/api/robo/production?${qs.toString()}`);
+    const data: SlabRecord[] = res.ok ? await res.json() : [];
+    setResults(data);
+    setApplied(hasFilters);
+    setLoading(false);
+  }, []);
+
+  // On mount, restore the filters this tab last applied (if any) and re-run
+  // that search, so returning from Open / Edit / Save lands on the same list.
+  // With nothing stored this is the original first load: the latest records.
+  useEffect(() => {
+    const stored = loadStoredFilters();
+    setFilters(stored);
+    runSearch(stored);
+  }, [runSearch]);
+
+  /**
+   * Permanently removes one slab record and its delay logs, then re-runs the
+   * current search so the row disappears without losing the filters.
+   *
+   * The confirm names the slab number rather than saying "this record":
+   * the operator's own check is against the paper register, and a row
+   * position on a filtered table is not something they can verify.
+   */
+  const removeSlab = async (r: SlabRecord) => {
+    if (!confirm(`Are you sure you want to delete this slab record?\n\nSlab No. ${r.slabNumber} — this cannot be undone.`)) return;
+    setActionError("");
+    setDeletingId(r.id);
+    const res = await fetch(`/api/robo/production/${r.id}`, { method: "DELETE" }).catch(() => null);
+    setDeletingId(null);
+    if (!res?.ok) {
+      const data = res ? await res.json().catch(() => ({})) : {};
+      setActionError(data.error || "Could not delete this slab record.");
+      return;
+    }
+    runSearch(filters);
+  };
+
+  const set = (k: keyof typeof EMPTY, v: string) => setFilters(p => ({ ...p, [k]: v }));
+
+  const search = (e: React.FormEvent) => { e.preventDefault(); runSearch(filters); };
+  const clear = () => { setFilters(EMPTY); runSearch(EMPTY); };
+
+  const inp = "w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20";
+
+  return (
+    <div className="max-w-6xl space-y-6">
+      {/* ── A. Find a Slab ── */}
+      <Card>
+        <form onSubmit={search}>
+          <h2 className="mb-4 font-semibold text-gray-800">Find a Slab</h2>
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 md:grid-cols-4">
+            <div>
+              <label className="mb-1 block text-sm font-medium text-gray-700">Production Date</label>
+              <input type="date" value={filters.date} onChange={e => set("date", e.target.value)} className={inp} />
+            </div>
+            <div>
+              <label className="mb-1 block text-sm font-medium text-gray-700">Batch No.</label>
+              <input value={filters.batchNo} onChange={e => set("batchNo", e.target.value)}
+                placeholder="e.g. B-1042" className={inp} />
+            </div>
+            <div>
+              <label className="mb-1 block text-sm font-medium text-gray-700">Slab Number</label>
+              <input value={filters.slabNumber} onChange={e => set("slabNumber", e.target.value)}
+                placeholder="e.g. 140748" className={inp} />
+            </div>
+            <div>
+              <label className="mb-1 block text-sm font-medium text-gray-700">Design Name</label>
+              <input value={filters.designName} onChange={e => set("designName", e.target.value)}
+                list="slab-design-suggestions" autoComplete="off"
+                placeholder="Type or pick a design name..." className={inp} />
+              <datalist id="slab-design-suggestions">
+                {designOptions.map(d => <option key={d} value={d} />)}
+              </datalist>
+            </div>
+          </div>
+          <div className="mt-4 flex gap-3">
+            <button type="submit"
+              className="rounded-lg bg-brand px-6 py-2.5 text-sm font-semibold tracking-wide text-white transition hover:bg-brand/90">
+              SEARCH
+            </button>
+            <button type="button" onClick={clear}
+              className="rounded-lg border border-gray-300 px-6 py-2.5 text-sm font-semibold tracking-wide text-gray-700 transition hover:bg-gray-50">
+              CLEAR FILTERS
+            </button>
+          </div>
+        </form>
+      </Card>
+
+      {actionError && (
+        <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{actionError}</div>
+      )}
+
+      {/* ── B. Results ── */}
+      <Card>
+        <div className="mb-3 flex items-center justify-between">
+          <h2 className="font-semibold text-gray-800">Results</h2>
+          <span className="text-xs text-gray-400">
+            {loading ? "Loading..." : applied
+              ? `${results.length} matching record${results.length !== 1 ? "s" : ""}`
+              : `Latest ${results.length} record${results.length !== 1 ? "s" : ""}`}
+          </span>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="border-b border-gray-200 bg-slate-50">
+              <tr>
+                {["S.No.", "Production Date", "Shift", "Design Name", "Batch No.", "Slab Number", "In Time", "Out Time", "Status", "Remarks", "Review"].map((h, i, arr) => (
+                  <th key={h} className={`whitespace-nowrap px-4 py-3 text-xs font-semibold uppercase tracking-wide text-gray-500 ${i === arr.length - 1 ? "text-right" : "text-left"}`}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {!loading && results.length === 0 && (
+                <tr>
+                  <td colSpan={11} className="px-4 py-12 text-center text-gray-400">
+                    {applied ? "No slabs match these filters." : "No production records yet."}
+                  </td>
+                </tr>
+              )}
+              {results.map(r => (
+                <tr key={r.id} className="border-b border-gray-50 transition hover:bg-slate-50">
+                  {/* S.No. — the slab's 1..N position in its batch, computed from
+                      the physical slab-number order (change #3). Shown when a Batch
+                      No. is searched (the whole batch is in view); "-" otherwise. */}
+                  <td className="whitespace-nowrap px-4 py-3 font-medium text-gray-700">{r.seqNo ?? "-"}</td>
+                  {/* The date the operator entered on the setup, not the shift's
+                      own — that one is the day the tablet was open, so a
+                      register caught up on Monday showed Monday for every slab
+                      of the previous week. See productionDate.ts. */}
+                  <td className="whitespace-nowrap px-4 py-3 text-gray-600">{productionDateOf(r) || "-"}</td>
+                  {/* The shift the operator picked for this slab, or — for the
+                      slabs entered before that field existed — the one its In
+                      Time falls in. Not the shift ROW's number, which is one
+                      wall-clock stamp per day. See productionShift.ts. */}
+                  <td className="whitespace-nowrap px-4 py-3 text-gray-600">{shiftCell(r)}</td>
+                  <td className="px-4 py-3 text-gray-600">{r.batchRecipe?.designName || "-"}</td>
+                  {/* CR-003: a regular slab's batch is unchanged ("D-1506");
+                      a trial slab reads "D-1506 (Trial Slab)". */}
+                  <td className={`whitespace-nowrap px-4 py-3 ${r.batchRecipe?.isTrial ? "font-medium text-brand" : "text-gray-600"}`}>
+                    {batchLabel(r.batchRecipe?.batchNo, r.batchRecipe?.isTrial)}
+                  </td>
+                  <td className="px-4 py-3 font-medium text-gray-900">{r.slabNumber}</td>
+                  <td className="px-4 py-3 text-gray-600">{r.inTime || "-"}</td>
+                  <td className="px-4 py-3 text-gray-600">{r.outTime || "-"}</td>
+                  <td className="px-4 py-3">
+                    <span className={`whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-medium ${slabStatusClass(r.status)}`}>
+                      {slabStatusLabel(r.status)}
+                    </span>
+                  </td>
+                  <td className="max-w-xs px-4 py-3 text-gray-600">{formatSlabRemarks(r.remarks, r.delayLogs)}</td>
+                  <td className="px-4 py-3 text-right">
+                    <div className="flex items-center justify-end gap-2 whitespace-nowrap">
+                      <Link prefetch={false} href={`/robo/slabs/${r.id}`}
+                        className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-lg border border-brand/20 bg-brand/5 px-3 py-1.5 text-xs font-semibold text-brand transition hover:border-brand hover:bg-brand hover:text-white">
+                        Complete Details
+                        <span aria-hidden>→</span>
+                      </Link>
+                      {/* Edit reaches every slab in every shift, closed ones
+                          included — this table is the only way back to a slab
+                          once its shift has rolled over. It opens on two tabs,
+                          Edit slab and Edit setup, because the design and the
+                          machines live on the batch's setup row rather than on
+                          the slab. */}
+                      <Link prefetch={false} href={`/robo/slabs/${r.id}/edit`}
+                        className="inline-flex items-center rounded-lg border border-gray-300 px-3 py-1.5 text-xs font-semibold text-gray-700 transition hover:bg-gray-50">
+                        Edit
+                      </Link>
+                      {canDelete && (
+                        <button type="button" onClick={() => removeSlab(r)} disabled={deletingId === r.id}
+                          className="inline-flex items-center rounded-lg border border-red-200 bg-red-50 px-3 py-1.5 text-xs font-semibold text-red-600 transition hover:border-red-600 hover:bg-red-600 hover:text-white disabled:opacity-50">
+                          {deletingId === r.id ? "Deleting…" : "Delete"}
+                        </button>
+                      )}
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+    </div>
+  );
+}
